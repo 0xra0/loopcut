@@ -2922,11 +2922,95 @@ class WaveTest(unittest.TestCase):
         self.assertIn("Every worker has reported.", late[0])
         self.assertTrue(session["items"][-1]["text"].endswith(
             "Checked: both rest on the rug.\n\nVerified by Loopcut on this scene: 2 of 2 checks.\n"
-            "Requirements (your words): 2 of 2 covered."), session["items"][-1]["text"])
+            "These results cover selected checks only; they do not establish overall task completion."), session["items"][-1]["text"])
         self.assertIn("Helpers were still working when the agent replied",
                       " ".join(i["text"] for i in session["items"] if i["kind"] == "notice"))
         self.assertEqual((session["jobs"][0]["bounces"], session["jobs"][0]["late_bounces"]), (0, 1),
                          "the checks passed; the late workers are counted apart")
+
+    def redo_turn(self, advisory_status: str, *later: str):
+        """rel020-pro's trailer, 2026-10-26: the orchestrator sends the same deliverable back wave after wave on an
+        advisory miss. Here three delegates of the armchair, each a redo of the last, then a reply. later: the
+        advisory's status in the runs after the first, else the first's again."""
+        advisory = [{"kind": "dims", "name": "Armchair", "size": [0.6, 0.6, 0.6]}]
+        first = {**self.brief_on_rug("Armchair", -0.5), "advisory": advisory}
+        again = {**first, "continues": "armchair", "requirements": [{"quote": "an armchair", "do": "smaller"}]}
+        statuses = iter((advisory_status, *later))
+        runtime = self.runtime
+
+        def each_run(wave, worker):
+            status = next(statuses, advisory_status if not later else later[-1])
+            self.child_checks["armchair"] = [
+                {"id": "c1", "status": "pass", "detail": "gap 0.4 mm"},
+                {"id": "a1", "advisory": True, "status": status, "title": "dims Armchair",
+                 "detail": "0.90 x 1.00 x 0.89 m; wants 0.6 x 0.6 x 0.6" if status == "fail" else "ok"}]
+            return runtime(wave, worker)
+        self.runtime = each_run
+        wave = lambda brief: {"shared": {"supports": [{"name": "Rug", "top_z": 0.015}]}, "workers": [brief]}
+        return self.orchestrated_turn(
+            "Put an armchair on the rug.",
+            [calls(("delegate", {"wave": wave(first)})), calls(("delegate", {"wave": wave(again)})),
+             calls(("delegate", {"wave": wave(again)})), text("The armchair is on the rug.")],
+            armchair=[build(), finish("Armchair built.")] * 3)
+
+    def test_a_flagged_deliverable_is_redone_once_then_the_reply_says_what_still_flags(self):
+        """The advisory always misses: the first redo runs and is said to be the last, the second is refused on a
+        neutral card (nothing started, nothing asked), and the turn ends on the reply with one plain line on what
+        the check still flags. The cap stops waves, never the reply."""
+        session, turn = self.redo_turn("fail")
+        self.assertEqual(turn.outcome, "completed")
+        self.assertEqual(self.merges, [["armchair"], ["armchair"]], "two runs, no third wave")
+        self.assertEqual(len(turn.delegations), 2)
+        cards = [i for i in session["items"] if i.get("name") == "delegate"]
+        self.assertEqual([c["status"] for c in cards], ["done", "done", "failed"])
+        self.assertNotIn("Redo:", cards[0]["output"])
+        self.assertIn("Redo: Armchair is redone once after its advisory check; after this it stands as it is this "
+                      "turn, whatever the check says.", cards[1]["output"])
+        self.assertTrue(cards[2]["output"].startswith(
+            "delegate refused; nothing started: this turn already redid Armchair after its advisory check flagged "
+            "it, the most a turn redoes one deliverable."), cards[2]["output"])
+        self.assertEqual(cards[2].get("plan_repair"), "capped", "its own neutral card, like the worker limit")
+        self.assertEqual(cards[2]["summary"], "No more helpers this turn")
+        reply = session["items"][-1]
+        self.assertEqual(reply["kind"], "assistant")
+        line = "The size check still flags Armchair; say if you want another pass."
+        self.assertTrue(reply["text"].startswith(f"The armchair is on the rug.\n\n{line}\n\nVerified by Loopcut"),
+                        reply["text"])
+        self.assertNotIn(line, reply["verification"], "the reply's own text, not folded into the checks")
+        self.assertIn(line, session["messages"][-1]["content"], "and the model's next turn knows it")
+        self.assertEqual(session["jobs"][0]["still_flags"], [line])
+
+    def test_a_redo_that_cleared_the_flag_is_still_the_last_and_its_refusal_promises_no_line(self):
+        """The first run misses, its redo passes: the second redo is still refused (once redone after a flag, it
+        stands), its refusal says a line comes only if the check still flags, and the reply has none."""
+        session, turn = self.redo_turn("fail", "pass")
+        self.assertEqual(self.merges, [["armchair"], ["armchair"]])
+        refused = [i for i in session["items"] if i.get("name") == "delegate"][-1]
+        self.assertIn("If its check still flags it at the end, Loopcut's line in the reply says so (for your "
+                      "planning; to the user, workers are helpers).", refused["output"])
+        self.assertNotIn("Loopcut adds one line", refused["output"])
+        self.assertNotIn("still flag", session["items"][-1]["text"])
+        self.assertNotIn("still_flags", session["jobs"][0])
+
+    def test_a_passing_advisory_never_caps_and_adds_no_line(self):
+        session, turn = self.redo_turn("pass")
+        self.assertEqual(turn.outcome, "completed")
+        self.assertEqual(self.merges, [["armchair"]] * 3, "the model's own redoes all run")
+        cards = [i for i in session["items"] if i.get("name") == "delegate"]
+        self.assertEqual([c["status"] for c in cards], ["done"] * 3)
+        self.assertFalse(any("Redo:" in c["output"] for c in cards))
+        self.assertNotIn("still flag", session["items"][-1]["text"])
+        self.assertNotIn("still_flags", session["jobs"][0])
+
+    def test_a_turn_starts_at_most_max_waves(self):
+        with mock.patch.object(orchestrator, "MAX_WAVES", 2):
+            session, turn = self.redo_turn("pass")
+        self.assertEqual(self.merges, [["armchair"]] * 2)
+        refused = [i for i in session["items"] if i.get("name") == "delegate"][-1]
+        self.assertTrue(refused["output"].startswith("delegate refused; nothing started: this turn has started 2 "
+                                                     "waves, the most one turn starts."), refused["output"])
+        self.assertEqual(refused.get("plan_repair"), "capped")
+        self.assertEqual(session["items"][-1]["text"].split("\n\n")[0], "The armchair is on the rug.")
 
     def orchestrated_turn(self, user: str, replies: list, router_reply=None, **worker_scripts):
         """One orchestrator turn through agent._run: delegate through tools.execute, the workers, the
@@ -2992,8 +3076,8 @@ class WaveTest(unittest.TestCase):
         self.assertIn("[armchair] Armchair · modeling · done", items[2]["output"])
         self.assertTrue(session["items"][-1]["text"].endswith(
             "The armchair is on the rug.\n\nVerified by Loopcut on this scene: 1 of 1 checks.\n"
-            "Requirements (your words): 1 of 1 covered."), session["items"][-1]["text"])
-        self.assertEqual([e["status"] for e in session["jobs"][0]["coverage"]], ["covered"], "the JobLog has it too")
+            "These results cover selected checks only; they do not establish overall task completion."), session["items"][-1]["text"])
+        self.assertEqual([e["status"] for e in session["jobs"][0]["coverage"]], ["checks_passed"], "the JobLog has it too")
         self.assertEqual(seen, [1, 1], "once after the merge, once at the finish gate")
         log = session["jobs"][0]
         self.assertEqual((log["level"], log["bounces"], log["final_checks"]["passed"]), (2, 0, 1))

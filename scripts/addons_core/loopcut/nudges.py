@@ -1,6 +1,6 @@
 """Conversion cards: what Loopcut's account adds, said at the moment it matters, and no more often than that.
 
-loopcut-web docs/platform/onboarding-value-and-conversion.md §4 is the spec. The cards here:
+The cards here:
 - locked_tool (M1): the user asked for what a live cloud tool does and the tool is locked (signed out, no
   credits, wrong plan). The model calls loopcut_cloud.offer_tool; the add-on draws the card, never the model.
 - chatgpt (M2): the ChatGPT plan stopped (usage limit, or an account that can't share its plan); carry on
@@ -19,9 +19,10 @@ State lives in <data root>/nudges.json: timestamps and keys only, never content.
 
 import json
 import math
+import re
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 from . import config, state
 
@@ -143,8 +144,11 @@ def _not_now() -> dict:
 
 
 def locked_tool_card(tool: dict, balance=None) -> dict:
-    """M1. tool: cloud.locked_tools() row {name, title, why: sign_in|credits|plan, credits, own_key}."""
+    """A cloud.locked_tools() row, including client_version with optional min_app_version."""
     title, why, cost = tool["title"], tool["why"], tool.get("credits")
+    if why == "client_version":
+        return state.item_offer("locked_tool", _version_need(tool), "Update now to use this tool.",
+                                [_action("Update now", "web", "https://loopcut.org/download"), _not_now()])
     price = f"This uses about {cost:g} credits ({dollars(cost)})." if isinstance(cost, (int, float)) and cost else ""
     own_key = [_action("Use my own key", "vendor_keys")] if tool.get("own_key") else []
     if why == "sign_in":
@@ -162,12 +166,21 @@ def locked_tool_card(tool: dict, balance=None) -> dict:
                             + own_key + [_not_now()])
 
 
+def _version_need(tool: dict) -> str:
+    version = tool.get("min_app_version")
+    valid = isinstance(version, str) and len(version) <= 20 and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version)
+    need = f"Loopcut {version}" if valid else "a newer Loopcut version"
+    return f"{tool['title']} needs {need}"
+
+
 def model_note(tool: dict, balance=None) -> str:
     """What a locked tool needs, as a plain fact the model can say as it is, as a paid call's refusal says it: "Image
     to 3D needs about 80 credits; you have 15." balance: the account's, in offer_tool's result only; offer_schema
     says the price alone. rel019-lowcredit: "Locked … Image to 3D" became "photo-to-3D isn't available in this
     session", right after the free Try it had made a model from a photo."""
     why, credits = tool.get("why"), tool.get("credits")
+    if why == "client_version":
+        return _version_need(tool) + "; update now."
     if why == "credits" and type(credits) is int and credits > 0:
         have = (f"; you have {math.floor(balance):,}" if type(balance) in (int, float) and math.isfinite(balance)
                 and balance >= 0 else "")
@@ -183,9 +196,11 @@ def offer_locked(session: dict, tool: dict, balance=None) -> str:
     The card or pop-up and a refusal's pop-up (agent._Consent._paywall) never both show for a tool in one turn."""
     offered = session.setdefault("offered_tools", [])
     note = model_note(tool, balance)
+    version_locked = tool["why"] == "client_version"
+    key = f"{tool['name']}:client_version:{tool.get('min_app_version')}" if version_locked else tool["name"]
     turn = session.get("turn")
-    this_turn = tool["name"] in (getattr(turn, "credit_offers", None) or ())
-    if tool["name"] in offered or this_turn or not may_show("locked_tool"):
+    this_turn = not version_locked and tool["name"] in (getattr(turn, "credit_offers", None) or ())
+    if key in offered or this_turn or (not version_locked and not may_show("locked_tool")):
         return f"Not shown again. {note} Say so in one sentence and carry on with what you can do."
     item = credits_item(tool, balance) if tool["why"] == "credits" else None
     if item is not None:
@@ -194,10 +209,11 @@ def offer_locked(session: dict, tool: dict, balance=None) -> str:
             return f"Not shown again. {note} Say so in one sentence and carry on with what you can do."
     else:
         session["items"].append(locked_tool_card(tool, balance))
-        if isinstance(getattr(turn, "credit_offers", None), set):
+        if not version_locked and isinstance(getattr(turn, "credit_offers", None), set):
             turn.credit_offers.add(tool["name"])
-    offered.append(tool["name"])
-    mark_shown("locked_tool")
+    offered.append(key)
+    if not version_locked:
+        mark_shown("locked_tool")
     return (f"The user now sees a card with the way to unlock it. {note} Mention it in one short sentence; "
             "do not repeat the card or push it.")
 
@@ -235,7 +251,96 @@ def chatgpt_card(code: str) -> dict | None:
             "chatgpt", "This ChatGPT account can't share its plan",
             f"OpenAI decides that by plan, workspace and country. {fast}",
             keep_going + [_action("Use my own key", "own_key")])
+    if code in ("unsupported_country_region_territory", "country_not_supported"):
+        return state.item_offer(
+            "chatgpt", "ChatGPT is unavailable in this region",
+            "Continue this request with Loopcut Fast. From here this chat goes through Loopcut's server.",
+            keep_going)
     return None
+
+
+def chatgpt_reset(details: dict) -> str:
+    """A supplied reset timestamp, validated before displaying or scheduling it."""
+    value = details.get("resets_at") or details.get("reset_at")
+    try:
+        if type(value) in (int, float):
+            return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
+        if isinstance(value, str) and value:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return value
+    except (ValueError, OverflowError, OSError):
+        pass
+    return ""
+
+
+def combine_limits(session: dict, request: dict, item: dict) -> None:
+    """Main thread: one saved limit card for the two ways to resume the same request."""
+    from . import agent
+    current = agent._turn_items(session, request)
+    gone = {id(row) for row in current if (row.get("nudge") == "chatgpt"
+            or (row.get("kind") == "limit" and row.get("chatgpt_limit")))}
+    session["items"][:] = [row for row in session["items"] if id(row) not in gone]
+    if (state.ui.get("allowance_notice") or {}).get("conversation") == session.get("id"):
+        state.clear_allowance_notice()
+    limit = request.get("loopcut_chatgpt_limit")
+    # Rebuilt from the validated reset only: a saved chat may carry a damaged marker, and the card is drawn every frame.
+    item["chatgpt_limit"] = {"resets_at": chatgpt_reset(limit) if isinstance(limit, dict) else ""}
+    item["text"] = "Your Loopcut credits and ChatGPT plan allowance are used. Your request is saved."
+    session["items"].append(item)
+
+
+_reset_waits = {}  # Session-local, explicit choices only; never restored as automatic retries.
+
+
+def chatgpt_reset_pending(item: dict) -> bool:
+    return id(item) in _reset_waits
+
+
+def chatgpt_reset_wait(item: dict) -> float:
+    try:
+        reset = datetime.fromisoformat(item["chatgpt_limit"]["resets_at"].replace("Z", "+00:00"))
+        return max(0.0, reset.replace(tzinfo=reset.tzinfo or timezone.utc).timestamp() - time.time())
+    except (KeyError, ValueError, TypeError, OverflowError):
+        return 0.0
+
+
+def watch_chatgpt_reset(session: dict, item: dict) -> bool:
+    """Handle a click before reset by arming or cancelling one retry. False means try now."""
+    if _reset_waits.pop(id(item), None) is not None:
+        return True
+    if not state.can_resume(session):
+        return False
+    remaining = chatgpt_reset_wait(item)
+    if not remaining:
+        return False
+    reset_at = time.time() + remaining
+    import bpy
+    stopped = session["messages"][-1]
+
+    def check():
+        if _reset_waits.get(id(item)) is not check:
+            return None
+        if (state.session() is not session or not state.can_resume(session)
+                or session["messages"][-1] is not stopped or item.get("status") == "done"
+                or not any(row is item for row in session["items"])):
+            _reset_waits.pop(id(item), None)
+            return None
+        remaining = reset_at - time.time()
+        if remaining > 0:
+            return min(remaining, 30.0)
+        from . import settings
+        prefs = settings.preferences()
+        _reset_waits.pop(id(item), None)
+        if prefs is None or prefs.provider != "LOOPCUT":
+            return None
+        from .ui import host
+        index = next(n for n, row in enumerate(session["items"]) if row is item)
+        host._do_action(session, ("limit_chatgpt", index))
+        return None
+
+    _reset_waits[id(item)] = check
+    bpy.app.timers.register(check, first_interval=max(1.0, min(remaining, 30.0)), persistent=True)
+    return True
 
 
 TRIAL_CHIPS = {  # Live tool → (chip, the request it writes into the input; nothing runs until the user sends it).

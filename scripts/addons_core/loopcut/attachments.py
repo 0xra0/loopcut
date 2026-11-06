@@ -21,7 +21,8 @@ from . import conversations
 from .videoref import MAX_SECONDS as MAX_CLIP_SECONDS, VIDEO_EXTENSIONS, ClipError, is_video  # noqa: F401
 
 EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".tga")
-ACCEPTED = EXTENSIONS + VIDEO_EXTENSIONS  # What the file browser and a drop offer.
+MODEL_EXTENSIONS = (".glb", ".gltf", ".fbx", ".obj")
+ACCEPTED = EXTENSIONS + MODEL_EXTENSIONS + VIDEO_EXTENSIONS
 MAX_PER_MESSAGE = 6
 MAX_SIDE = 2048            # The stored copy; workspace requests and look_at_reference read details from it.
 SEND_SIDE = 768            # The cheap loop's copy; workspace requests use MAX_SIDE instead.
@@ -31,6 +32,93 @@ MAX_CLIP_BYTES = 2_000_000_000  # A phone's 4K minute is about 400 MB; only the 
 
 class AttachmentError(Exception):
     pass
+
+
+def paste_image(session: dict, context) -> list[str]:
+    """Read Blender's native clipboard image in a temporary Image Editor context."""
+    area = context.area
+    if area is None:
+        return ["Paste an image in the Loopcut panel, or attach an image file."]
+    old_type, old_ui_type = area.type, area.ui_type
+    space = previous = image = None
+    temporary = None
+    try:
+        area.type = "IMAGE_EDITOR"
+        space = area.spaces.active
+        previous = space.image
+        region = next(r for r in area.regions if r.type == "WINDOW")
+        with context.temp_override(area=area, region=region):
+            if not bpy.ops.image.clipboard_paste.poll():
+                return ["No image is available on the clipboard. Copy an image, or attach an image file."]
+            if "FINISHED" not in bpy.ops.image.clipboard_paste():
+                return ["Could not paste the clipboard image. Try attaching an image file."]
+        image = space.image
+        if image is None or image is previous or not all(image.size):
+            return ["Could not read the clipboard image. Try attaching an image file."]
+        handle, temporary = tempfile.mkstemp(suffix=".png", prefix="loopcut-clipboard-")
+        os.close(handle)
+        image.filepath_raw, image.file_format = temporary, "PNG"
+        image.save()
+        count = len(session["attachments"])
+        problems = add(session, [temporary])
+        for attached in session["attachments"][count:]:
+            attached["name"] = "Clipboard image.png"
+            attached.pop("source", None)  # The temporary source is deleted; use the stored full image.
+        return problems
+    except (OSError, RuntimeError, AttributeError, StopIteration) as ex:
+        return [f"Could not paste the clipboard image: {ex}. Try attaching an image file."]
+    finally:
+        if space is not None:
+            space.image = previous
+        if image is not None and image is not previous:
+            bpy.data.images.remove(image)
+        area.type = old_type
+        area.ui_type = old_ui_type
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def import_models(session: dict, paths: list[str]) -> list[str]:
+    """A model dropped on the panel goes into the scene; it is never encoded as an image."""
+    from . import state
+    problems = []
+    attempted = False
+    for raw in paths:
+        source = Path(raw)
+        try:
+            if not source.is_file():
+                raise AttachmentError("the file is missing")
+            if source.stat().st_size > MAX_FILE_BYTES:
+                raise AttachmentError(f"the model exceeds {MAX_FILE_BYTES // 1_000_000} MB; import it with File > Import")
+            suffix = source.suffix.lower()
+            if suffix in (".glb", ".gltf"):
+                importer = bpy.ops.import_scene.gltf
+            elif suffix == ".fbx":
+                importer = bpy.ops.import_scene.fbx
+            elif suffix == ".obj":
+                importer = bpy.ops.wm.obj_import
+            else:
+                raise AttachmentError("use a GLB, glTF, FBX or OBJ file")
+            attempted = True  # Even a failed importer can leave geometry behind.
+            result = importer(filepath=str(source))
+            if "FINISHED" not in result:
+                raise AttachmentError("the importer cancelled")
+        except AttributeError:
+            problems.append(f"Could not import {source.name}: its Blender importer is unavailable. Enable it, or use File > Import.")
+            continue
+        except (AttachmentError, OSError, RuntimeError) as ex:
+            problems.append(f"Could not import {source.name}: {ex}.")
+            continue
+        note = f"Imported {source.name} into the scene."
+        session["items"].append(state.item_notice(f"{note} Tell Loopcut what to do with it."))
+        session.setdefault("between_turns", []).append(note)
+    if attempted:
+        try:
+            if "FINISHED" not in bpy.ops.ed.undo_push(message="Import model"):
+                raise RuntimeError("undo was cancelled")
+        except (AttributeError, RuntimeError) as ex:
+            problems.append(f"Could not record import undo: {ex}. Inspect the scene for imported or partial geometry.")
+    return problems
 
 
 def _to_png(source: Path, target: Path, max_side: int = MAX_SIDE) -> tuple[int, int]:

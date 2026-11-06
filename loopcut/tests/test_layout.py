@@ -101,7 +101,7 @@ class VerificationStyleTest(unittest.TestCase):
         prose = [p for p in drawn["prims"] if p["id"].startswith("item0.p")]
         folded = [p for p in drawn["prims"] if p["id"].startswith("item0.verification.summary.l")]
         self.assertEqual(" ".join(p["text"] for p in prose), summary)
-        self.assertEqual([p["text"] for p in folded], ["Checked: 2 of 2 pass, 1 partly covered ▸"])
+        self.assertEqual([p["text"] for p in folded], ["Checked: 2 of 2 pass, 1 partly checked ▸"])
         self.assertLess(max(p["y"] for p in prose), folded[0]["y"], "the summary first")
         self.assertFalse(any(p["id"].startswith("item0.verification.l") for p in drawn["prims"]), "details folded")
         self.assertFalse(any("o3" in p.get("text", "") for p in drawn["prims"]), "no check ids on the line")
@@ -112,21 +112,21 @@ class VerificationStyleTest(unittest.TestCase):
         opened = build(session)
         details = [p for p in opened["prims"] if p["id"].startswith("item0.verification.l")]
         self.assertEqual(prim(opened, "item0.verification.summary.l0")["text"],
-                         "Checked: 2 of 2 pass, 1 partly covered ▾")
+                         "Checked: 2 of 2 pass, 1 partly checked ▾")
         self.assertEqual(" ".join(p["text"] for p in details), block.replace("\n", " "), "today's details")
-        self.assertIn('- partly covered: "a red ball bouncing on a wooden floor": o3, o4 pass; nothing measures "on" '
+        self.assertIn('- partly checked: "a red ball bouncing on a wooden floor": o3, o4 pass; nothing measures "on" '
                       '(a contact check would)', block)
         self.assertGreater(details[0]["y"], prim(opened, "item0.verification.summary.l0")["y"])
         self.assertEqual(hit(opened, "item0.verification.toggle")["action"], ("toggle", 0))
         passing = build(self.final_reply(summary, self.ROWS[:1], ["a red ball"]))
-        self.assertEqual(prim(passing, "item0.verification.summary.l0")["text"], "✓ Checked: 1 of 1 pass ▸")
+        self.assertEqual(prim(passing, "item0.verification.summary.l0")["text"], "Checked: 1 of 1 pass ▸")
 
     def test_a_reply_with_no_text_of_its_own_still_reads_alone(self):
         from loopcut import orchestrator
         session = self.final_reply("", self.ROWS[:1], ["a red ball"])
         drawn = build(session)
         self.assertEqual([p["text"] for p in drawn["prims"] if p["id"].startswith("item0.") and p.get("text")],
-                         ["Done. ✓ Checked: 1 of 1 pass ▸"])
+                         ["Checked: 1 of 1 pass ▸", "Copy"])
         self.assertNotIn("item0.verification.rule", ids(drawn, "prims"), "no rule over nothing")
         self.assertEqual(orchestrator.checked_line("Not verified by Loopcut: the checks could not run (x).", alone=True),
                          "Not checked")
@@ -135,19 +135,23 @@ class VerificationStyleTest(unittest.TestCase):
         two = f"{failing}\n\nPlacement measured this turn: 2 of 2 checks.\nThe dog rests on Ground."
         self.assertEqual(orchestrator.checked_line(two), "Checked: 3 of 4 pass", "every block's checks")
 
-    def test_the_panel_says_your_words_and_the_model_keeps_the_users_words(self):
+    def test_scope_and_known_gaps_reach_the_panel_and_model_and_legacy_blocks_still_open(self):
+        from loopcut import orchestrator
         session = self.final_reply("Done.", self.ROWS)
         session["items"][0]["expanded"] = True
         drawn = " ".join(p.get("text", "") for p in build(session)["prims"])
-        self.assertIn("Requirements (your words): 0 of 1 covered, 1 partly covered.", drawn)
+        self.assertIn("Request checks: 1 partly checked.", drawn)
+        self.assertIn(orchestrator.CHECK_SCOPE, drawn)
         self.assertNotIn("the user's words", drawn)
         self.assertNotIn("the user", session["items"][0]["text"])
-        self.assertIn("Requirements (the user's words): 0 of 1 covered, 1 partly covered.",
+        self.assertIn("Request checks: 1 partly checked.",
                       session["messages"][0]["content"], "the model's copy is unchanged")
-        old = session["messages"][0]["content"]  # A reply saved before 0.2.20: the model's wording on the item too.
+        old = ("Done.\n\nVerified by Loopcut on this scene: 2 of 2 checks.\n"
+               "Requirements (the user's words): 0 of 1 covered, 1 partly covered.")
         session["items"][0].update(text=old, verification=old.split("\n\n", 1)[1])
         drawn = " ".join(p.get("text", "") for p in build(session)["prims"])
         self.assertIn("Requirements (your words): 0 of 1 covered, 1 partly covered.", drawn)
+        self.assertIn("Checked: 2 of 2 pass, 1 partly checked", drawn)
         self.assertNotIn("the user's words", drawn)
 
     def test_no_step_notice_is_plain_and_last(self):
@@ -453,11 +457,24 @@ class HeaderTest(unittest.TestCase):
         display = build(state.new_session(), view="jobs", jobs=[row])
         self.assertEqual(hit(display, "job.job1.job_resume")["action"], ("job_resume", "job1"))
 
+    def test_a_job_row_says_it_saved_a_checkpoint_not_its_revision_hash(self):
+        """rel020-pro (2026-10-26): "Saved revision cf8c7d4c78ff" in the jobs list; the row keeps the revision."""
+        row = {"id": "job_cf8c7d4c78ff00", "state": "done", "frames": [1], "format": "PNG", "camera": "Camera",
+               "width": 640, "height": 480, "samples": 32, "budget_seconds": 60, "scene_revision": "cf8c7d4c78ff1234",
+               "progress": {"completed": 1}}
+        display = build(state.new_session(), view="jobs", jobs=[row])
+        self.assertEqual(texts(display)["job.job_cf8c7d4c78ff00.note"], "Saved a checkpoint")
+        self.assertNotIn("cf8c7d4c78ff", " ".join(p["text"] for p in display["prims"] if p["t"] == "text"))
+        self.assertEqual(row["scene_revision"], "cf8c7d4c78ff1234")
+        row["error"] = "Render failed: out of memory"
+        self.assertEqual(texts(build(state.new_session(), view="jobs", jobs=[row]))["job.job_cf8c7d4c78ff00.note"],
+                         "Render failed: out of memory", "an error still says itself")
+
     def test_icon_buttons_with_tooltips_sit_at_the_right(self):
         display = build()
         buttons = [hit(display, id) for id, _, _ in layout.HEADER_BUTTONS]
-        self.assertEqual([b["action"][0] for b in buttons], ["close_panel", "service_settings", "history_open", "new_chat", "jobs_open"])
-        self.assertEqual([b["tip"] for b in buttons], ["Close panel", "Settings", "History", "New chat", "Background jobs"])
+        self.assertEqual([b["action"][0] for b in buttons], ["close_panel", "service_settings", "history_open", "new_chat", "jobs_open", "copy_menu"])
+        self.assertEqual([b["tip"] for b in buttons], ["Close panel", "Settings", "History", "New chat", "Background jobs", "Conversation menu"])
         xs = [b["x"] for b in buttons]
         self.assertEqual(xs, sorted(xs, reverse=True), "close is rightmost, then settings, history, new")
         self.assertLess(xs[-1] + buttons[-1]["w"], 420)
@@ -576,15 +593,35 @@ class ToolCardLabelTest(unittest.TestCase):
         self.assertEqual(item, original, "layout must preserve the stored identifier and summary")
         return display
 
-    def test_duplicate_identifier_is_drawn_once(self):
-        for summary in ("", "get_scene_info"):
+    def test_a_card_never_shows_the_tools_id_and_its_plain_words_once(self):
+        """rel020-axe and rel020-pro (2026-10-26): "run_python", "import_asset" on cards. The card keeps the id (the
+        model's copy is exact); what it draws is its plain words, once."""
+        for summary in ("", "Read the scene"):
             for expanded in (False, True):
                 with self.subTest(summary=summary, expanded=expanded):
                     display = self.display(summary, expanded)
                     labels = [p["text"] for p in display["prims"]
                               if p["t"] == "text" and p["id"].startswith("item0.tool.")]
-                    self.assertEqual(labels.count("get_scene_info"), 1)
+                    self.assertEqual(labels.count("Read the scene"), 1)
+                    self.assertNotIn("get_scene_info", labels)
                     self.assertNotIn("item0.tool.name", ids(display, "prims"))
+        for name, status, words in (("run_python", "done", "Ran a script"), ("run_python", "awaiting", "Runs a script"),
+                                    ("run_python", "failed", "Runs a script"),
+                                    ("import_asset", "done", "Added a library model"),
+                                    ("import_asset", "awaiting", "Adds a library model"),
+                                    ("delegate", "done", "Worked with helpers")):
+            with self.subTest(name=name, status=status):
+                session = state.new_session()
+                item = dict(state.item_tool(name, "Add three runes to the blade", ""), status=status, expanded=True)
+                session["items"].append(item)
+                shown = " ".join(p["text"] for p in build(session)["prims"] if p["t"] == "text")
+                self.assertIn(words, shown)
+                self.assertNotIn(name, shown)
+                self.assertEqual(item["name"], name, "the card's record keeps the id")
+        session = state.new_session()
+        session["items"].append(dict(state.item_tool("some_new_tool", "", ""), status="done", expanded=True))
+        self.assertNotIn("some_new_tool", " ".join(p["text"] for p in build(session)["prims"] if p["t"] == "text"),
+                         "a tool with no plain words shows none, never its id")
 
     def test_collapsed_card_gives_the_title_the_available_width(self):
         title = "Read the current scene information"
@@ -610,10 +647,10 @@ class ToolCardLabelTest(unittest.TestCase):
         display = build(session, now=1045.0)
         self.assertLessEqual(right(prim(display, "item0.tool.running")), prim(display, "item0.tool.name")["x"])
 
-    def test_expanded_card_retains_the_technical_identifier(self):
+    def test_expanded_card_shows_the_tools_plain_words(self):
         display = self.display("Scene information", expanded=True)
         self.assertEqual(prim(display, "item0.tool.summary")["text"], "Scene information")
-        self.assertEqual(prim(display, "item0.tool.name")["text"], "get_scene_info")
+        self.assertEqual(prim(display, "item0.tool.name")["text"], "Read the scene")
         self.assertEqual(hit(display, "item0.tool.card")["action"], ("toggle", 0))
 
     def test_awaiting_summary_is_complete_at_panel_sizes(self):
@@ -640,7 +677,7 @@ class ToolCardLabelTest(unittest.TestCase):
                         self.assertEqual(current["y"], previous["y"] + previous["h"])
 
                     names = [p for p in frame.prims if p["id"].startswith("item0.tool.name")]
-                    self.assertEqual([p["text"] for p in names], ["run_python"])
+                    self.assertEqual([p["text"] for p in names], ["Runs a script"])
                     name = names[0]
                     self.assertEqual(name["size"], frame.px(T.FONT_SIZE_SMALL))
                     self.assertGreaterEqual(name["y"], rows[-1]["y"] + rows[-1]["h"])
@@ -1075,7 +1112,13 @@ class CodeCorrectionTest(unittest.TestCase):
                         self.assertNotEqual(prim(display, "item0.tool.glyph")["text"], "✓")
                         self.assertEqual(prim(display, "item0.tool.glyph")["color"], T.TEXT_MUTED)
                         self.assertEqual(prim(display, "item0.tool.details.label")["text"], "Details")
-                        self.assertIn("correcting it" if busy else "Loopcut carried on", self.note(display))
+                        # A later step has run, busy or not: it carried on (rel020-pro: "is correcting it" stayed
+                        # on a step fixed minutes before), never "Recovered".
+                        self.assertIn("Loopcut carried on", self.note(display))
+                        self.assertNotIn("correcting", self.note(display))
+                        alone = self.display(items[:2], busy=busy, active_turn_id="one")
+                        self.assertIn("correcting it" if busy else "This step failed", self.note(alone),
+                                      "the turn's last step: still being corrected while the turn runs")
 
     def test_terminal_error_stays_red_even_after_a_later_success(self):
         for ending in (state.item_error("Connection dropped"), state.item_limit("Allowance used", "week_limit", "free", "", None)):
@@ -1585,7 +1628,7 @@ class QueuedTest(unittest.TestCase):
         self.assertEqual(hit(display, "item1.send_now")["action"], ("send_queued_now", 1))
         self.assertEqual(texts(display)["item1.send_now.label.l0"], "Stop helper and send now")
         self.assertEqual([h["id"] for h in display["hits"] if h["id"].startswith("item1.")],
-                         ["item1.send_now"])
+                         ["item1.send_now", "item1.copy"])
         session["items"][0]["rows"][0]["status"] = "done"
         display = build(session)
         self.assertEqual(delivery(display), "Waiting for Loopcut to reply")
@@ -1675,7 +1718,7 @@ class DelegateDetailsTest(unittest.TestCase):
         session = chat(refused)
         session["items"].append(retry)
         display = layout.build(session, 900, 2000, 1.0, measure)
-        self.assertEqual(texts(display)["item0.tool.summary"], "Adjusted the helper plan and retried")
+        self.assertEqual(texts(display)["item0.tool.summary"], "Changed the plan and tried again")
         self.assertEqual(texts(display)["item0.tool.glyph"], "✓")
         retry["plan_started"] = True
         self.assertEqual(texts(layout.build(session, 900, 2000, 1.0, measure))["item0.tool.summary"],
@@ -1702,7 +1745,7 @@ class DelegateDetailsTest(unittest.TestCase):
                 self.assertTrue("Helper limit for this turn".startswith(texts(display)["item0.tool.summary"].rstrip("…")))
                 self.assertEqual(prim(display, "item0.tool.glyph"), {**prim(display, "item0.tool.glyph"),
                                                                      "text": "–", "color": T.TEXT_MUTED})
-                self.assertNotIn("Helper plan needs adjustment", " ".join(texts(display).values()))
+                self.assertNotIn("The plan needs changes", " ".join(texts(display).values()))
                 if expanded:
                     self.assertIn("this turn can start 0 more workers", " ".join(texts(display).values()))
                     self.assertEqual(prim(display, "item0.tool.output.l0")["color"], T.TEXT_MUTED)
@@ -1727,8 +1770,8 @@ class DelegateDetailsTest(unittest.TestCase):
                 self.assertNotIn("workers[0]", visible)
                 self.assertNotIn("$0.40", visible)
                 self.assertNotIn("item0.tool.reason", ids(display, "prims"))
-                expected = {"resolved": "Helper started", "adjusting": "Adjusting the helper plan…",
-                            "needed": "Helper plan needs adjustment"}[repair]
+                expected = {"resolved": "Helper started", "adjusting": "Changing the plan…",
+                            "needed": "The plan needs changes"}[repair]
                 # The collapsed line may ellipsize at narrow widths.
                 self.assertTrue(expected.startswith(texts(display)["item0.tool.summary"].rstrip("…")))
                 self.assertEqual(prim(display, "item0.tool.glyph")["color"] == T.ERROR, repair == "needed")
@@ -1746,11 +1789,11 @@ class DelegateDetailsTest(unittest.TestCase):
             session = chat(refused, busy=True)
             session["items"].append(retry)
             session["turn"] = types.SimpleNamespace(plan_turn="turn1")
-            self.assertEqual(texts(build(session))["item0.tool.summary"], "Adjusting the helper plan…")
+            self.assertEqual(texts(build(session))["item0.tool.summary"], "Changing the plan…")
             retry["plan_started"] = True
             self.assertEqual(texts(build(session))["item0.tool.summary"], "Helper started")
             retry["plan_workers"] = [["b", "modeling"]]
-            self.assertEqual(texts(build(session))["item0.tool.summary"], "Adjusting the helper plan…")
+            self.assertEqual(texts(build(session))["item0.tool.summary"], "Changing the plan…")
         session["busy"] = False
         self.assertEqual(prim(build(session), "item0.tool.glyph")["color"], T.ERROR)
         session.update(busy=True, turn=types.SimpleNamespace(plan_turn="turn2"))
@@ -2456,7 +2499,12 @@ class WaveCardTest(unittest.TestCase):
                     worker("floor_lamp", "working", steps=3, role="lighting", note="Rolled back an edit to Rug"))
         display = build(chat(item, busy=True))
         t = texts(display)
-        self.assertEqual(t["item0.wave.title"], "Wave 1 · 2 workers")
+        self.assertEqual(t["item0.wave.title"], "Working on it · 2 helpers")
+        self.assertEqual(item["text"], "Wave 1 · 2 workers", "the record keeps its own words")
+        item["rows"][1]["status"] = "done"
+        self.assertEqual(texts(build(chat(item)))["item0.wave.title"], "Finished · 2 helpers")
+        item["rows"] = item["rows"][:1]
+        self.assertEqual(texts(build(chat(item)))["item0.wave.title"], "Finished · 1 helper")
         self.assertEqual([t["item0.wave.row0.name"], t["item0.wave.row1.name"]], ["Armchair", "Floor_Lamp"])
         self.assertEqual([t["item0.wave.row0.status"], t["item0.wave.row1.status"]], ["done", "working"])
         self.assertEqual(t["item0.wave.row0.detail"], "modeling · 14 steps · checks 5/5")

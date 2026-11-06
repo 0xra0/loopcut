@@ -227,5 +227,30 @@ class OwnedConflictWhyTest(unittest.TestCase):
         self.assertEqual(ownership.differs({"loc": [1.0], "rot": [0]}, {"loc": [1.0], "hide": [True]}), ["hide", "rot"])
 
 
+class NodeInputsTest(unittest.TestCase):
+    """A Geometry Nodes modifier's inputs, which merge checks for held-back targets: Blender 5.2 keeps them as
+    properties.inputs.<socket>.value and refuses keys() (every merge of a build with one failed, 2026-11-01)."""
+
+    def test_blender_5_2_inputs_are_read_from_their_values(self):
+        prop = lambda name, kind: types.SimpleNamespace(identifier=name, type=kind)
+        target = object()
+        inputs = types.SimpleNamespace(
+            bl_rna=types.SimpleNamespace(properties=[prop("rna_type", "POINTER"), prop("name", "STRING"),
+                                                     prop("Socket_0", "POINTER"), prop("Socket_1", "POINTER")]),
+            name="", Socket_0=types.SimpleNamespace(value=None), Socket_1=types.SimpleNamespace(value=target))
+
+        class Modifier:
+            properties = types.SimpleNamespace(inputs=inputs)
+
+            def keys(self):
+                raise TypeError("bpy_struct.keys(): this type doesn't support IDProperties")
+        self.assertEqual(merge._node_inputs(Modifier()), [None, target])
+
+    def test_earlier_blender_inputs_are_its_id_properties(self):
+        class Modifier(dict):
+            pass
+        self.assertEqual(merge._node_inputs(Modifier(Socket_1="Empty")), ["Empty"])
+
+
 if __name__ == "__main__":
     unittest.main()

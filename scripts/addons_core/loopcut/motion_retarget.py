@@ -912,6 +912,11 @@ def retarget(source, ob, rig, *, scene, frame_start, in_place=False, fingers=Tru
     ground_s = min(min(p[side + ("ToeBase" if toes else "Foot")][1].z for side in ("Left", "Right")) for p in poses)
     ground_t = min(current[tb[f"{'toe' if toes else 'foot'}_{s}"]].z for s in "lr")
     anchor = (current[tb["thigh_l"]] + current[tb["thigh_r"]]) * 0.5
+    # Standing height: when the source stands at its rest height, the target stands at its own. Scaling the source's
+    # pelvis height by leg length alone assumes the feet are in proportion too; short legs on big feet (Muse, a plush
+    # mascot: 15-20 cm) sank into the floor. Only the motion relative to standing is scaled by k.
+    standing_s = pelvis(src_rest).z - min(src_rest[side + ("ToeBase" if toes else "Foot")].z for side in ("Left", "Right"))
+    lift = (anchor.z - ground_t) - standing_s * k
     first = poses[0]
     psi = _yaw_between((first["LeftLeg"][1] - first["RightLeg"][1]).cross(Vector((0, 0, 1))),
                        (current[tb["thigh_l"]] - current[tb["thigh_r"]]).cross(Vector((0, 0, 1))))
@@ -996,7 +1001,7 @@ def retarget(source, ob, rig, *, scene, frame_start, in_place=False, fingers=Tru
                 else:
                     arm[n] = chain
             p = travel[f]
-            want = mw_inv @ (Vector((anchor.x, anchor.y, ground_t))
+            want = mw_inv @ (Vector((anchor.x, anchor.y, ground_t + lift))
                              + psi @ (Vector((p[0] - travel[0][0], p[1] - travel[0][1], p[2] - ground_s)) * k))
             p0 = (arm[pelvis_bones[0]].translation + arm[pelvis_bones[1]].translation) * 0.5
             b = bones[root]

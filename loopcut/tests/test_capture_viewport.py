@@ -138,6 +138,32 @@ class CaptureTest(unittest.TestCase):
         with self.assertRaisesRegex(tools.ToolError, "Nothing visible to frame"):
             self.look(focus=[parent.name])
 
+    def test_a_detail_with_the_object_it_is_on_is_framed_close(self):
+        """rel020-axe (2026-10-26): focus on the axe head and its runes framed the whole head, the strokes read as
+        "subtle" and were not there. The runes (inside the head's box, under half its size) are framed alone, the
+        head in view around them; a cup on a table is not a detail (its centre is above the table's box), and a
+        sheet, for placement, frames everything asked for."""
+        boxes = {"Head": ((-0.21, -0.06, 0.65), (0.14, 0.03, 0.99)), "Runes": ((-0.17, -0.013, 0.74), (-0.13, -0.006, 0.94)),
+                 "Table": ((-1.0, -1.0, 0.0), (1.0, 1.0, 0.75)), "Cup": ((-0.05, -0.05, 0.75), (0.05, 0.05, 0.85))}
+        objects = {name: types.SimpleNamespace(name=name, type="MESH", visible_get=lambda: True,
+                                               bound_box=[(-1, -1, -1), (1, 1, 1)]) for name in boxes}
+        self.scene.objects.extend(objects.values())
+        tools.bpy.data = types.SimpleNamespace(objects=objects)
+        self.enterContext(mock.patch.object(tools, "_box_of", lambda obj: boxes[obj.name]))
+        result = self.look(focus=["Head", "Runes"], angle="front")
+        self.assertEqual(self.framed.call_args.args[1], [objects["Runes"]])
+        self.assertIn("front view of Runes, framed close as a detail on Head (focus Head alone for the whole);",
+                      result.text)
+        self.look(focus=["Head"], angle="front")
+        self.assertEqual(self.framed.call_args.args[1], [objects["Head"]], "the whole, when asked alone")
+        self.look(focus=["Table", "Cup"], angle="three_quarter")
+        self.assertEqual(self.framed.call_args.args[1], [objects["Table"], objects["Cup"]], "on it, not a detail of it")
+        self.framed.reset_mock()
+        self.look(focus=["Head", "Runes"], angle="sheet")
+        self.assertEqual(self.framed.call_args_list[0].args[1], [objects["Head"], objects["Runes"]])
+        self.assertEqual(tools.detail_names({"Head": boxes["Head"], "Runes": boxes["Runes"], "Table": boxes["Table"]}),
+                         ["Runes"])
+
     def test_geometry_target_keeps_its_own_bounds(self):
         cube = self.scene.objects[0]
         cube.children_recursive = [types.SimpleNamespace(name="Distant", type="MESH")]
@@ -239,6 +265,7 @@ class CaptureTest(unittest.TestCase):
         from loopcut import shaders, video_attach
         self.draw.reset_mock()
         reference = self.folder / "reference.png"
+        reference.write_bytes(b"synthetic reference")
         fake_numpy = types.SimpleNamespace(ones=lambda *args, **kwargs: mock.MagicMock(), float32="float32")
         clip_frame = (reference, 34, "take.mp4 clip frame 94 (3.10 s)")
         self.scene.frame_current, self.scene.frame_set = 1, mock.Mock()

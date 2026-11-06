@@ -100,6 +100,8 @@ def _pump() -> float:
     if _turn_running():
         from . import agent
         agent.check_stall(time.monotonic() - first if first is not None else 0.0)
+    from . import view_follow
+    view_follow.sample()  # Whether the user is moving a 3D view, which framing what was added leaves alone.
     now = time.monotonic()
     period = _animating()
     if _redraw_requested or (period is not None and now - _animated_at >= period):

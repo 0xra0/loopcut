@@ -40,7 +40,7 @@ def _fingerprint(descriptor, arguments, files, project):
     from . import blobs
     fields = {row['field'] for row in descriptor.get('file_inputs', [])}
     try:
-        hashes = {k: blobs.sha256(Path(path)) for k, path in files.items()}
+        hashes = {k: blobs.digest(path) for k, path in files.items()}  # Stored: a kept file, by its hash.
     except OSError as ex:
         raise cloud_http.CloudError('A cloud input changed or could not be read.', 'invalid_input', 422,
                                     {'field': 'files'}) from ex
@@ -363,7 +363,7 @@ def _quote(module, descriptor, arguments, files, project, cancel, runtime, clien
 
 
 def authorize(module, descriptor, arguments, files, *, project, cancel, runtime, client, notice='', notice_first=False,
-              on_progress=None, offer=None):
+              on_progress=None, offer=None, input_warning=''):
     """Worker: resolve a runtime quote before consent, then forward its ID. offer: a long render's local time
     (render_offer.prepare), which makes its card the choice between the cloud and this computer."""
     _check_cancel(cancel)
@@ -395,6 +395,9 @@ def authorize(module, descriptor, arguments, files, *, project, cancel, runtime,
             runtime.quotes[quote['quote_id']] = quote
             runtime.quote_requests[quote['quote_id']] = arguments.fingerprint
     details = approval_details(descriptor, quote)
+    from . import spending
+    if input_warning:
+        details.update(input_warning=input_warning, required=True)
     if descriptor.get('name') == 'auto_rig':
         details['rig_notice'] = notice
     elif notice:
@@ -405,9 +408,25 @@ def authorize(module, descriptor, arguments, files, *, project, cancel, runtime,
     if offer and quote is not None:
         from . import render_offer
         details["render_offer"] = render_offer.choice(offer, quote)
-    _check_cancel(cancel)
-    confirm(details)
-    _check_cancel(cancel)
+    backend = descriptor.get('backend', 'managed')
+    if spending.paid(details) and spending.first_use(runtime, descriptor['name'], backend):
+        # Recheck under the consent lock: another call may approve this tool while we wait.
+        consent_lock = getattr(runtime, 'paid_consent_lock', spending.lock)
+        while not consent_lock.acquire(timeout=.1):
+            _check_cancel(cancel)
+        try:
+            _check_cancel(cancel)
+            if spending.first_use(runtime, descriptor['name'], backend):
+                details.update(first_use=True, required=True)
+                confirm(details)
+                _check_cancel(cancel)
+                spending.note_use(runtime, descriptor['name'], backend)
+        finally:
+            consent_lock.release()
+    if not details.get('first_use'):
+        _check_cancel(cancel)
+        confirm(details)
+        _check_cancel(cancel)
     arguments.quote = quote
     arguments.receipt = dict(arguments)
     return arguments

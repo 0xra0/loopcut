@@ -1452,3 +1452,44 @@ class JobChoiceCardTest(ChoiceLayoutTest):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MadeLastTest(unittest.TestCase):
+    """rel020-pro: a typewriter added in a new chat, then "render it in the cloud" rendered the forest camera, where the
+    typewriter was a speck. The render request's scene context says plainly when the scene camera leaves out what the
+    chat made last (render_offer.made_line), a fact for the model, never a refusal."""
+
+    def test_the_fact_when_the_newest_thing_is_off_camera_or_tiny_in_it(self):
+        typewriter = ["Old Fasioned Type Writer"]
+        tiny = {"inside": 1.0, "bounds": (.49, .505, .3, .31)}  # A 28 cm prop 15 m from a 29 mm lens.
+        self.assertEqual(render_offer.made_fact(typewriter, "Camera", tiny),
+                         'render note: what this chat made last (Old Fasioned Type Writer) is tiny in the scene camera '
+                         '"Camera"\'s shot (about 2% of the frame across). If the user means it, ask which shot they '
+                         'want or frame it before rendering.')
+        self.assertIn("(under 1% of the frame across)",
+                      render_offer.made_fact(typewriter, "Camera", {"inside": 1.0, "bounds": (.5, .502, .5, .503)}))
+        for off in ({"inside": 0.0, "bounds": (1.2, 1.4, .2, .4)}, {"inside": 0.0, "bounds": None}, None):
+            with self.subTest(off=off):
+                self.assertIn('(Old Fasioned Type Writer) is not in the scene camera "Camera"\'s shot.',
+                              render_offer.made_fact(typewriter, "Camera", off))
+        self.assertEqual(render_offer.made_fact(typewriter, "Camera", {"inside": 1.0, "bounds": (.3, .7, .2, .8)}), "",
+                         "framed at a fair size: nothing to say")
+        names = [f"Part {n}" for n in range(5)]
+        self.assertIn("(Part 0, Part 1, Part 2 and 2 more)", render_offer.made_fact(names, "Camera", None))
+
+    def test_made_line_measures_what_is_left_of_it_in_the_scene_cameras_shot(self):
+        from loopcut import camera
+        scene = types.SimpleNamespace(objects={"Typewriter": object(), "Forest": object()}, camera=object())
+        measured = []
+        def coverage(name, names):
+            measured.append((name, names))
+            return {"camera": "Camera", "all": {"inside": 0.0, "bounds": None}}
+        with patch.object(bpy, "context", types.SimpleNamespace(scene=scene), create=True), \
+                patch.object(camera, "coverage", coverage):
+            line = render_offer.made_line(["Typewriter", "Deleted since"])
+            self.assertEqual(measured, [("", ["Typewriter"])], "the scene camera, and only what is still there")
+            self.assertIn("(Typewriter) is not in", line)
+            self.assertEqual(render_offer.made_line([]), "")
+            scene.camera = None
+            self.assertEqual(render_offer.made_line(["Typewriter"]), "", "no camera: no shot to compare")
+        self.assertEqual(len(measured), 1)

@@ -60,7 +60,7 @@ SENT = "loopcut_codex"        # On a turn's message once Codex has it: a resumed
 RESUME = "Go on from where you stopped."
 # Blender tools Codex lacks, including a shell-free script runner; its own file edits and image viewer do the rest.
 DYNAMIC = ("apply_build", "snapshot_scene", "run_blender", "run_python", "get_scene_info", "inspect_api", "capture_viewport",
-           "search_assets", "import_asset")
+           "search_assets", "import_asset", "open_file")
 # What the user's own ~/.codex/config.toml would add to a Loopcut thread: MCP servers (switched off by name,
 # _mcp_servers), plugins, apps, memories, hooks, a notify program, web search, AGENTS.md files and personal
 # skills. allow_login_shell=false keeps the shell's PATH as given: a login shell's profile puts /usr/bin first,
@@ -565,10 +565,16 @@ class CodexTurn:
         return _reply(text, ok, image)
 
     def run_dynamic(self, card: dict, name: str, arguments: str) -> tuple[str, bool, Path | None, bool]:
+        if name == "open_file":
+            try:
+                arguments = agent._prepare_open_file(arguments)
+            except (tools.ToolError, OSError, ValueError) as ex:
+                return str(ex), False, None, False
+            card["summary"], card["code"] = agent._describe(llm.ToolCall(name=name, arguments=arguments))
         approval = agent._approval(name, arguments, self.turn.roots)
         if agent._asks(approval, name, self.session, self.cfg):
             self.turn.decided.clear()
-            state.awaiting(card)
+            state.awaiting(card, always_ask=approval == "open_file")
             card["heavy"] = approval == "heavy" and not self.session["auto_heavy"]
             card["install"] = approval == "install"
             agent._redraw()

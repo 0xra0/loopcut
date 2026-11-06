@@ -174,6 +174,7 @@ class Ledger:
         self._shell_failures: dict[tuple, int] = {}  # Same command and error, ignoring its display summary.
         self._reads: dict[tuple, dict] = {}  # Call key -> revision, digest, steps and where of its latest result.
         self._failing_runs = 0
+        self._render_refusals = 0
         self._polls = 0  # Status calls without wait that found a render job running.
         self._last = ""  # The tool of the call recorded before this one.
 
@@ -209,6 +210,9 @@ class Ledger:
         again for refusal()."""
         notes = []
         with self._lock:
+            render_refused = key[0] == "run_python" and "Render refused by the cost guard:" in text
+            if render_refused:
+                self._render_refusals += 1
             repeated = False
             if not ok:
                 error = normalised(error_line(text))
@@ -223,7 +227,11 @@ class Ledger:
                         shell_key = (command, error)
                         shell_count = self._shell_failures.get(shell_key, 0) + 1
                         self._shell_failures[shell_key] = shell_count
-                if shell_count >= 2:
+                if render_refused and self._render_refusals >= 2:
+                    notes.append(f"({self._render_refusals} render attempts refused this turn. Stop rendering in run_python; "
+                                 "use see_render(render=true) for a look, render_job for saved output, "
+                                 "or tell the user what is blocking you.)")
+                elif shell_count >= 2:
                     notes.append(f"(This same shell command has failed the same way {shell_count} times this turn. "
                                  "Do not repeat it unchanged. For Python, write a .py file with write_file and run python3 file.py; "
                                  'for bpy use run_blender(script="script.py", blend="") or run_python for the live scene.)')
@@ -236,7 +244,7 @@ class Ledger:
                     notes.append(f"(Same error as before. Already tried: {earlier}.)")
             if key[0] == "run_python":
                 self._failing_runs = 0 if ok else self._failing_runs + 1
-                if self._failing_runs >= FAILING_RUNS and not repeated:
+                if self._failing_runs >= FAILING_RUNS and not repeated and not render_refused:
                     notes.append(f"({self._failing_runs} run_python calls in a row have failed. Step back before "
                                  f"the next one: check the API with inspect_api, read what is there with "
                                  f"get_object_info, try a smaller step, or tell the user what is blocking you.)")

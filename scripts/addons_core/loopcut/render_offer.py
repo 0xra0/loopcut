@@ -29,6 +29,10 @@ In the cloud runs the cloud render for the same frames in the job's place, its q
 call's (short of it, shortfall()'s Upgrade); this computer runs the job as asked, with the time the card said it
 takes; Not now runs neither (job_call, job_result).
 
+"Render it" when the scene camera leaves out what the chat made last (0.2.22; rel020-pro: a typewriter added in a new
+chat, then "render it in the cloud" rendered the forest shot, where it was a speck): the request's scene context says
+so plainly (made_line), a fact for the model, which then asks which shot or frames the new thing; nothing is refused.
+
 No bpy at import: the layout and its tests read the copy here.
 """
 
@@ -759,3 +763,43 @@ def result(error):
     ok = bool(error.extra.get("ok"))
     return tools.ToolResult(str(error), ok=ok, receipt=spending.receipt_text(0),
                             outcome="Rendering on this laptop" if ok else "")
+
+
+SMALL_IN_SHOT = 0.1  # What the chat made last spans less of the camera's frame than this, across and up: tiny in it.
+MADE_SHOWN = 3       # Names in the line; "and N more" after.
+
+
+def made_fact(names: list, camera: str, measured: dict | None) -> str:
+    """Pure: the render request's line when the scene camera's shot leaves out what the chat made last (names), from
+    camera.coverage's measure of them (framing.coverage: inside, bounds in frame units), or "" when it shows them at
+    a fair size."""
+    what = ", ".join(names[:MADE_SHOWN]) + (f" and {len(names) - MADE_SHOWN} more" if len(names) > MADE_SHOWN else "")
+    bounds = (measured or {}).get("bounds")
+    if bounds and (measured or {}).get("inside", 0) > 0:
+        left, right, bottom, top = (min(1.0, max(0.0, value)) for value in bounds)
+        span = max(right - left, top - bottom)
+        if span >= SMALL_IN_SHOT:
+            return ""
+        where = (f'is tiny in the scene camera "{camera}"\'s shot ('
+                 + (f"about {span:.0%}" if span >= .01 else "under 1%") + " of the frame across)")
+    else:
+        where = f'is not in the scene camera "{camera}"\'s shot'
+    return (f"render note: what this chat made last ({what}) {where}. If the user means it, ask which shot they want "
+            "or frame it before rendering.")
+
+
+def made_line(names) -> str:
+    """Main thread: made_fact for those of names still in the scene, measured in its camera's shot as frame_camera
+    measures (camera.coverage); "" with no camera, none of them left, or anything unreadable. Never raises."""
+    try:
+        import bpy
+        from . import camera
+        scene = bpy.context.scene
+        present = [name for name in names or () if isinstance(name, str) and name in scene.objects]
+        if not present or scene.camera is None:
+            return ""
+        measured = camera.coverage("", present)
+        return made_fact(present, measured["camera"], measured["all"])
+    except Exception as ex:  # A fact line is a nicety; the turn goes on without it.
+        print(f"Loopcut: could not check the camera's shot for a render: {ex!r}")
+        return ""

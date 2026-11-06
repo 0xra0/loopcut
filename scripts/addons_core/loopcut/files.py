@@ -11,11 +11,12 @@ Access rules, applied by the gate in agent.py through needs_approval:
   tokens and conversations, and the model has no business there.
 - Nothing here deletes, and nothing overwrites unless asked to in so many words.
 
-needs_approval and the path checks are pure; the tools run on Blender's main thread.
+needs_approval is pure; a hidden-path refusal also adds a panel notice. The tools run on Blender's main thread.
 """
 
 import contextlib
 import fnmatch
+import functools
 import os
 import shutil
 import tempfile
@@ -27,7 +28,7 @@ from . import cost_guard, render_offer, scratch
 from .tools import MAX_OUTPUT_CHARS, ToolError, ToolResult, _clip
 
 READ_TOOLS = {"list_files", "read_file"}
-WRITE_TOOLS = {"write_file", "move_file", "export_glb"}  # export_glb: the orchestrator's (glb.py).
+WRITE_TOOLS = {"write_file", "move_file", "export_glb", "export_for_engine"}  # glb.py, the orchestrator's; engine_export.py.
 MAX_ENTRIES = 200            # A folder listing past this says so and asks for a pattern.
 MAX_TEXT_BYTES = 2_000_000   # A text file past this is read in line ranges.
 IMAGE_SIDE = 768             # The copy the model sees; a viewport capture is 640.
@@ -126,32 +127,232 @@ def relative_base() -> tuple[Path, str]:
     return blend_base()
 
 
-def blend_base() -> tuple[Path, str]:
-    """(folder, note): what Blender's // means, and outside workspace mode where a relative path the
-    model writes lands; when that is not the .blend's folder, a sentence saying where it is instead.
-    Main thread: reads bpy.
+def documents_folder() -> Path:
+    """Use the Windows Known Folder API, including redirected and OneDrive Documents."""
+    import sys
+    if sys.platform != "win32":
+        return Path.home() / "Documents"
+    import ctypes
+    from ctypes import wintypes
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                    ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8)]
+    documents = GUID(0xFDD39AD0, 0x238F, 0x46AF,
+                     (ctypes.c_ubyte * 8)(0xAD, 0xB4, 0x6C, 0x85, 0x48, 0x03, 0x69, 0xC7))
+    result = ctypes.c_wchar_p()
+    api = ctypes.windll
+    status = api.shell32.SHGetKnownFolderPath(ctypes.byref(documents), 0, None, ctypes.byref(result))
+    try:
+        if status != 0 or not result.value:
+            raise ToolError("Windows could not locate your Documents folder.")
+        return Path(result.value)
+    finally:
+        if result:
+            api.ole32.CoTaskMemFree(ctypes.cast(result, ctypes.c_void_p))
 
-    Never Blender's working directory: that is wherever Blender was started from, and during evals
-    it is the harness folder in the git checkout (render_job put product_reveal_final/ there,
-    2026-09-27). Saved: the .blend's folder, what Blender's // means. Unsaved: the render output
-    folder when it is an absolute path (Blender's default is /tmp/), else a Loopcut folder in the
-    system temp folder; not Blender's own temp folder, which is deleted when Blender quits."""
+
+def blend_base() -> tuple[Path, str]:
+    """Visible deliverable folder: beside the saved project, otherwise in Documents/Loopcut."""
     import bpy
-    if bpy.data.filepath:
+    from . import checkpoints, state
+    if (bpy.data.filepath and not is_untitled_recovery(bpy.data.filepath)
+            and not Path(bpy.data.filepath).resolve().is_relative_to(checkpoints.data_root().resolve())):
         return Path(bpy.data.filepath).resolve().parent, ""
-    scene = bpy.context.scene
-    out = scene.render.filepath if scene is not None else ""
-    if out and not out.startswith("//") and Path(os.path.expanduser(out)).is_absolute():
-        folder, what = Path(os.path.expanduser(out)), "the render output folder"
-        if not (out.endswith(("/", "\\")) or folder.is_dir()):
-            folder = folder.parent  # A file name prefix such as /tmp/shot_.
-    else:
-        folder, what = Path(tempfile.gettempdir()) / "Loopcut", "a Loopcut folder in the system temp folder"
-        with contextlib.suppress(OSError):
-            folder.mkdir(exist_ok=True)
-    folder = folder.resolve()
-    return folder, (f"This scene is not saved to a .blend yet, so relative paths are under {what}, {folder}. "
-                    "Save the file first, or give an absolute path, to put output somewhere else.")
+    for project in reversed(state.session().get("projects", [])):
+        if (project and not is_untitled_recovery(project)
+                and not Path(project).resolve().is_relative_to(checkpoints.data_root().resolve())):
+            return Path(project).resolve().parent, ""
+    folder = (documents_folder() / "Loopcut" / ("Untitled-" + state.session()["id"][:8])).resolve()
+    return folder, f"This scene is not saved yet. Deliverables are saved to {folder}. Give full paths for deliverables."
+
+
+DELIVERABLE_SUFFIXES = {".blend", ".fbx", ".obj", ".mtl", ".stl", ".ply", ".glb", ".gltf", ".bin",
+                        ".usd", ".usda", ".usdc", ".usdz", ".abc", ".dae", ".png", ".jpg", ".jpeg",
+                        ".exr", ".tif", ".tiff", ".webp", ".mp4", ".mov", ".wav", ".zip"}
+
+
+def deliverable_path(raw: str) -> Path:
+    """Resolve output paths away from internal copies and temporary storage."""
+    from . import checkpoints
+    path = resolve(raw, base=blend_base()[0])
+    hidden = (checkpoints.data_root().resolve(), *_temp_roots())
+    # A saved project's folder is an explicit choice, even when it happens to be in temp.
+    base = blend_base()[0]
+    if any(path.is_relative_to(root) and not base.is_relative_to(root) for root in hidden):
+        path = base / path.name
+    return path
+
+
+def saved_notice(path: Path, session: dict | None = None) -> None:
+    from . import state
+    session = state.session() if session is None else session
+    session["items"].append({**state.item_notice(f"Saved to {path}"), "saved_path": str(path)})
+
+
+def publish_sources(source_root: Path, names: list[str], destination: Path) -> list[Path]:
+    """Copy one deliverable set without replacing existing files; retain relative sidecars."""
+    import filecmp
+    names = sorted(_deliverable_dependencies(source_root, names))
+    names = [name for name in names if (source_root / name).is_file()
+             and not (source_root / name).is_symlink()
+             and (source_root / name).resolve().is_relative_to(source_root.resolve())]
+    if not names:
+        return []
+    base, number = destination, 1
+    while True:
+        targets = [base / name for name in names]
+        if any(target.exists() and (not target.is_file() or not filecmp.cmp(source_root / name, target, shallow=False))
+               for name, target in zip(names, targets)):
+            number += 1
+            base = destination / f"Export-{number}"
+            continue
+        created = []
+        try:
+            for name, target in zip(names, targets):
+                source = source_root / name
+                if target.exists():
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if shutil.disk_usage(target.parent)[2] < source.stat().st_size + 64 * 1024 * 1024:
+                    raise ToolError(f"Disk is full: could not deliver {source.name} to {target.parent}.")
+                # Exclusive creation also protects a file appearing after the collision check.
+                with target.open("xb") as out:
+                    created.append(target)
+                    with source.open("rb") as incoming:
+                        shutil.copyfileobj(incoming, out)
+            return targets
+        except FileExistsError:
+            for path in created:
+                path.unlink(missing_ok=True)
+            number += 1
+            base = destination / f"Export-{number}"
+        except (OSError, ToolError) as ex:
+            for path in created:
+                path.unlink(missing_ok=True)
+            raise ToolError(f"Could not publish deliverables to {base}: {ex}") from ex
+
+
+def _deliverable_dependencies(root: Path, names: list[str]) -> set[str]:
+    """Include local assets referenced by changed exports, recursively, without unrelated siblings."""
+    import json
+    import shlex
+    from urllib.parse import unquote
+    root = root.resolve()
+    found, pending = set(), list(names)
+    while pending:
+        name = pending.pop()
+        path = root / name
+        if (name in found or path.is_symlink() or not path.is_file()
+                or not path.resolve().is_relative_to(root)):
+            continue
+        found.add(name)
+        references = []
+        try:
+            if path.suffix.lower() == ".gltf":
+                body = json.loads(path.read_text(encoding="utf-8"))
+                references = [unquote(row.get("uri", "")) for row in body.get("buffers", []) + body.get("images", [])]
+            elif path.suffix.lower() in {".mtl", ".obj"}:
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    words = shlex.split(line, comments=True)
+                    if not words:
+                        continue
+                    command = words[0].lower()
+                    if command == "mtllib":
+                        references.extend(words[1:])
+                    elif command.startswith("map_") or command in {"bump", "disp", "decal", "norm", "refl"}:
+                        # Options precede the texture path; filenames can contain spaces.
+                        reference = next((" ".join(words[n:]) for n in range(1, len(words))
+                                          if (path.parent / " ".join(words[n:])).is_file()), "")
+                        references.append(reference)
+        except (OSError, ValueError, AttributeError, TypeError):
+            continue
+        for reference in references:
+            if not isinstance(reference, str) or not reference or ":" in reference:
+                continue
+            sidecar = path.parent / reference
+            if not sidecar.is_symlink() and sidecar.resolve().is_relative_to(root):
+                pending.append(str(sidecar.relative_to(root)))
+    return found
+
+
+def _operator_outputs(path: Path) -> dict[Path, tuple]:
+    """Exporters may change extensions; track stem.* and files referenced by glTF."""
+    import json
+    import sys
+    key = str.casefold if sys.platform in {"win32", "darwin"} else str
+    found = {}
+    if not path.parent.is_dir():
+        return found
+    for output in path.parent.iterdir():
+        if (key(output.stem) == key(path.stem) and output.suffix.lower() in DELIVERABLE_SUFFIXES
+                and output.is_file() and not output.is_symlink()):
+            stat = output.stat()
+            found[output] = (stat.st_mtime_ns, stat.st_size)
+    for output in list(found):
+        if output.suffix.lower() != ".gltf":
+            continue
+        try:
+            body = json.loads(output.read_text(encoding="utf-8"))
+            for row in body.get("buffers", []) + body.get("images", []):
+                uri = row.get("uri", "")
+                if not uri or ":" in uri:
+                    continue
+                from urllib.parse import unquote
+                sidecar = (path.parent / unquote(uri)).resolve()
+                if sidecar.is_relative_to(path.parent.resolve()) and sidecar.is_file() and not sidecar.is_symlink():
+                    stat = sidecar.stat()
+                    found[sidecar] = (stat.st_mtime_ns, stat.st_size)
+        except (OSError, ValueError, AttributeError, TypeError):
+            continue
+    return found
+
+
+@contextlib.contextmanager
+def watching_deliverables():
+    """Keep operators' requested working paths; publish successful exports as visible copies."""
+    import sys
+    module = sys.modules.get("bpy.ops")
+    real = getattr(module, "_op_create_function", None)
+    if real is None:
+        yield
+        return
+
+    def create(submodule, name):
+        op = real(submodule, name)
+        output_op = (submodule in {"export_scene", "export_mesh"} or submodule == "wm" and name in {
+            "save_as_mainfile", "save_mainfile", "obj_export", "stl_export", "ply_export", "usd_export",
+            "alembic_export", "collada_export"})
+        if not output_op:
+            return op
+
+        @functools.wraps(op)
+        def write(*args, **kwargs):
+            import bpy
+            raw = kwargs.get("filepath") or (bpy.data.filepath if name.startswith("save_") else "")
+            if not raw:
+                return op(*args, **kwargs)
+            destination = blend_base()[0]
+            path = Path(bpy.path.abspath(str(raw))) if str(raw).startswith("//") else Path(raw).absolute()
+            before = _operator_outputs(path)
+            result = op(*args, **kwargs)
+            if result == {"FINISHED"}:
+                after = _operator_outputs(path)
+                key = (lambda p: str(p).casefold()) if sys.platform in {"win32", "darwin"} else str
+                previous = {key(p): stamp for p, stamp in before.items()}
+                changed = [p for p, stamp in after.items() if previous.get(key(p)) != stamp]
+                if changed:
+                    paths = publish_sources(path.parent, [str(p.relative_to(path.parent)) for p in changed], destination)
+                    for target in paths:
+                        saved_notice(target)
+                        print(f"Saved to {target}. Give this full path in your reply.")
+            return result
+        return write
+
+    module._op_create_function = create
+    try:
+        yield
+    finally:
+        module._op_create_function = real
 
 
 def is_relative(raw: str) -> bool:
@@ -163,7 +364,9 @@ def is_relative(raw: str) -> bool:
 def relative_note(*raws: str) -> str:
     """"" or a line for a tool's result saying where relative paths went, when the scene is unsaved
     and one of these paths was relative. Main thread."""
-    note = relative_base()[1] if any(is_relative(raw) for raw in raws) else ""
+    note = blend_base()[1] if any(is_relative(raw) for raw in raws) else ""
+    if any(Path(raw).suffix.lower() in DELIVERABLE_SUFFIXES for raw in raws):
+        note = (note + " Give full paths for deliverables.").strip()
     return f"\n{note}" if note else ""
 
 
@@ -188,11 +391,38 @@ def resolve(raw: str, base: Path | None = None) -> Path:
 def _temp_roots() -> tuple[Path, ...]:
     """The system's and Blender's temp folders: Blender's own, the Loopcut folder for unsaved scenes
     and the images Loopcut shows the model are there. Where they are is a setting, not a hidden file."""
-    roots = [tempfile.gettempdir()]
+    roots = [tempfile.gettempdir(), os.environ.get("TMPDIR"), os.environ.get("TEMP"), os.environ.get("TMP")]
+    if os.name != "nt":
+        roots.extend(("/tmp", "/private/tmp"))
     with contextlib.suppress(ImportError, AttributeError):
         import bpy
         roots.append(bpy.app.tempdir)
     return tuple(Path(root).resolve() for root in roots if root)
+
+
+def is_untitled_recovery(raw: str) -> bool:
+    """Native untitled recovery files have no saved project directory, including custom temp bases."""
+    import re
+    if not raw:
+        return False
+    path = Path(raw).resolve()
+    if path.name.lower() != "quit.blend" and not re.fullmatch(r"[0-9]+_autosave\.blend", path.name, re.I):
+        return False
+    roots = list(_temp_roots())
+    with contextlib.suppress(ImportError, AttributeError):
+        import bpy
+        if bpy.app.tempdir:
+            roots.append(Path(bpy.app.tempdir).resolve().parent)
+    return any(path.is_relative_to(root) for root in roots)
+
+
+def _relative_to(path: Path, root: Path) -> Path | None:
+    """Desktop filesystem paths may retain typed case after resolve()."""
+    import sys
+    key = str.casefold if sys.platform in {"win32", "darwin"} else str
+    if tuple(map(key, path.parts[:len(root.parts)])) == tuple(map(key, root.parts)):
+        return Path(*path.parts[len(root.parts):])
+    return None
 
 
 def is_hidden(path: Path) -> bool:
@@ -218,6 +448,20 @@ def _forbidden_roots() -> tuple[Path, ...]:
         return ()
 
 
+def _hidden_refusal(path: Path) -> ToolError:
+    from . import mainthread, state, workspace
+    internal = workspace.inside(path) is not None or ".loopcut" in path.parts or inside(path, _forbidden_roots())
+    if internal:
+        return ToolError(f"{path} is Loopcut's own data and off limits.")
+    session = state.session()
+    text = f"{path} is in a hidden folder or has a hidden name. To use it, copy it into the project folder and select that copy."
+    if not session["items"] or session["items"][-1].get("text") != text:
+        session["items"].append(state.item_notice(text))
+    mainthread.request_redraw()
+    return ToolError(f"Files and folders starting with '.' are hidden. Ask the user to copy it into the project folder; "
+                     f"do not copy it yourself or access it by another route: {path}")
+
+
 def check(path: Path) -> Path:
     """Raise for a path the model may never touch, whatever the user allows. A workspace (workspace.py)
     is the model's own, though it lives in Loopcut's data: inside one, only its hidden names count."""
@@ -225,10 +469,10 @@ def check(path: Path) -> Path:
     root = workspace.inside(path)
     if root is not None:
         if any(part.startswith(".") for part in path.relative_to(root).parts):
-            raise ToolError(f"{path} is hidden (a name starting with '.'): hidden files and folders are off limits.")
+            raise _hidden_refusal(path)
         return path
     if is_hidden(path):
-        raise ToolError(f"{path} is hidden (a name starting with '.'): hidden files and folders are off limits.")
+        raise _hidden_refusal(path)
     if inside(path, _forbidden_roots()):
         raise ToolError(f"{path} is Loopcut's own data and off limits.")
     return path
@@ -340,6 +584,8 @@ def _read_image(path: Path) -> ToolResult:
         width, height = attachments._to_png(path, out, IMAGE_SIDE)
     except attachments.AttachmentError as ex:
         raise ToolError(str(ex)) from ex
+    from . import cloud_jobs
+    cloud_jobs.note_picture_seen(path)
     return ToolResult(f"Image attached: the file {path.name}, {width}x{height} px.", image_path=out, file_image=True)
 
 
@@ -354,12 +600,27 @@ def read_file(path: str, lines: list | None = None) -> ToolResult:
 
 
 def write_file(path: str, content: str, overwrite: bool = False) -> ToolResult:
-    target = check(resolve(path))
+    from . import workspace
+    ws = workspace.current()
+    deliverable = Path(path).suffix.lower() in DELIVERABLE_SUFFIXES
+    target = resolve(path, base=ws) if ws is not None else resolve(path)
+    if deliverable and workspace.inside(target) is None:
+        target = deliverable_path(str(target))
+    if ws is not None:
+        project = blend_base()[0]
+        relative = _relative_to(target, project)
+        if _relative_to(target, ws) is None and relative is not None:
+            target = (ws / relative).resolve()
+            if _relative_to(target, ws) is None:
+                raise ToolError("That workspace path points outside the workspace; choose another name.")
+    target = check(target)
     if target.is_dir():
         raise ToolError(f"{target} is a folder.")
     if target.exists() and not overwrite:
         raise ToolError(f"{target} already exists; pass overwrite=true to replace it, or choose another name.")
     from . import workspace
+    if not target.parent.is_dir() and is_relative(path) and target.parent == blend_base()[0]:
+        target.parent.mkdir(parents=True, exist_ok=True)
     if not target.parent.is_dir() and workspace.inside(target) is not None:
         target.parent.mkdir(parents=True, exist_ok=True)  # In the workspace, as a shell's tools would.
     if not target.parent.is_dir():
@@ -369,7 +630,14 @@ def write_file(path: str, content: str, overwrite: bool = False) -> ToolResult:
         target.write_bytes(data)
     except OSError as ex:
         raise ToolError(f"Cannot write {target}: {ex.strerror or ex}") from ex
-    return ToolResult(f"Wrote {_human(len(data))} to {target}.{relative_note(path)}")
+    published = ""
+    if deliverable:
+        paths = (publish_sources(target.parent, [target.name], blend_base()[0])
+                 if workspace.inside(target) is not None else [target])
+        for delivered in paths:
+            saved_notice(delivered)
+            published += f"\nSaved to {delivered}. Give this full path in your reply."
+    return ToolResult(f"Wrote {_human(len(data))} to {target}.{relative_note(path)}{published}")
 
 
 def move_file(source: str, destination: str, copy: bool = False) -> ToolResult:

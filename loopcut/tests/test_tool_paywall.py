@@ -106,6 +106,9 @@ class Fixture(unittest.TestCase):
         self.transport = Transport(Reply(self.manifest()))
         client = cloud_http.Client(base_url="https://service.test", api_key="lc_demo", transport=self.transport)
         runtime = cloud.Runtime(client, temp.name, signed_in=True)
+        from loopcut import spending
+        for descriptor in self.TOOLS:
+            spending.note_use(runtime, descriptor['name'])
         data = tempfile.TemporaryDirectory()  # nudges.json: the locked card's caps.
         self.addCleanup(data.cleanup)
         for target in (patch.object(cloud, "_runtime", runtime), patch.dict(sys.modules, {"loopcut.cloud_jobs": module}),

@@ -174,6 +174,7 @@ class RelativePathTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
         self.project, self.cwd, self.system_temp = (self.root / n for n in ("project", "checkout", "tmp"))
+        self.enterContext(patch.object(Path, "home", return_value=self.root / "home"))
         for folder in (self.project, self.cwd, self.system_temp):
             folder.mkdir()
         previous = os.getcwd()
@@ -203,31 +204,35 @@ class RelativePathTest(unittest.TestCase):
     def test_absolute_and_home_paths_are_as_written(self):
         with self.blender(blend=str(self.project / "shot.blend")):
             self.assertEqual(files.resolve(str(self.root / "out")), self.root / "out")
-            self.assertEqual(files.resolve("~/renders"), Path.home().resolve() / "renders")
+            self.assertEqual(files.resolve("~/renders"), Path(os.path.expanduser("~/renders")).resolve())
             self.assertEqual(files.relative_note(str(self.root / "out"), "~/renders"), "")
 
-    def test_unsaved_goes_under_the_render_output_folder_and_says_so(self):
+    def test_unsaved_uses_documents_instead_of_the_render_output_folder(self):
         output = self.root / "renders"
         output.mkdir()
         for render_output in (f"{output}/", str(output), f"{output}/shot_"):
             with self.blender(render_output=render_output):
-                self.assertEqual(files.resolve("final/"), output / "final", render_output)
-                self.assertEqual(files.resolve("//final"), output / "final")
+                base = files.blend_base()[0]
+                self.assertTrue(base.is_relative_to(self.root / "home" / "Documents" / "Loopcut"))
+                self.assertEqual(files.resolve("final/"), base / "final", render_output)
+                self.assertEqual(files.resolve("//final"), base / "final")
                 note = files.relative_note("final/")
                 self.assertIn("not saved", note)
-                self.assertIn(f"the render output folder, {output}", note)
+                self.assertIn(str(base), note)
 
-    def test_unsaved_without_an_absolute_render_output_uses_a_loopcut_temp_folder(self):
+    def test_unsaved_without_an_absolute_render_output_uses_documents(self):
         for render_output in ("", "//render/", "render/"):
             with self.blender(render_output=render_output):
-                self.assertEqual(files.resolve("final"), self.system_temp / "Loopcut" / "final", render_output)
-                self.assertIn(str(self.system_temp / "Loopcut"), files.relative_note("final"))
-                self.assertEqual(files.project_roots()[0], self.system_temp / "Loopcut")
+                base = files.blend_base()[0]
+                self.assertEqual(files.resolve("final"), base / "final", render_output)
+                self.assertIn(str(base), files.relative_note("final"))
+                self.assertEqual(files.project_roots()[0], base)
 
     def test_file_tools_write_relative_paths_under_the_base_and_note_it_when_unsaved(self):
         output = self.root / "renders"
         output.mkdir()
         with self.blender(render_output=f"{output}/"):
+            output = files.blend_base()[0]
             result = files.write_file("notes.txt", "hello")
             self.assertTrue((output / "notes.txt").is_file())
             self.assertFalse((self.cwd / "notes.txt").exists())

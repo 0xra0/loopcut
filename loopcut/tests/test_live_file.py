@@ -35,6 +35,8 @@ class Blender:
                 if not path:
                     raise RuntimeError("Unable to save an unsaved file with an empty filepath")
                 blender.written.append(path)
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                Path(path).write_bytes(b"synthetic blend")
                 if not kwargs.get("copy"):
                     blender.filepath = path  # Blender's Save As: the open file is now the one written.
             elif idname in live_file.REPLACES:
@@ -85,8 +87,9 @@ class LiveFileTest(unittest.TestCase):
         self.assertEqual(self.blender.filepath, self.user_file, "Cmd+S must still write the user's file")
         self.assertEqual(self.blender.written, [str(target)], "the agent still gets its file")
         self.assertEqual(self.blender.calls[0][2], {"filepath": str(target), "copy": True})
-        self.assertEqual(live_file.take(), [f"{live_file.NOTICE_PREFIX} saved coffee-table.blend as a copy; the "
-                                            f"user's open file is still {self.user_file}."])
+        self.assertEqual(live_file.take(), [f"{live_file.NOTICE_PREFIX} saved {target} as a copy; the "
+                                            f"user's open file is still {self.user_file}. "
+                                            "Give the full saved path in your reply."])
 
     def test_an_explicit_copy_false_and_a_relative_name_are_copies_too(self):
         cwd = os.getcwd()
@@ -164,12 +167,17 @@ class LiveFileTest(unittest.TestCase):
             ops = _ops()
             ops.ed = types.SimpleNamespace(undo_push=lambda **kw: None)
             stack.enter_context(mock.patch.object(tools.bpy, "ops", ops, create=True))
+            stack.enter_context(mock.patch.object(tools.bpy, "data", types.SimpleNamespace(filepath=self.user_file), create=True))
+            stack.enter_context(mock.patch.dict(os.environ, {"LOOPCUT_DATA_DIR": str(self.home / "datafiles" / "loopcut")}))
             target = str(self.workspace / "stone_room.blend")
             result = tools.run_python(f"bpy.ops.wm.save_as_mainfile(filepath={target!r})")
         self.assertTrue(result.ok, result.text)
         self.assertEqual(self.blender.filepath, self.user_file)
+        delivered = str((Path(self.user_file).parent / "stone_room.blend").resolve())
         self.assertEqual(self.blender.written, [target])
-        self.assertIn("saved stone_room.blend as a copy; the user's open file is still", result.text)
+        self.assertTrue(Path(target).is_file())
+        self.assertTrue(Path(delivered).is_file())
+        self.assertIn(f"saved {target} as a copy; the user's open file is still", result.text)
         self.assertIs(self.module._op_create_function, self.real)
 
 

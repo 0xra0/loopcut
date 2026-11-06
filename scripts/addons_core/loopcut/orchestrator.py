@@ -60,7 +60,7 @@ CHECKS_TEXT = (
 
 # The advisory list's kinds (acceptance.ADVISORY_KINDS), and that every kind above may join it.
 ADVISORY_TEXT = ("Any check kind, or no_modifiers name; flat_shaded name max_smooth?; inside_bounds name tol?; "
-                 "triangles name min? max?")
+                 "triangles name min? max?; shading name")
 
 SCHEMAS = [
     {"type": "function", "function": {
@@ -147,6 +147,68 @@ CAP_RUNNING = "Still running: {names}; wait for them (delegate wait true), do no
 # A wave sent again with wait true once none is left (GLM, wb-free-1 20261024-172724, read CAP_SPENT as "cannot
 # wait" and built a second anvil while the anvil worker ran): the wait it means, the wave not started again.
 CAP_WAIT = "Waiting for the workers already running (nothing new started: this turn's {cap} workers are its limit)."
+# Re-composition (rel020-pro's horror trailer, 2026-10-26: a Fast orchestrator sent the camera back wave after wave on
+# an advisory miss, 20+ minutes and 1.25M input tokens, until the user pressed Stop). Once an advisory check flagged a
+# deliverable this turn, it is redone REDO_CAP times, then it stands as it is; and a turn starts MAX_WAVES waves at
+# most, whatever they brief. Neither is a gate: delegate refuses (its own neutral card, like the worker limit), the reply
+# still ends the turn, and what still flags is one plain line in it (still_flags), not another wave.
+REDO_CAP = 1
+MAX_WAVES = 6
+REDO_SPENT = ("delegate refused; nothing started: this turn already redid {names} after {its} advisory check flagged "
+              "{it}, the most a turn redoes one deliverable. Leave {it} as {it} is: brief only other deliverables, or "
+              "reply now with what is done and what is left. If {its} check still flags {it} at the end, Loopcut's "
+              "line in the reply says so (" + FOR_PLANNING + ").")
+WAVES_SPENT = ("delegate refused; nothing started: this turn has started {n} waves, the most one turn starts. Reply now "
+               "with what is done and what is left (" + FOR_PLANNING + ").")
+REDO_LAST = ("Redo: {names} {is_} redone once after {its} advisory check; after this {it} stands as {it} is this turn, "
+             "whatever the check says.")
+# The final reply's line for each deliverable the caps stopped that an advisory check still flags.
+STILL_FLAGS = "The {checks} still flag{s} {names}; say if you want another pass."
+ADVISORY_WORDS = {"in_frame": "camera framing", "dims": "size", "contact": "placement", "suspended": "placement",
+                  "attached_to": "placement", "above": "placement", "below": "placement", "inside_bounds": "placement",
+                  "no_overlap": "overlap", "count": "count", "exists": "presence", "faces_max": "polygon count",
+                  "triangles": "polygon count", "origin_base": "pivot", "material_on": "material", "light": "lighting",
+                  "light_inside": "lighting", "setting": "render setting", "animated": "animation",
+                  "flat_shaded": "shading", "no_modifiers": "modifier", "file": "file"}
+
+# Unlike the general repeat guard, this budget spans changing arguments and error messages. It belongs to the
+# original user message so a resume cannot restart a validation loop. A wave that validates and starts resets it;
+# a successful dry run, a read or another failed plan does not.
+PLAN_ATTEMPTS = 3
+PLAN_REFUSALS = "loopcut_helper_plan_refusals"
+PLAN_FALLBACK = ("New helper planning is stopped for this turn after repeated validation failures. "
+                 "Continue the remaining work directly with your tools. Wait for any existing helpers with "
+                 "delegate wait true before editing their objects. Do not retry or repackage the helper plan. "
+                 "A refused plan did no work; say plainly what remains unfinished if you cannot continue.")
+
+
+def planning_stopped(session: dict) -> bool:
+    return _turn_request(session).get(PLAN_REFUSALS, 0) >= PLAN_ATTEMPTS
+
+
+def plan_result(session: dict, result):
+    """Account for delegate results in the owning agent loop, including malformed JSON and wrong argument names.
+    Tool argument inspection outside that loop must not spend another conversation's budget. Repairs keep their
+    validation errors; the model gets exact user text, then a bounded direct-work fallback."""
+    request = _turn_request(session)
+    if not request:
+        return result
+    if not getattr(result, "plan_refused", False) or planning_stopped(session):
+        return result
+    result.model_note = getattr(result, "model_note", "") or ""
+    count = request[PLAN_REFUSALS] = request.get(PLAN_REFUSALS, 0) + 1
+    if count == PLAN_ATTEMPTS:
+        result.model_note += "\n\n" + PLAN_FALLBACK
+        result.notice = f"Helper planning stopped after {PLAN_ATTEMPTS} unsuccessful attempts."
+    else:
+        result.model_note += f"\n\nHelper plan attempt {count} of {PLAN_ATTEMPTS}."
+        if "quote" in result.text or "requirements" in result.text:
+            # Evidence to copy, never a replacement requirement or a guessed interpretation of the user's intent.
+            recent = [i.get("text", "") for i in session.get("items", ()) if i.get("kind") == "user"][-3:]
+            excerpts = [json.dumps(text[-1000:], ensure_ascii=False) for text in recent if isinstance(text, str)]
+            result.model_note += (" Copy a relevant exact span for requirements.quote; put your interpretation in do "
+                                  "or defaults. Recent user text (excerpts):\n" + "\n".join(excerpts))
+    return result
 
 
 # ------------------------------------------------------------------ the user's words
@@ -1533,6 +1595,90 @@ def cap_spent(job) -> str:
                             running=CAP_RUNNING.format(names=", ".join(running)) if running else "")
 
 
+def capped_deliverables(job) -> list[str]:
+    """The deliverables this turn redid REDO_CAP times since an advisory check first flagged one of their runs."""
+    from . import waves
+    capped = []
+    for key, runs in waves.runs_of(job).items():
+        flagged = next((n for n, misses in enumerate(runs) if misses), None)
+        if flagged is not None and len(runs) - 1 - flagged >= REDO_CAP:
+            capped.append(key)
+    return capped
+
+
+def _works_on(brief: dict, threads: dict) -> list[str]:
+    """A brief's deliverable, and the one the worker it continues made."""
+    continued = (threads.get(brief.get("continues") or "") or {}).get("deliverable")
+    return [str(name) for name in dict.fromkeys((brief.get("deliverable"), continued)) if name]
+
+
+def _it(names: list[str]) -> dict:
+    one = len(names) == 1
+    return {"names": " and ".join(names), "it": "it" if one else "they", "its": "its" if one else "their",
+            "is_": "is" if one else "are"}
+
+
+def turn_limit(wave, shared, turn) -> str:
+    """WAVES_SPENT once the turn has started MAX_WAVES waves; REDO_SPENT when the wave briefs a deliverable
+    capped_deliverables has; else "". For any delegate that would start workers, dry runs too."""
+    from . import waves
+    if len(getattr(turn, "delegations", None) or ()) >= MAX_WAVES:
+        return WAVES_SPENT.format(n=MAX_WAVES)
+    job = getattr(turn, "job", None)
+    capped = set(capped_deliverables(job)) if job is not None else set()
+    if not capped:
+        return ""
+    wave = wave_argument(wave, shared)[0]
+    workers_ = wave.get("workers") if isinstance(wave, dict) else None
+    threads = (job.session.get("worker_threads") or {}) if isinstance(getattr(job, "session", None), dict) else {}
+    hit = list(dict.fromkeys(name for w in (workers_ if isinstance(workers_, list) else ()) if isinstance(w, dict)
+                             for name in _works_on(w, threads) if name in capped))
+    if not hit:
+        return ""
+    text = REDO_SPENT.format(**_it(hit))
+    running = [name for name, pending in waves.started_deliverables(job) if pending] if not job.stopped else []
+    return text + (" " + CAP_RUNNING.format(names=", ".join(running)).strip() if running else "")
+
+
+def redo_line(plan: dict, turn) -> str:
+    """REDO_LAST for the briefs of a starting wave that are a flagged deliverable's last redo this turn."""
+    from . import waves
+    job = getattr(turn, "job", None)
+    runs = waves.runs_of(job)
+    threads = (job.session.get("worker_threads") or {}) if isinstance(getattr(job, "session", None), dict) else {}
+    last = []
+    for brief in plan["workers"]:
+        for name in _works_on(brief, threads):
+            flagged = next((n for n, misses in enumerate(runs.get(name) or ()) if misses), None)
+            if flagged is not None and len(runs[name]) - 1 - flagged == REDO_CAP - 1:
+                last.append(name)
+    last = list(dict.fromkeys(last))
+    return REDO_LAST.format(**_it(last)) if last else ""
+
+
+def still_flags(turn) -> list[str]:
+    """One plain line (STILL_FLAGS) for each deliverable the caps stopped whose latest run an advisory check still
+    flags: what is left, said in the final reply in place of another wave."""
+    from . import waves
+    job = getattr(turn, "job", None)
+    if job is None:
+        return []
+    every = len(getattr(turn, "delegations", None) or ()) >= MAX_WAVES
+    capped = set(capped_deliverables(job))
+    lines = []
+    for key, runs in waves.runs_of(job).items():
+        misses = runs[-1]
+        if not misses or not (every or key in capped):
+            continue
+        words = list(dict.fromkeys(ADVISORY_WORDS.get(check.get("kind"), str(check.get("kind") or "advisory")
+                                                      .replace("_", " ")) for check, _ in misses))
+        names = list(dict.fromkeys(name for check, _ in misses for name in (
+            check.get("names") or [] if check.get("kind") == "in_frame" else acceptance._named(check))))
+        lines.append(STILL_FLAGS.format(checks=" and ".join(words) + (" checks" if len(words) > 1 else " check"),
+                                        s="" if len(words) > 1 else "s", names=", ".join((names or [key])[:4])))
+    return lines
+
+
 def waits(name: str, arguments: dict) -> bool:
     """delegate wait with no briefs: the running workers' next results. It starts nothing, so it is not
     asked about (the delegate that started them was). A wave sent as a JSON string counts as its briefs."""
@@ -1544,10 +1690,15 @@ def waits(name: str, arguments: dict) -> bool:
 def starts_nothing(name: str, arguments: dict, turn) -> bool:
     """delegate, not a dry run, once the turn has no worker left to start (waves.workers_left): whatever its wave,
     it is the wait (cap_waits) or the refusal (cap_spent). So it is not asked about, and the loop marks the call
-    (agent.Turn.capped_call): delegate holds it to those even if a slot frees before it runs."""
+    (agent.Turn.capped_call): delegate holds it to those even if a slot frees before it runs. A wave turn_limit
+    refuses starts nothing either."""
+    if (name == "delegate" and turn is not None and state.session().get("turn") is turn
+            and planning_stopped(state.session())):
+        return not only_reads(name, arguments)
     from . import waves
     return (name == "delegate" and not only_reads(name, arguments)
-            and waves.workers_left(getattr(turn, "job", None), getattr(turn, "roles", None)) == 0)
+            and (waves.workers_left(getattr(turn, "job", None), getattr(turn, "roles", None)) == 0
+                 or bool(turn_limit(arguments.get("wave"), arguments.get("shared"), turn))))
 
 
 def cap_waits(arguments: dict, job) -> bool:
@@ -1572,11 +1723,18 @@ def delegate(wave: dict | None = None, dry_run: bool = False, wait: bool = False
         if job is None or job.stopped or not waves.pending(job):
             return waves.wait_result(session, job)
         return tools.ToolResult("Waiting for the workers.", then=functools.partial(waves.collect, job))
+    if planning_stopped(session):
+        if job is not None and cap_waits({"wait": wait, "dry_run": dry_run}, job):
+            return tools.ToolResult(PLAN_FALLBACK, then=functools.partial(waves.collect, job))
+        return tools.ToolResult(PLAN_FALLBACK, ok=False, plan_capped=True)
     if roles is None or not roles.orchestrate:
         return tools.ToolResult("Workers are off in this conversation; do the work yourself.", ok=False)
     if session.get("workers_unavailable"):
         return tools.ToolResult(waves.unavailable_note(session), ok=False)
     left = waves.workers_left(job, roles)
+    limit = turn_limit(wave, shared, turn)  # Before the worker limit: a capped call may be this one (starts_nothing).
+    if limit:
+        return tools.ToolResult(limit, ok=False, plan_capped=True)
     # Every worker the account's max_workers allows this turn has started, or did when the call was let run
     # unasked (starts_nothing): it starts none, even if one queued has since been dropped.
     if left == 0 or getattr(turn, "capped_call", None) is not None:
@@ -1629,6 +1787,7 @@ def delegate(wave: dict | None = None, dry_run: bool = False, wait: bool = False
             lines.append(_repairs_line(repairs))
         return tools.ToolResult("\n".join(lines), ok=False, plan_refused=True)
     warnings = [f"- warning: {w}" for w in warnings]
+    redo = redo_line(plan, turn)  # Said before the wave runs, so its result is planned for as the last.
     before = _snapshot()
     try:
         ctx = waves.prepare(session, turn, plan, message_index=_last_assistant(session["messages"]))
@@ -1636,10 +1795,11 @@ def delegate(wave: dict | None = None, dry_run: bool = False, wait: bool = False
         return tools.ToolResult(f"Could not start the workers: {ex}. Nothing started; do it yourself or tell the user.",
                                 ok=False)
     ctx.scene_before = before  # run_wave's result carries it, so the turn's changes card includes the merge.
+    _turn_request(session).pop(PLAN_REFUSALS, None)  # A validated wave started; collecting alone never resets this.
     lines = [f"Wave {ctx.number} started: {', '.join(w['deliverable'] for w in plan['workers'])}.", budget]
     if repairs:
         lines.append(_repairs_line(repairs))
-    lines += warnings
+    lines += warnings + ([redo] if redo else [])
     lead = "\n".join(lines)  # Said again at the top of what run_wave returns, which replaces this result.
     return tools.ToolResult(lead, then=functools.partial(waves.run_wave, ctx, lead=lead), scene_before=before)
 
@@ -1871,11 +2031,11 @@ def describe(name: str, arguments: dict):
     wave = wave if isinstance(wave, dict) else {}
     workers = wave.get("workers")
     if not isinstance(workers, list) or not workers or not all(isinstance(w, dict) for w in workers):
-        return "Helper plan is empty or invalid", json.dumps(arguments, indent=2)
+        return "Planning helpers", json.dumps(arguments, indent=2)
     what = ", ".join(str(w.get("deliverable") or w.get("id") or "?") for w in workers)
     code = json.dumps(wave, indent=2)
     if only_reads(name, arguments):
-        return f"Check a helper plan: {what}", code
+        return f"Planning helpers for {what}", code
     roles = _roles()
     usd = roles.job_max_usd if roles else config.Roles.job_max_usd
     seconds = roles.worker_max_seconds if roles else config.Roles.worker_max_seconds
@@ -1935,10 +2095,10 @@ def _same(quote: str, other) -> bool:
 
 def coverage(requirements: list[str], results: list, retired: list = ()) -> list[dict]:
     """Each distinct requirement of the user's (a brief's requirement, or a check's quote no brief
-    quotes) with the checks that quote it or part of it: covered (they pass and measure its placement
+    quotes) with the checks that quote it or part of it: checks_passed (they pass and measure its placement
     words), partly (a placement word nothing measures, or a check that could not be measured),
     failed, unverified (no check measured it) or retired. Information for the Verified block, never
-    a gate."""
+    a gate. Linking a quote does not prove a check measures every part of the request."""
     quotes = []
     for quote in requirements:
         if normalise(quote) and all(normalise(quote) != normalise(q) for q in quotes):
@@ -1971,7 +2131,7 @@ def coverage(requirements: list[str], results: list, retired: list = ()) -> list
                 result.get("status") != "pass" for _, _, result in linked):
             status, evidence = "partly", f"{labels}: some could not be measured"
         else:
-            status, evidence = "covered", f"{labels} pass"
+            status, evidence = "checks_passed", f"{labels} pass"
         out.append({"quote": quote, "status": status, "checks": [label for label, _, _ in linked], "evidence": evidence})
     return out
 
@@ -1983,16 +2143,14 @@ REQUIREMENTS, YOUR_REQUIREMENTS = "Requirements (the user's words)", "Requiremen
 
 
 def coverage_lines(entries: list[dict]) -> list[str]:
-    """How many of the user's requirements the checks cover, then each only partly covered or not at all."""
+    """Known gaps in the selected checks. Never count quoted requirements as completed: even an exact quote can
+    include an export, appearance or import task that its linked existence check does not measure."""
     counted = [e for e in entries if e["status"] != "retired"]
-    if not counted:
-        return []
-    covered = sum(e["status"] == "covered" for e in counted)
-    rest = [f"{n} {word}" for word, n in (("partly covered", sum(e["status"] == "partly" for e in counted)),
+    rest = [f"{n} {word}" for word, n in (("partly checked", sum(e["status"] == "partly" for e in counted)),
                                           ("unverified", sum(e["status"] == "unverified" for e in counted)),
                                           ("failed", sum(e["status"] == "failed" for e in counted))) if n]
-    lines = [f"{REQUIREMENTS}: {covered} of {len(counted)} covered" + "".join(f", {r}" for r in rest) + "."]
-    return lines + [f"- {'partly covered' if e['status'] == 'partly' else e['status']}: \"{e['quote'][:80]}\": "
+    lines = [CHECK_SCOPE] + (["Request checks: " + ", ".join(rest) + "."] if rest else [])
+    return lines + [f"- {'partly checked' if e['status'] == 'partly' else e['status']}: \"{e['quote'][:80]}\": "
                     f"{e['evidence'][:160]}" for e in counted if e["status"] in ("partly", "unverified")]
 
 
@@ -2001,6 +2159,7 @@ def coverage_lines(entries: list[dict]) -> list[str]:
 # as "1 of 1" then "9 of 18" under one head read as a glitch ("did you glitch?", 2026-10-25).
 VERIFIED = "Verified by Loopcut on this scene"
 BLOCKS = "loopcut_verified_blocks"
+CHECK_SCOPE = "These results cover selected checks only; they do not establish overall task completion."
 
 
 def _turn_request(session: dict) -> dict:
@@ -2016,8 +2175,8 @@ def block_head(session: dict, later: str) -> str:
 def verified_block(results: list[tuple[str, dict, dict]], retired: list[tuple[str, dict, str]] = (),
                    requirements: list[str] = (), head: str = VERIFIED) -> str:
     """results: (label, check, acceptance result); retired: (label, check, reason); requirements: the
-    briefs' quotes. The block Loopcut appends to the final reply: the checks, then how much of what
-    the user asked for they cover (coverage), so "32 of 32" never stands for all of it. head: block_head's."""
+    briefs' quotes. The block reports measured checks and known gaps. Neither a passing check nor the words
+    attached to it establish completion of the user's whole task. head: block_head's."""
     passed = sum(1 for _, _, r in results if r.get("status") == "pass")
     lines = [f"{head}: {passed} of {len(results)} checks."]
     lines += coverage_lines(coverage(list(requirements), results, retired))
@@ -2041,48 +2200,55 @@ def for_user(block: str) -> str:
 _COUNTED = re.compile(rf"^(?:{VERIFIED}|(?:Placement measured|Rig checked|Checked again) this turn): "
                       r"(\d+) of (\d+) checks\.$", re.M)
 _SHORT = re.compile(r"^Requirements \((?:the user's|your) words\): \d+ of \d+ covered(.*)\.$", re.M)
+_GAPS = re.compile(r"^Request checks: (.*)\.$", re.M)
 
 
 def checked_line(verification: str, alone: bool = False) -> str:
     """The panel's one line for a reply's blocks, folded under the model's own summary (0.2.19 gate: the final reply
-    read as a checklist): "✓ Checked: 4 of 4 pass", "Checked: 2 of 2 pass, 1 partly covered", or "Not checked" when
-    no block counted a check. alone: the reply has no text of its own, so an all-pass line opens with "Done."."""
+    read as a checklist). Passing checks never supply a completion claim, even when alone (no model summary).
+    Legacy requirement counts are read for their gaps only, not as proof that a task finished."""
     counts = [(int(p), int(t)) for p, t in _COUNTED.findall(verification)]
     passed, total = sum(p for p, _ in counts), sum(t for _, t in counts)
     if not total:
         return "Not checked"
     short: dict[str, int] = {}
-    for tail in _SHORT.findall(verification):
-        for n, word in re.findall(r", (\d+) (partly covered|unverified)", tail):
+    for tail in _SHORT.findall(verification) + _GAPS.findall(verification):
+        for n, word in re.findall(r"(\d+) (partly covered|partly checked|unverified|failed)", tail):
+            word = "partly checked" if word == "partly covered" else word
             short[word] = short.get(word, 0) + int(n)
     line = f"Checked: {passed} of {total} pass" + "".join(f", {n} {word}" for word, n in short.items())
-    return line if passed < total or short else ("Done. " if alone else "") + "✓ " + line
+    return line
 
 
-def _append_to_reply(session: dict, completion, block: str) -> None:
+def _append_to_reply(session: dict, completion, block: str, lead: str = "") -> None:
     """The block goes on the reply the user sees, in for_user's wording, and on the message the model sees next turn
-    as it is."""
+    as it is. lead (still_flags' lines) goes before it as the reply's own text, never folded into the block's footer;
+    with no block, only lead."""
     items, messages = session["items"], session["messages"]
     request = _turn_request(session)
-    if request:
+    if request and block:
         request[BLOCKS] = request.get(BLOCKS, 0) + 1
     reply = items[-1] if items and items[-1].get("kind") == "assistant" and completion and completion.text.strip() else None
     if reply is None:
         reply = state.item_assistant()
         reply["streaming"] = False
         items.append(reply)
-    earlier, shown = reply.get("verification"), for_user(block)
-    reply["text"] = f"{reply['text'].rstrip()}\n\n{shown}" if reply["text"].strip() else shown
+    earlier, shown = reply.get("verification"), for_user(block) if block else ""
+    for part in (lead, shown):
+        if part:
+            reply["text"] = f"{reply['text'].rstrip()}\n\n{part}" if reply["text"].strip() else part
     # Only the runtime sets this field. Text from the model (including an identical line)
     # stays ordinary prose; old conversations without provenance do too. A second gate's block (rig_gate's,
     # then contact's) joins the first, so both stay in the one muted footer the panel draws.
-    joined = isinstance(earlier, str) and earlier and reply["text"].endswith(f"{earlier}\n\n{shown}")
-    reply["verification"] = f"{earlier}\n\n{shown}" if joined else shown
+    if shown:
+        joined = isinstance(earlier, str) and earlier and reply["text"].endswith(f"{earlier}\n\n{shown}")
+        reply["verification"] = f"{earlier}\n\n{shown}" if joined else shown
+    added = "\n\n".join(part for part in (lead, block) if part)
     last = messages[-1] if messages else {}
     if last.get("role") == "assistant" and not last.get("tool_calls") and completion is not None:
-        last["content"] = f"{(last.get('content') or '').rstrip()}\n\n{block}".lstrip()
+        last["content"] = f"{(last.get('content') or '').rstrip()}\n\n{added}".lstrip()
     else:
-        messages.append({"role": "assistant", "content": block})
+        messages.append({"role": "assistant", "content": added})
 
 
 def _late_workers(session: dict, turn, job):
@@ -2127,12 +2293,18 @@ def finish_gate(session: dict, turn, completion, run_checks):
         return None
     labelled = job.final_checks()
     retired = [(label, check, reason) for label, (check, reason) in job.retired.items()]
+    flags = still_flags(turn)  # What the redo and wave caps left: said once the turn ends, never bounced.
+    lead = "\n".join(flags)
+    if flags and isinstance(getattr(job, "log", None), dict):
+        job.log["still_flags"] = flags
     if not labelled and not retired:
+        if lead:
+            _append_to_reply(session, completion, "", lead)
         return None
     try:
         results = run_checks([check for _, check in labelled]) if labelled else []
     except Exception as ex:  # Unverifiable is said, never hidden, and never bounced.
-        _append_to_reply(session, completion, f"Not verified by Loopcut: the checks could not run ({ex}).")
+        _append_to_reply(session, completion, f"Not verified by Loopcut: the checks could not run ({ex}).", lead)
         job.finish(bounces=job.bounces, results=[])
         return None
     rows = [(label, check, result) for (label, check), result in zip(labelled, results)]
@@ -2147,7 +2319,7 @@ def finish_gate(session: dict, turn, completion, run_checks):
                                              for label, check, result in failed))
     requirements = _requirements(job)
     _append_to_reply(session, completion, verified_block(rows, retired, requirements,
-                                                         block_head(session, "Checked again this turn")))
+                                                         block_head(session, "Checked again this turn")), lead)
     if isinstance(getattr(job, "log", None), dict):  # For the evals: what the block said of each requirement.
         job.log["coverage"] = [{k: e[k] for k in ("quote", "status", "checks")}
                                for e in coverage(requirements, rows, retired)]

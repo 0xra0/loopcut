@@ -21,22 +21,261 @@ as `<name>.restored-<time>.blend` beside the original. Index entries say which k
 """
 
 import json
+import errno
+import contextlib
 import os
 import re
+import shutil
 import time
+import threading
+import functools
 import uuid
 from pathlib import Path
 
 INDEX_NAME = "index.json"
 DEFAULT_BUDGET_MB = 2048
+DEFAULT_STORAGE_MB = 10240
+FREE_RESERVE = 64 * 1024 * 1024
 STALE_SESSION_DAYS = 30
 KEEP_NEWEST = 5
+_STORAGE_LOCK = threading.RLock()
+_STORAGE_SIZES = {}
+_STORAGE_ERRORS = {}
+_CLEANUP_THREAD = None
+
+
+def _storage_locked(function):
+    @functools.wraps(function)
+    def locked(*args, **kwargs):
+        with _STORAGE_LOCK:
+            return function(*args, **kwargs)
+    return locked
+
+
+def cached_storage_size() -> int | None:
+    key = str(data_root())
+    if key in _STORAGE_ERRORS:
+        raise OSError(_STORAGE_ERRORS[key])
+    return _STORAGE_SIZES.get(key)
+
+
+def storage_scan_running() -> bool:
+    return _CLEANUP_THREAD is not None and _CLEANUP_THREAD.is_alive()
+
+
 _ID = re.compile(r"^[0-9a-f]{32}$")
 _RESTORED_SUFFIX = re.compile(r"\.restored-\d{8}-\d{6}(-\d+)?$")
 
 
 class CheckpointError(Exception):
     pass
+
+
+class StorageFullError(CheckpointError):
+    pass
+
+
+def storage_budget() -> int:
+    try:
+        from . import settings
+        return int(getattr(settings.preferences(), "storage_budget_mb", DEFAULT_STORAGE_MB)) * 1024 * 1024
+    except (AttributeError, ImportError):
+        return DEFAULT_STORAGE_MB * 1024 * 1024
+
+
+def storage_size(path: Path | None = None) -> int:
+    """Count owned regular files without following symlinks."""
+    path = data_root() if path is None else path
+    total = 0
+    for folder, dirs, names in os.walk(path, followlinks=False):
+        dirs[:] = [d for d in dirs if not (Path(folder) / d).is_symlink()]
+        for name in names:
+            child = Path(folder) / name
+            if not child.is_symlink():
+                with contextlib.suppress(OSError):
+                    total += child.stat().st_size
+    return total
+
+
+def _disposable_folder(folder: Path, name: str, protected: set[Path]) -> bool:
+    if folder.is_symlink() or not folder.is_dir():
+        return False
+    # A stopped cleanup can leave a folder already retired from its working path.
+    if re.fullmatch(r"\.cleanup-[0-9a-f]{32}", folder.name):
+        return True
+    if not _ID.fullmatch(folder.name):
+        return False
+    resolved = folder.resolve()
+    if any(p == resolved or resolved in p.parents for p in protected):
+        return False
+    try:
+        if name == "workspaces":
+            from . import jobs
+            owner = json.loads((folder / ".loopcut" / "owner.json").read_text(encoding="utf-8"))
+            return not (type(owner.get("pid")) is int and jobs._alive(owner["pid"]))
+        status = json.loads((folder / "status.json").read_text(encoding="utf-8"))
+        return (status.get("state") in ("complete", "cancelled", "failed", "interrupted")
+                and not (folder / ".lease").exists() and not (folder / "lease").exists())
+    except (OSError, ValueError, AttributeError):
+        return name == "workspaces"
+
+
+def _kept_checkpoints(store: "Store", active_id: str) -> set[str]:
+    active = [e for e in store.entries if not e["expired"]]
+    keep = ({e["id"] for e in active[:1] + active[-KEEP_NEWEST:]}
+            if store.folder.name == active_id else set())
+    undo = next((e["id"] for e in reversed(active) if e["kind"] == "pre_restore"), None)
+    return keep | {undo} | {e["id"] for e in active if e["kind"] == "bundle"}
+
+
+def cleanup_storage(*, budget_bytes: int | None = None, now: float | None = None,
+                    protect: tuple[Path, ...] = (), reclaim_bytes: int = 0,
+                    root: Path | None = None, active_session: dict | None = None,
+                    require_reclaim: bool = False) -> dict:
+    """Scan without holding the storage lock; serialize each index update or folder retirement.
+
+    A copy preflight must be able to reclaim its full shortfall before deleting anything.
+    Conversation text, live work and restore undo remain protected even above the budget.
+    """
+    root = data_root() if root is None else root
+    budget = storage_budget() if budget_bytes is None else max(0, budget_bytes)
+    cutoff = (time.time() if now is None else now) - STALE_SESSION_DAYS * 86400
+    from . import state
+    session = state.session() if active_session is None else active_session
+    protected = {p.resolve() for p in protect}
+    if session.get("mode") == "workspace":
+        protected.add((root / "workspaces" / session["id"]).resolve())
+    candidates = []
+    for name in ("workspaces", "jobs"):
+        parent = root / name
+        if not parent.is_dir() or parent.is_symlink():
+            continue
+        for folder in parent.iterdir():
+            if _disposable_folder(folder, name, protected):
+                candidates.append((folder.stat().st_mtime, folder, None, None))
+    parent = root / "checkpoints"
+    if parent.is_dir() and not parent.is_symlink():
+        for folder in parent.iterdir():
+            if folder.is_symlink() or not folder.is_dir() or not _ID.fullmatch(folder.name):
+                continue
+            try:
+                with _STORAGE_LOCK:
+                    store = Store(root, folder.name)
+                    keep = _kept_checkpoints(store, session["id"])
+                for entry in store.entries:
+                    path = store.snapshot_path(entry["id"])
+                    if not entry["expired"] and entry["id"] not in keep and path.resolve() not in protected:
+                        candidates.append((entry.get("created", folder.stat().st_mtime), path, folder.name, entry["id"]))
+                indexed = {p.name for e in store.entries if not e["expired"]
+                           for p in (store.snapshot_path(e["id"]), store.tail_path(e["id"]))}
+                for path in folder.iterdir():
+                    if (path.is_symlink() or not path.is_file() or path.name in indexed
+                            or path.resolve() in protected):
+                        continue
+                    if re.fullmatch(r"[0-9a-f]{32}\.(blend|tail\.json)", path.name) and path.stat().st_mtime < cutoff:
+                        candidates.append((path.stat().st_mtime, path, folder.name, None))
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+    total = storage_size(root)
+    sized = []
+    for stamp, path, conversation, checkpoint in candidates:
+        size = storage_size(path) if conversation is None else 0
+        if conversation is not None:
+            for file in (path, path.with_suffix(".tail.json")) if checkpoint else (path,):
+                if not file.is_symlink() and file.is_file():
+                    size += file.stat().st_size
+        sized.append((stamp, path, conversation, checkpoint, size))
+    if require_reclaim and sum(row[4] for row in sized) < reclaim_bytes:
+        raise StorageFullError("Disk is full: disposable copies cannot free enough space for this copy.")
+    budget = min(budget, max(0, total - reclaim_bytes)) if reclaim_bytes else budget
+    removed = 0
+    for stamp, path, conversation, checkpoint, size in sorted(sized, key=lambda c: c[0]):
+        # Stale unindexed files can always be cleared after the all-or-nothing preflight.
+        if total <= budget and not (conversation is not None and checkpoint is None):
+            continue
+        retired = None
+        try:
+            with _STORAGE_LOCK:
+                current = state.session()
+                if current.get("mode") == "workspace":
+                    protected.add((root / "workspaces" / current["id"]).resolve())
+                if conversation is None:
+                    if not _disposable_folder(path, path.parent.name, protected):
+                        continue
+                    retired = path.with_name(".cleanup-" + uuid.uuid4().hex)
+                    path.rename(retired)
+                else:
+                    store = Store(root, conversation)
+                    if checkpoint:
+                        entry = store.get(checkpoint)
+                        if (entry["expired"] or checkpoint in _kept_checkpoints(store, current["id"])
+                                or path.resolve() in protected):
+                            continue
+                        entry["expired"] = True
+                        store.save_index()
+                        path.unlink(missing_ok=True)
+                        store.tail_path(checkpoint).unlink(missing_ok=True)
+                    else:
+                        live = {p for e in store.entries if not e["expired"]
+                                for p in (store.snapshot_path(e["id"]), store.tail_path(e["id"]))}
+                        if path in live or path.resolve() in protected:
+                            continue
+                        path.unlink(missing_ok=True)
+            if retired is not None:
+                shutil.rmtree(retired)  # Recursive filesystem work never holds the storage lock.
+            total -= size
+            removed += size
+        except (OSError, CheckpointError):
+            if retired is not None and retired.exists():
+                with _STORAGE_LOCK:
+                    if not path.exists():
+                        retired.rename(path)
+            continue
+    remaining = storage_size(root)
+    _STORAGE_SIZES[str(root)] = remaining
+    _STORAGE_ERRORS.pop(str(root), None)
+    return {"bytes": remaining, "removed": removed, "budget": budget}
+
+
+@_storage_locked
+def require_space(destination: Path, size: int | None = None, *, protect: tuple[Path, ...] = ()) -> None:
+    """Prune disposable storage to its budget; refuse a copy only for insufficient disk space."""
+    if size is None:
+        import bpy
+        source = Path(bpy.data.filepath) if bpy.data.filepath else None
+        size = source.stat().st_size if source is not None and source.is_file() else FREE_RESERVE
+    parent = destination.parent
+    while not parent.exists():
+        if parent == parent.parent:
+            raise StorageFullError(f"The storage volume is unavailable: {destination.anchor}")
+        parent = parent.parent
+    needed = size + FREE_RESERVE
+    try:
+        free = shutil.disk_usage(parent)[2]
+    except OSError as ex:
+        raise StorageFullError(f"The storage volume is unavailable: {parent}: {ex}") from ex
+    shortfall = max(0, needed - free)
+    root = data_root()
+    if shortfall and root.exists() and root.stat().st_dev != parent.stat().st_dev:
+        raise StorageFullError("Disk is full: Loopcut copies are on a different volume and cannot free space here.")
+    cleanup_storage(protect=protect, reclaim_bytes=shortfall, require_reclaim=bool(shortfall))
+    try:
+        free = shutil.disk_usage(parent)[2]
+    except OSError as ex:
+        raise StorageFullError(f"The storage volume is unavailable: {parent}: {ex}") from ex
+    if free < needed:
+        raise StorageFullError("Disk is full: there is not enough free space for a scene copy and conversation saves.")
+
+
+def storage_notice(session: dict, cause: Exception | None = None) -> None:
+    from . import state
+    if not any(i.get("storage") for i in session["items"]):
+        unavailable = cause is not None and "unavailable" in str(cause).lower()
+        reason = ("Storage volume is unavailable. Reconnect it or choose an available folder. "
+                  if unavailable else "Disk is full. Free space, clean up copies, or lower the storage budget in Preferences. ")
+        session["items"].append({**state.item_notice(
+            reason + "Checkpoints are paused. You can continue without new checkpoints; "
+            "those edits cannot be restored from chat."), "storage": True})
 
 
 # ------------------------------------------------------------------ pure logic (no bpy)
@@ -109,13 +348,18 @@ class Store:
 
     def save_index(self) -> None:
         self.folder.mkdir(parents=True, exist_ok=True)
-        temporary = self.folder / (INDEX_NAME + ".tmp")
-        temporary.write_text(json.dumps(self.entries, indent=1), encoding="utf-8")
-        os.replace(temporary, self.folder / INDEX_NAME)
+        temporary = self.folder / (INDEX_NAME + "." + uuid.uuid4().hex + ".tmp")
+        try:
+            temporary.write_text(json.dumps(self.entries, indent=1), encoding="utf-8")
+            os.replace(temporary, self.folder / INDEX_NAME)
+        finally:
+            temporary.unlink(missing_ok=True)
 
-    def add(self, entry: dict, budget_bytes: int) -> None:
+    def add(self, entry: dict, budget_bytes: int, *, protect: tuple[Path, ...] = ()) -> None:
         self.entries.append(entry)
         for checkpoint_id in plan_pruning(self.entries, budget_bytes):
+            if self.snapshot_path(checkpoint_id) in protect:
+                continue
             self.get(checkpoint_id)["expired"] = True
             self.snapshot_path(checkpoint_id).unlink(missing_ok=True)
             self.tail_path(checkpoint_id).unlink(missing_ok=True)
@@ -147,12 +391,15 @@ def in_place_supported() -> bool:
     return "loopcut_snapshot_restore" in dir(bpy.ops.wm)
 
 
-def _write_snapshot(store: Store, kind: str, label: str, **extra) -> dict:
+@_storage_locked
+def _write_snapshot(store: Store, kind: str, label: str, *, protect: tuple[Path, ...] = (), **extra) -> dict:
     import bpy
     checkpoint_id = uuid.uuid4().hex
     path = store.snapshot_path(checkpoint_id)
     in_place = in_place_supported()
     try:
+        require_space(path, protect=protect)
+        store.entries = Store(data_root(), store.folder.name).entries
         store.folder.mkdir(parents=True, exist_ok=True)
         # Either way the open file, its path and its unsaved-changes state are left alone.
         if in_place:
@@ -161,17 +408,26 @@ def _write_snapshot(store: Store, kind: str, label: str, **extra) -> dict:
         else:
             bpy.ops.wm.save_as_mainfile(filepath=str(path), copy=True, compress=True)
         size = path.stat().st_size
+        entry = {"id": checkpoint_id, "kind": kind, "label": label[:80], "created": time.time(),
+                 "size": size, "expired": False, "source": bpy.data.filepath, "in_place": in_place, **extra}
+        store.add(entry, _budget_bytes(), protect=protect)
+        cleanup_storage(protect=(*protect, path))
+    except StorageFullError:
+        path.unlink(missing_ok=True)
+        raise
     except (OSError, RuntimeError) as ex:
         path.unlink(missing_ok=True)
+        if getattr(ex, "errno", None) == errno.ENOSPC or "No space left" in str(ex):
+            raise StorageFullError(f"Disk is full: could not save a checkpoint to {store.folder}.") from ex
         raise CheckpointError(f"Could not save a checkpoint to {store.folder}: {ex}") from ex
-    entry = {"id": checkpoint_id, "kind": kind, "label": label[:80], "created": time.time(),
-             "size": size, "expired": False, "source": bpy.data.filepath, "in_place": in_place, **extra}
-    store.add(entry, _budget_bytes())
     return entry
 
 
 def begin_turn(session: dict, user_item: dict, *, text: str | None = None) -> None:
     """Record the request before sending; reused notes may already be in history. Nothing is written yet."""
+    if session.get("checkpoints_disabled"):
+        session["pending_checkpoint"] = None
+        return
     session["pending_checkpoint"] = {
         "item": user_item,
         "input": user_item["text"] if text is None else text,
@@ -186,9 +442,15 @@ def ensure_for_turn(session: dict) -> None:
     pending = session.get("pending_checkpoint")
     if not pending:
         return
-    entry = _write_snapshot(_store(session), "turn", pending["item"]["text"],
-                            message_index=pending["message_index"], item_index=pending["item_index"],
-                            input=pending["input"])
+    try:
+        entry = _write_snapshot(_store(session), "turn", pending["item"]["text"],
+                                message_index=pending["message_index"], item_index=pending["item_index"],
+                                input=pending["input"])
+    except StorageFullError as ex:
+        session["pending_checkpoint"] = None
+        session["checkpoints_disabled"] = True
+        storage_notice(session, ex)
+        raise
     pending["item"]["checkpoint"] = entry["id"]
     session["pending_checkpoint"] = None
 
@@ -200,7 +462,15 @@ def ensure_for_wave(session: dict, label: str, message_index: int, item_index: i
     puts the scene back to before the delegate call, every merge of the wave undone, and cuts the
     conversation to just before the wave was asked for. Raises CheckpointError; the wave must not
     start without one."""
-    entry = _write_snapshot(_store(session), "wave", label, message_index=message_index, item_index=item_index)
+    if session.get("checkpoints_disabled"):
+        return ""
+    try:
+        entry = _write_snapshot(_store(session), "wave", label, message_index=message_index, item_index=item_index)
+    except StorageFullError as ex:
+        session["pending_checkpoint"] = None
+        session["checkpoints_disabled"] = True
+        storage_notice(session, ex)
+        raise
     return entry["id"]
 
 
@@ -211,6 +481,7 @@ def for_bundle(session: dict) -> str:
     return _write_snapshot(_store(session), "bundle", "Cloud bundle")["id"]
 
 
+@_storage_locked
 def discard(session: dict, checkpoint_id: str) -> None:
     """Main thread: remove a snapshot nothing restores (a bundle's, once collected), so it never takes
     the storage budget from the conversation's checkpoints. A missing one is already gone."""
@@ -219,18 +490,19 @@ def discard(session: dict, checkpoint_id: str) -> None:
         entry = store.get(checkpoint_id)
     except CheckpointError:
         return
-    store.snapshot_path(checkpoint_id).unlink(missing_ok=True)
     store.entries.remove(entry)
     store.save_index()
+    store.snapshot_path(checkpoint_id).unlink(missing_ok=True)
 
 
 def status(session: dict, checkpoint_id: str) -> str:
     """'ok' | 'expired' | 'missing', for the UI."""
     try:
-        entry = _store(session).get(checkpoint_id)
+        store = _store(session)
+        entry = store.get(checkpoint_id)
     except CheckpointError:
         return "missing"
-    return "expired" if entry["expired"] else "ok"
+    return "expired" if entry["expired"] or not store.snapshot_path(checkpoint_id).is_file() else "ok"
 
 
 def bundle_from_checkpoint(session: dict, checkpoint_id: str, staging_dir) -> dict:
@@ -266,6 +538,7 @@ def _blocking_job() -> str | None:
     return None
 
 
+@_storage_locked
 def restore(session: dict, checkpoint_id: str) -> Path | None:
     """Main thread, outside any operator. Returns the new file the restored scene was saved to,
     or None when it was restored in place."""
@@ -289,7 +562,7 @@ def restore(session: dict, checkpoint_id: str) -> Path | None:
     #    that point is common to both branches, so the same cut applies either way.
     cut_messages, cut_items = target["message_index"], target["item_index"]
     undo = _write_snapshot(store, "pre_restore", "Before restore",
-                           message_index=cut_messages, item_index=cut_items)
+                           protect=(snapshot,), message_index=cut_messages, item_index=cut_items)
     tail = {"messages": session["messages"][cut_messages:], "items": session["items"][cut_items:],
             "input": session["input"], "references": session.get("references") or []}
     store.tail_path(undo["id"]).write_text(json.dumps(tail), encoding="utf-8")
@@ -305,7 +578,8 @@ def restore(session: dict, checkpoint_id: str) -> Path | None:
             if bpy.ops.wm.loopcut_snapshot_restore(filepath=str(snapshot)) != {"FINISHED"}:
                 raise CheckpointError("Blender could not read that checkpoint; nothing was changed.")
         else:
-            destination = restored_path(target["source"] or undo["source"], data_root() / "restored", time.time())
+            from . import files
+            destination = restored_path(target["source"] or undo["source"], files.blend_base()[0], time.time())
             destination.parent.mkdir(parents=True, exist_ok=True)
             bpy.ops.wm.open_mainfile(filepath=str(snapshot), load_ui=False)
             bpy.ops.wm.save_as_mainfile(filepath=str(destination), compress=False)
@@ -369,14 +643,39 @@ def _drop_cut_references(session: dict, cut: list) -> None:
         session["references"] = [r for r in session.get("references") or [] if r["ref"] not in gone]
 
 
-def remove_stale_sessions(now: float | None = None) -> None:
-    """Drop snapshot stores nothing has been added to for STALE_SESSION_DAYS. Snapshots are the
-    bulky part; the conversation itself is kept and shows those checkpoints as expired."""
-    import shutil
-    root = data_root() / "checkpoints"
-    if not root.is_dir():
+def schedule_cleanup() -> None:
+    """Capture Blender settings on the main thread, then scan storage off the startup path."""
+    global _CLEANUP_THREAD
+    if _CLEANUP_THREAD is not None and _CLEANUP_THREAD.is_alive():
         return
-    cutoff = (now or time.time()) - STALE_SESSION_DAYS * 86400
-    for folder in root.iterdir():
-        if folder.is_dir() and _ID.match(folder.name) and folder.stat().st_mtime < cutoff:
-            shutil.rmtree(folder)
+    from . import state
+    root, budget, session = data_root(), storage_budget(), state.session()
+    def clean():
+        try:
+            remove_stale_sessions(root=root, budget_bytes=budget, active_session=session)
+        except Exception as ex:
+            _STORAGE_SIZES.pop(str(root), None)
+            _STORAGE_ERRORS[str(root)] = str(ex)
+            print(f"Loopcut: could not clean up old copies: {ex}")
+    _CLEANUP_THREAD = threading.Thread(target=clean, name="Loopcut storage cleanup", daemon=True)
+    try:
+        _CLEANUP_THREAD.start()
+    except Exception as ex:
+        _STORAGE_SIZES.pop(str(root), None)
+        _STORAGE_ERRORS[str(root)] = str(ex)
+        raise
+
+
+def remove_stale_sessions(now: float | None = None, *, root: Path | None = None,
+                          budget_bytes: int | None = None, active_session: dict | None = None) -> None:
+    # Atomic saves remove their own temporary files; also clear leftovers from a stopped process.
+    root = data_root() if root is None else root
+    parent = root / "conversations"
+    if parent.is_dir():
+        for folder in parent.iterdir():
+            if folder.is_dir() and not folder.is_symlink() and _ID.fullmatch(folder.name):
+                for name in ("conversation.json.tmp", "meta.json.tmp"):
+                    temporary = folder / name
+                    if temporary.is_file() and temporary.stat().st_mtime < (now or time.time()) - 86400:
+                        temporary.unlink(missing_ok=True)
+    cleanup_storage(now=now, root=root, budget_bytes=budget_bytes, active_session=active_session)

@@ -99,13 +99,15 @@ RECORD_ARGUMENTS = 100  # Characters of a call's arguments that its record keeps
 CHARS_PER_TOKEN = 3.4   # JSON and code run denser than prose; the ratio is corrected from usage.
 IMAGE_TOKENS = 2000     # One capture at worker_capture.WIDTH (1024 px, the M4 quality audit's looks); it was 800
                         # at tools.CAPTURE_WIDTH (640 px) and 1700 at 960 px, scaling with pixels.
-FIXED_TOKENS = 8600     # System prompt and tool schemas when the caller does not say (measured 2026-09-27;
+FIXED_TOKENS = 9300     # System prompt and tool schemas when the caller does not say (measured 2026-09-27;
                         # 7,901 on 2026-09-30 with inspect_uv, uv_unwrap and inspect_texture, and after the M4 merges;
                         # 7,926 with text blocks in owns, run_python's fresh namespace and capture view layers;
                         # 7,982 on 2026-10-10 with the libraries-first rule; 8,149 on 2026-10-13 with transfer_textures;
                         # 8,194 on 2026-10-17 with the captures' labels switch; 8,198 in 0.2.13; 8,199 on
                         # 2026-10-23 with asset pick numbers; 8,407 with auto-rig's tools on 2026-10-22, which only
-                        # accounts with auto-rig access get; 8,340 on 2026-10-26 with read_result, 8,551 with auto-rig's).
+                        # accounts with auto-rig access get; 8,340 on 2026-10-26 with read_result, 8,551 with auto-rig's;
+                        # 8,796 on 2026-10-31 with check_shading and export_for_engine, about 9,010 with auto-rig's;
+                        # 8,952 with add_detail_normal, about 9,170 with auto-rig's).
 WORKSPACE_FIXED_TOKENS = 4400  # Workspace prompt/tools including character_rig: 4,280 on 2026-10-22,
                                # 3,833 on 2026-10-09 with live inspect_api,
                                # 4,012 on 2026-10-10 with the asset libraries note; 4,044 on 2026-10-15 with

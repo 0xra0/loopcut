@@ -1,20 +1,11 @@
-"""The version guard: no module of a newer (or older) Loopcut is loaded into this one.
+"""Stamp imported modules and refuse mixed versions until Blender restarts.
 
-Loopcut imports most of its modules on first use, so one can be read from disk hours after Blender
-started. When the files were replaced in the meantime, by an update installed while this Blender was
-still open (another Blender quitting ran the installer, or the installer was run by hand), that module
-is the new version and everything loaded before it the old one, and the first call between them fails.
-On 2026-10-25 a 0.2.15 Blender loaded 0.2.17's chatgpt_responses for its first ChatGPT request and the
-turn ended in "Internal error: AttributeError(module 'loopcut.context' has no attribute 'is_record')".
-
-register() puts a finder first on sys.meta_path. Before Python loads a module of this package that is
-not loaded yet, it reads bl_info's version from __init__.py on disk, and when that is no longer the
-version this Blender started with, the import fails with RestartNeeded, whose text is the chat's card.
-A file it cannot read or parse lets the import through. Modules already loaded never come here, so it
-costs one small file read per module, once.
+The import hook checks first imports and explicit reloads. The turn boundary also checks cached
+modules and the on-disk version, including when no new import would otherwise reach the hook.
 """
 
 import importlib.abc
+import importlib.machinery
 import re
 import sys
 from pathlib import Path
@@ -23,7 +14,7 @@ MESSAGE = "Loopcut was updated while Blender was open. Restart Blender to finish
 _VERSION = re.compile(r'"version":\s*\((\d+),\s*(\d+),\s*(\d+)\)')
 # The version the first register() saw. Kept through unregister and register: Blender reloads __init__.py when
 # its file changed (addon_utils.enable) but not the modules it imported, so a later bl_info can be newer than them.
-_started: tuple | None = None
+_started: tuple | None = globals().get("_started")
 
 
 class RestartNeeded(ImportError):
@@ -41,25 +32,97 @@ def version_on_disk(root: Path) -> tuple | None:
 
 
 class _Finder(importlib.abc.MetaPathFinder):
+    _loopcut_version_guard = True
+
     def __init__(self, package: str, root: Path, version: tuple):
         self.package, self.root, self.version = package, root, version
+        self.package_module = sys.modules.get(package)
 
     def find_spec(self, fullname, path=None, target=None):
-        if fullname.startswith(self.package + ".") and fullname not in sys.modules:  # Not a reload.
+        # A reload keeps the root object; an extension purge ends this finder's lifetime.
+        if sys.modules.get(self.package) is not self.package_module:
+            # A new list, not an in-place removal: the import system may be iterating the old one right now.
+            sys.meta_path = [finder for finder in sys.meta_path if finder is not self]
+            return None
+        if fullname.startswith(self.package + "."):
             found = version_on_disk(self.root)
             if found is not None and found != self.version:
                 print(f"Loopcut: {fullname} on disk is {'.'.join(map(str, found))}, this Blender runs "
                       f"{'.'.join(map(str, self.version))}; not loading it")
                 raise RestartNeeded(MESSAGE, name=fullname)
+            spec = importlib.machinery.PathFinder.find_spec(fullname, path, target)
+            if spec is not None and spec.loader is not None:
+                spec.loader = _Loader(spec.loader, self.version)
+                return spec
         return None  # The usual finders load it.
+
+
+class _Loader:
+    def __init__(self, loader, version):
+        self.loader, self.version = loader, version
+
+    def __getattr__(self, name):
+        return getattr(self.loader, name)
+
+    def create_module(self, spec):
+        return self.loader.create_module(spec)
+
+    def exec_module(self, module):
+        # Set before execution as well: another thread may inspect an import in progress.
+        module.__loopcut_version__ = self.version
+        self.loader.exec_module(module)
 
 
 def register(package: str, root: Path, version) -> None:
     global _started
     _started = _started or tuple(version)
     unregister(package)
+    # Only these two modules bootstrap the hook. Unstamped cached children are untrusted,
+    # rather than being relabelled with the new initializer's version on re-enable.
+    for name in (package, package + ".version_guard"):
+        module = sys.modules.get(name)
+        if module is not None:
+            module.__dict__.setdefault("__loopcut_version__", tuple(version))
     sys.meta_path.insert(0, _Finder(package, Path(root), _started))
+    agent = sys.modules.get(package + ".agent")
+    if agent is not None and getattr(agent, "__loopcut_version__", None) != _started:
+        # Legacy cached entry points predate the turn guard. They must not run a new turn
+        # while the newly registered package contains unstamped or mismatched modules.
+        def refuse(*args, **kwargs):
+            state = importlib.import_module(package + ".state")
+            allow_turn(state.session(), package)
+            return False
+        for name in ("send", "resume", "turn_into_3d"):
+            if callable(getattr(agent, name, None)):
+                setattr(agent, name, refuse)
 
 
 def unregister(package: str) -> None:
-    sys.meta_path[:] = [f for f in sys.meta_path if not (isinstance(f, _Finder) and f.package == package)]
+    sys.meta_path[:] = [f for f in sys.meta_path if not (
+        (getattr(f, "_loopcut_version_guard", False) or
+         (type(f).__module__ == __name__ and type(f).__name__ == "_Finder")) and f.package == package)]
+
+
+def ensure_consistent(package: str = __package__) -> None:
+    finder = next((f for f in sys.meta_path if getattr(f, "_loopcut_version_guard", False)
+                   and f.package == package), None)
+    if finder is None:  # Pure helpers can also be used without enabling the add-on.
+        return
+    found = version_on_disk(finder.root)
+    if found is not None and found != finder.version:
+        raise RestartNeeded(MESSAGE, name=package)
+    for name, module in sys.modules.copy().items():
+        if (name == package or name.startswith(package + ".")) and module is not None:
+            if getattr(module, "__loopcut_version__", None) != finder.version:
+                raise RestartNeeded(MESSAGE, name=name)
+
+
+def allow_turn(session: dict, package: str = __package__) -> bool:
+    try:
+        ensure_consistent(package)
+    except RestartNeeded:
+        state = importlib.import_module(package + ".state")
+        if not session["items"] or session["items"][-1].get("text") != MESSAGE:
+            session["items"].append(state.item_error(MESSAGE))
+        return False
+    return True

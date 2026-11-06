@@ -44,7 +44,7 @@ def extra(folder: Path = base.PACKAGE, name: str = "_flag_off_0214") -> dict:
               "provider": provider}
         with patch.object(layout.config, "billing_open", return_value=True):
             for width in (420, 240):
-                display = layout.build(session, width, 800, 1.0, base.measure, "fast", None, ui)
+                display = base.billing_display(layout, session, width, 800, 1.0, base.measure, "fast", None, ui)
                 shots[f"reply_{provider.lower()}_{width}"] = {"prims": display["prims"], "hits": display["hits"]}
     cards = {}
     granted = 1792144800.0  # 2026-10-16T10:00:00Z. An hour later and still whole, the trial card shows in 0.2.14 and

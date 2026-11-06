@@ -114,6 +114,36 @@ class RuntimeFixture(unittest.TestCase):
         return runtime
 
 
+class CreditToolTest(RuntimeFixture):
+    def test_free_credit_tool_refreshes_balance_and_prices_without_submitting(self):
+        runtime = self.runtime(Reply(manifest(tool(cost={'credits_estimate': 6, 'quote_required': True}))))
+        runtime.manifest = manifest(tool())
+        self.assertIn('loopcut_cloud__credits', [s['function']['name'] for s in cloud.tool_schemas()])
+        self.assertFalse(cloud.changes_scene('loopcut_cloud__credits'))
+        self.assertFalse(cloud.approval('loopcut_cloud__credits'))
+        with patch.object(cloud, 'sync_settings'):
+            pending = cloud.execute('loopcut_cloud__credits', {})
+        result = pending.then(lambda: False, lambda fn: fn())
+        self.assertTrue(result.ok, result.text)
+        data = json.loads(result.text)
+        self.assertEqual(data['balance'], 100)
+        self.assertTrue(data['fresh'])
+        self.assertEqual(data['prices'][0]['credits_estimate'], 6)
+        self.assertTrue(data['prices'][0]['quote_required'])
+        self.assertEqual([(c['method'], c['url'].rsplit('/', 1)[-1]) for c in self.transport.calls],
+                         [('GET', 'manifest')])
+
+    def test_offline_and_signed_out_never_report_a_fresh_balance(self):
+        runtime = self.runtime(OSError('offline'), signed_in=False)
+        runtime.manifest = manifest(tool())
+        with patch.object(cloud, 'sync_settings'):
+            result = cloud.execute('loopcut_cloud__credits', {}).then(lambda: False, lambda fn: fn())
+        data = json.loads(result.text)
+        self.assertIsNone(data['balance'])
+        self.assertFalse(data['fresh'])
+        self.assertIn('cached', data['note'])
+
+
 class RuntimeTest(RuntimeFixture):
 
     def test_html_404_is_quiet_and_removes_cached_beta_capabilities(self):
@@ -217,9 +247,9 @@ class RuntimeTest(RuntimeFixture):
         runtime = self.runtime(Reply(manifest(tool())), Reply(manifest(tool(status='coming_soon', available=False))),
                                Reply(manifest(tool('new_tool', backends=['managed']))))
         runtime.refresh()
-        self.assertEqual(len(cloud.tool_schemas()), 1)
+        self.assertEqual(len(cloud.tool_schemas()), 2)
         runtime.refresh()
-        self.assertEqual(cloud.tool_schemas(), [])
+        self.assertEqual([s['function']['name'] for s in cloud.tool_schemas()], ['loopcut_cloud__credits'])
         self.assertEqual(runtime.coming_soon()[0]['title'], 'Generate image')
         runtime.refresh()
         self.assertEqual(cloud.tool_schemas()[0]['function']['name'], 'loopcut_cloud__new_tool')
@@ -939,7 +969,8 @@ class SchemaTest(RuntimeFixture):
     def test_long_tools_offer_job_status(self):
         runtime = self.runtime(Reply(manifest(tool(latency='long'))))
         runtime.refresh()
-        self.assertEqual([s['function']['name'] for s in cloud.tool_schemas()], ['loopcut_cloud__image_generate', 'loopcut_cloud__job_status'])
+        self.assertEqual([s['function']['name'] for s in cloud.tool_schemas()],
+                         ['loopcut_cloud__image_generate', 'loopcut_cloud__credits', 'loopcut_cloud__job_status'])
 
     def test_codex_and_workspace_receive_dynamic_cloud_tools(self):
         from loopcut import agent, codex_app

@@ -262,7 +262,8 @@ class FreshChecksTest(unittest.TestCase):
     def test_passing_scene_summary_does_not_list_raw_check_identifiers(self):
         checks = [(f"worker c{i}", {"kind": "no_overlap", "names": [f"Raw_Object_{i}", "Other"]},
                    {"status": "pass", "detail": "1.0 mm"}) for i in range(12)]
-        self.assertEqual(orchestrator.verified_block(checks), "Verified by Loopcut on this scene: 12 of 12 checks.")
+        self.assertEqual(orchestrator.verified_block(checks), "Verified by Loopcut on this scene: 12 of 12 checks.\n"
+                         "These results cover selected checks only; they do not establish overall task completion.")
 
     def test_a_later_block_in_the_turn_is_headed_by_what_it_measured(self):
         """2026-10-25: "Verified … 1 of 1" then "Verified … 9 of 18" in one turn, and the user asked "did you glitch?"."""
@@ -390,7 +391,8 @@ class FreshChecksTest(unittest.TestCase):
     def test_unrelated_acceptance_pass_does_not_list_contact_coverage(self):
         block = orchestrator.verified_block([("typewriter c1", {"kind": "exists", "name": "Typewriter"},
                                               {"status": "pass"})])
-        self.assertEqual(block, "Verified by Loopcut on this scene: 1 of 1 checks.")
+        self.assertEqual(block, "Verified by Loopcut on this scene: 1 of 1 checks.\n"
+                         "These results cover selected checks only; they do not establish overall task completion.")
         self.assertNotIn("Socket", block)
 
 

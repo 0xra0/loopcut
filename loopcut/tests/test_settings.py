@@ -158,6 +158,31 @@ class SettingsTest(unittest.TestCase):
             context.start()
             self.addCleanup(context.stop)
 
+    def test_preferences_redraw_does_not_walk_storage(self):
+        checkpoints = importlib.import_module(NAME + '.checkpoints')
+        with patch.object(checkpoints, 'storage_size', side_effect=AssertionError('Preferences scanned storage')):
+            self.draw_preferences('CUSTOM', False)
+            self.draw_preferences('CUSTOM', False)
+
+    def test_preferences_show_unavailable_size_when_cleanup_worker_has_died(self):
+        checkpoints = importlib.import_module(NAME + '.checkpoints')
+        with patch.object(checkpoints, 'cached_storage_size', return_value=None), \
+                patch.object(checkpoints, '_CLEANUP_THREAD', None):
+            calls = self.draw_preferences('CUSTOM', False)
+        labels = [entry[1] for entry in calls if entry[0] == 'label']
+        self.assertFalse(any('calculating' in label for label in labels))
+        self.assertTrue(any('size unavailable' in label for label in labels))
+
+    def test_failed_storage_scan_shows_unavailable_size_and_keeps_folder_visible(self):
+        checkpoints = importlib.import_module(NAME + '.checkpoints')
+        with patch.object(checkpoints, 'cached_storage_size', side_effect=OSError('Synthetic scan failure')), \
+                patch.object(checkpoints, 'data_root', return_value=Path('/synthetic/storage')):
+            calls = self.draw_preferences('CUSTOM', False)
+        labels = [entry[1] for entry in calls if entry[0] == 'label']
+        self.assertTrue(any('size unavailable' in label for label in labels))
+        self.assertFalse(any('folder is unavailable' in label for label in labels))
+        self.assertIn(str(Path('/synthetic/storage')), labels)
+
     def test_signed_out_account_entry_is_visible_with_every_model_provider(self):
         for provider in ('LOOPCUT', 'CHATGPT', 'OPENAI', 'CUSTOM'):
             self.prefs.provider = provider

@@ -194,6 +194,47 @@ class PolicyTest(unittest.TestCase):
         self.assertIn("daily credit limit", spending.declined(spending.DAILY, managed(6), S))
 
 
+class FirstUseTest(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.client = cloud_http.Client(base_url='https://service.test', api_key='lc_test')
+        self.runtime = cloud.Runtime(self.client, folder.name, signed_in=True)
+        self.runtime.manifest = {'account': {'credits': {'balance': 500}}, 'tools': [], 'skills': []}
+
+    def call(self, name='image_to_3d', credits=80, accepted=True):
+        descriptor = {'name': name, 'version': 1, 'backend': 'managed', 'file_inputs': [],
+                      'cost': {'credits_estimate': credits}, 'approval': {'confirm_over_credits': 100}}
+        card = state.item_tool('loopcut_cloud__' + name, name, '')
+        consent = agent._Consent(state.new_session(), agent.Turn(), card)
+        snapshots = []
+        with patch.object(agent, '_redraw'), patch.object(conversations, 'save'), \
+                patch.object(agent, '_wait_for_approval', side_effect=lambda turn: snapshots.append(dict(card)) or accepted), \
+                patch.object(cloud_account, '_quote', return_value={'quote_id': 'qt_test', 'credits': credits,
+                             'expires_at': '2099-01-01T00:00:00Z'}), cloud_account.approval_context(consent):
+            cloud_account.authorize(cloud_jobs, descriptor, {}, {}, project=PROJECT, cancel=threading.Event(),
+                                    runtime=self.runtime, client=self.client)
+        return snapshots
+
+    def test_first_use_asks_with_price_then_persists_across_chats_and_restart(self):
+        asks = self.call()
+        self.assertEqual(len(asks), 1)
+        self.assertEqual(asks[0]['ask'], spending.COST)
+        self.assertIn('80 credits', asks[0]['cost'])
+        self.assertIn('First use of this paid tool.', asks[0]['ask_lines'])
+        self.runtime = cloud.Runtime(self.client, self.runtime.cache_dir, signed_in=True)
+        self.assertEqual(self.call(), [])
+        self.assertEqual(len(self.call(credits=101)), 1)
+        self.assertEqual(len(self.call(name='image_generate', credits=6)), 1)
+
+    def test_declining_and_free_calls_do_not_record_first_use(self):
+        with self.assertRaises(cloud_http.CloudError):
+            self.call(accepted=False)
+        self.assertEqual(len(self.call()), 1)
+        self.assertEqual(self.call(name='asset_search', credits=0), [])
+        self.assertEqual(len(self.call(name='asset_search', credits=4)), 1)
+
+
 class ConsentTest(unittest.TestCase):
     """agent._Consent: each limit pauses the turn on a card; Approve continues, Skip declines only that call."""
 
@@ -609,6 +650,7 @@ class ServerRefusalTest(unittest.TestCase):
         self.runtime = types.SimpleNamespace(lock=threading.RLock(), cache_dir=Path(self.temp.name), quotes={},
                                              quote_requests={}, handle_error=lambda error: None,
                                              manifest={"account": {"credits": {"balance": 500}}})
+        spending.note_use(self.runtime, 'image_generate')
         self.client = cloud_http.Client(base_url="https://service.test", api_key="lc_test", transport=self.transport,
                                         client_headers={"x-loopcut-contract": "0.1", "x-loopcut-client": "test"})
         self.session, self.turn = state.new_session(), agent.Turn()
@@ -1104,6 +1146,8 @@ class QuotedPriceTest(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.runtime = types.SimpleNamespace(lock=threading.RLock(), cache_dir=Path(temp.name), quotes={},
                                              quote_requests={}, handle_error=lambda error: None, manifest={})
+        for name in SERVER_PRICE:
+            spending.note_use(self.runtime, name)
         self.client = cloud_http.Client(base_url="https://service.test", api_key="lc_test", transport=self.server,
                                         client_headers={"x-loopcut-contract": "0.1", "x-loopcut-client": "test"})
         for target in (patch.object(agent, "_redraw"), patch.object(cloud_jobs, "_redraw"),

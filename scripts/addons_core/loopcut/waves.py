@@ -1857,6 +1857,27 @@ def started_deliverables(job: Job) -> list[tuple[str, bool]]:
                 if w.thread is not None or w.finished is None]
 
 
+def runs_of(job: Job | None) -> dict[str, list[list[tuple[dict, dict]]]]:
+    """Each deliverable's merged runs this turn, in the order asked for, a brief that continues one of the turn's
+    workers counting for that worker's deliverable: per run, its advisory misses as (advisory check, result), []
+    when none missed. What orchestrator.capped_deliverables and still_flags read."""
+    if job is None or not getattr(job, "crew", None):
+        return {}
+    with job.lock:
+        crew = list(job.crew)
+    keys, runs = {}, {}
+    for worker in crew:  # Read with defaults: the finish gate and delegate's refusal never fail on a worker's shape.
+        brief = getattr(worker, "brief", None) or {}
+        key = keys.get(brief.get("continues") or "") or brief.get("deliverable")
+        keys[getattr(worker, "id", None)] = key
+        if not (key and getattr(worker, "reported", False) and (getattr(worker, "row", None) or {}).get("merged")):
+            continue
+        advisory = {c.get("id"): c for c in brief.get("advisory") or () if isinstance(c, dict)}
+        runs.setdefault(key, []).append([(advisory.get(r.get("id")) or {}, r) for r in getattr(worker, "advice", ())
+                                         if r.get("status") not in ("pass", "deferred")])
+    return runs
+
+
 def _schedule(job: Job, is_cancelled) -> None:
     """The job's thread while any worker is queued or running: starts queued workers in order as slots
     free (at most max_workers at once, across the turn's waves; one the budget has no room for never

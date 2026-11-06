@@ -88,9 +88,18 @@ def uuid_hex(n):
 
 
 class CloudEndToEndTest(unittest.TestCase):
+    def test_catalog_estimate_matches_the_final_conversion_price(self):
+        descriptor = next(row for row in self.runtime.manifest['tools'] if row['name'] == 'image_to_3d')
+        self.assertEqual(descriptor['cost']['credits_estimate'], 80)
+
     @classmethod
     def setUpClass(cls):
         cls.service = MockService('--live-tools', 'image_generate,image_to_3d,render,sfx', '--job-seconds', '.3')
+        # Keep the synthetic service's catalog and quote endpoint on the price these scenarios exercise.
+        cls.service.transport.state.catalog['image_to_3d']['cost']['credits_estimate'] = 80
+        cls.service.transport.state.catalog['image_to_3d']['approval']['confirm_over_credits'] = 100
+        cls.service.transport.state.catalog['image_generate']['cost']['credits_estimate'] = 6
+        cls.service.transport.state.catalog['image_generate']['approval']['confirm_over_credits'] = 100
         cls.service.__enter__()
         cls.addClassCleanup(cls.service.__exit__, None, None, None)
 
@@ -122,6 +131,9 @@ class CloudEndToEndTest(unittest.TestCase):
                                         transport=self.transport, client_headers=cloud_http.contract_headers())
         self.control(reset=True, flags={'premium_skills': False})
         self.runtime = cloud.Runtime(self.client, self.directory.name, signed_in=True)
+        from loopcut import spending
+        for name in ('image_generate', 'image_to_3d', 'render', 'sfx'):
+            spending.note_use(self.runtime, name)
         self.replace(cloud, '_runtime', self.runtime)
         self.join_refreshes()
         self.assertTrue(self.runtime.refresh())
@@ -194,6 +206,8 @@ class CloudEndToEndTest(unittest.TestCase):
                     future.set_exception(ex)
 
     def execute(self, name='image_generate', arguments=None, stopped=None, consent=lambda details: True):
+        if name == 'image_to_3d' and arguments is not None:
+            arguments = {'input_check': {key: True for key in cloud.IMAGE_CHECK}, **arguments}
         full_name = cloud.PREFIX + name
         prepared = tools.execute(full_name, json.dumps({'prompt': 'tiny prop'} if arguments is None else arguments))
         if prepared.then is None:
@@ -303,6 +317,7 @@ class CloudEndToEndTest(unittest.TestCase):
         self.assertTrue(all(thread != self.main for thread in self.progress_threads))
         self.assertIn('%', state.session()['items'][-1]['output'])
         image_job = self.applied[0]
+        cloud_jobs.note_picture_seen(Path(image_job['outputs'][0]['path']))
         model = self.execute('image_to_3d', {'image': image_job['outputs'][0]['path']})
         self.assertTrue(model.ok, model.text)
         self.assertEqual(len(self.applied), 2)
@@ -511,6 +526,7 @@ class CloudEndToEndTest(unittest.TestCase):
         own = Image('cat.png', str(Path(self.directory.name) / 'cat.png'))
         Path(own.source).write_bytes(b'\x89PNG cat')
         self.data.images.append(own)
+        cloud_jobs.note_picture_seen(Path(own.source))
         card, consent, asks = self.asked(True, spending.Settings(ask_above=500))
         self.assertTrue(self.execute('image_to_3d', {'image': 'cat.png'}, consent=consent).ok)
         self.assertEqual(asks, [], 'under the thresholds it runs unasked, as before')
@@ -572,6 +588,143 @@ class CloudEndToEndTest(unittest.TestCase):
                              None, {})
         self.assertIn('Turned into 3D ✓', [p['text'] for p in drawn['prims'] if p.get('t') == 'text'])
         self.assertFalse([h for h in drawn['hits'] if h['id'] == 'item0.tool.to3d0'], 'no click left')
+
+    PLAN = ("I'll create a full-body concept image of your frog knight (6 credits), then turn it into a textured 3D "
+            "model (80 credits) and optimize it for game use (about 5 credits). I'll make the concept first so you "
+            "can approve the design before I generate the model.")
+
+    def planned(self, *replies):
+        """The chat as rel020-chain's turn left it before the click: the user's request, the model's replies (its plan
+        first), the turn completed, the made picture's card second. A turn's start and config are stood in for:
+        returns the (chat, turn) of each turn that would have started."""
+        from loopcut import agent, spending
+        session = state.session()
+        request = 'make me a 3D model of my frog knight for my game'
+        session['messages'] = [{'role': 'user', 'content': f'<scene_context>\n</scene_context>\n\n{request}'},
+                               *({'role': 'assistant', 'content': text} for text in replies)]
+        session['items'].insert(0, state.item_user(request))
+        session.update(turn_number=1, turn_outcome='completed')
+        launched = []
+        self.replace(agent, '_configure', lambda turn, chat=None: setattr(turn, 'spending', spending.Settings()))
+        self.replace(agent, '_launch', lambda chat, turn: launched.append((chat, turn)))
+        self.replace(agent, '_finished_plans', set())
+        return launched
+
+    def test_a_click_on_a_stated_three_step_plan_goes_on_with_its_last_step_once(self):
+        """rel020-chain: the plan was picture (6), 3D (80), then optimize for game use (about 5); the user pressed Turn
+        it into 3D and nothing came after the model landed. Now one turn goes on with the stated rest, only that, with
+        the click's note; its paid step runs under Ask above with no card, by the usual rules (extras_mode too)."""
+        from loopcut import agent, context, spending
+        _, _, image = self.make_picture()
+        launched = self.planned(self.PLAN, 'The concept is ready. Shall I turn this design into the 3D model?')
+        card = self.click(index=1)
+        self.assertEqual(card['status'], 'done', card.get('output'))
+        self.assertEqual(len(launched), 1, 'one turn goes on')
+        chat, turn = launched[0]
+        self.assertIs(chat, state.session())
+        message = chat['messages'][-1]
+        self.assertTrue(message[context.STEP_LIMIT], "the user's turn goes on: not a new request")
+        self.assertFalse(context.is_turn_start(message))
+        lines = message['content'].split('\n')
+        self.assertTrue(lines[0].startswith(f'since your last turn: the user pressed Turn it into 3D on the picture '
+                                            f'{image.name}; it ran: Imported and selected models'), lines[0])
+        self.assertEqual(lines[1], agent.FINISH_PLAN.format(rest='and optimize it for game use (about 5 credits).'))
+        self.assertEqual(message[agent.FINISH_NOTES], lines[0])
+        self.assertEqual(chat['between_turns'], [], 'the note went with it, once')
+        self.assertNotIn('outcome', card, 'the model reports, not a done line')
+        retopology = {'name': 'retopology', 'version': 1, 'backend': 'managed', 'title': 'Retopology',
+                      'cost': {'credits_estimate': 5, 'quote_required': False}, 'file_inputs': [],
+                      'approval': {'confirm_over_credits': 100}, 'latency': 'minutes'}
+        details = cloud_account.approval_details(retopology, None)
+        step = state.item_tool(cloud.PREFIX + 'retopology', 'Retopology', '')
+        self.assertTrue(agent._Consent(chat, turn, step)(details), 'under Ask above: it runs')
+        self.assertNotIn('ask', step, 'with no card')
+        self.assertEqual(chat['spend']['auto'], 5)
+        turn.spending = spending.Settings(extras=spending.ONLY_ASKED)
+        with self.assertRaises(cloud_http.CloudError) as refused:
+            agent._Consent(chat, turn, state.item_tool(cloud.PREFIX + 'retopology', 'Retopology', ''))(details)
+        self.assertEqual(refused.exception.code, 'declined', '"Only when I ask" still refuses it')
+        chat['messages'].pop()  # As if that turn never ran: the same click still never goes on twice.
+        self.assertEqual(len(agent._finished_plans), 1)
+        self.assertFalse(agent._finish_plan(chat, next(iter(agent._finished_plans)), 80, 1), 'once per click')
+        self.assertEqual(len(launched), 1)
+
+    def test_a_plan_with_nothing_after_its_3d_step_ends_on_a_done_line_not_a_turn(self):
+        from loopcut import agent
+        self.make_picture()
+        launched = self.planned("I'll make a concept picture (6 credits) and then turn it into a 3D model "
+                                "(80 credits). I'll show you the picture first.")
+        self.replace(scene_diff, 'snapshot', lambda: {'objects': {b.name: {'type': 'MESH', 'parent': None}
+                                                                  for b in self.data.objects}})
+        card = self.click(index=1)
+        self.assertEqual((card['status'], card['outcome']), ('done', agent.TO_3D_DONE))
+        self.assertEqual(state.session()['made'], ['model'], "the click's model is what the chat made last")
+        self.assertEqual(launched, [])
+        self.assertEqual(len(state.session()['between_turns']), 1, 'the note waits for the next message')
+        from loopcut.ui import layout
+        drawn = layout.build(state.session(), 420, 900, 1, lambda font, size, text: len(text) * size * .5, 'fast',
+                             None, {})
+        self.assertIn(agent.TO_3D_DONE, [p['text'] for p in drawn['prims'] if p.get('t') == 'text'])
+
+    def test_no_turn_goes_on_after_a_stop_typing_or_a_message_since_the_click(self):
+        from loopcut import agent
+        for case in ('stopped', 'typing', 'attached', 'sent'):
+            with self.subTest(case):
+                self.make_picture()
+                launched = self.planned(self.PLAN)
+                session = state.session()
+                if case == 'stopped':
+                    session['turn_outcome'] = 'cancelled'
+                card = self.press(index=1)
+                if case == 'typing':
+                    session['input'] = 'wait, make the sword longer'
+                elif case == 'attached':
+                    session['attachments'] = [{'ref': 'x', 'name': 'sword.png'}]
+                elif case == 'sent':  # A message sent and answered while the model was made.
+                    session['turn_number'] += 1
+                self.assertTrue(self.until(lambda: not state.running_clicks))
+                self.assertEqual(launched, [])
+                self.assertEqual((card['status'], card['outcome']), ('done', agent.TO_3D_DONE))
+                session.update(input='', attachments=[])
+
+    def test_the_3d_step_shows_its_progress_and_usual_time_and_is_a_background_job_while_it_runs(self):
+        """rel020-chain: "Turning into 3D…" ran about 2 minutes with no estimate, and Background jobs said "No
+        background jobs yet" right after. The click's card and the picture's button show how long it usually takes
+        from the click on, then the job's own percent and message; its job is a Background jobs row while it runs."""
+        from loopcut.ui import layout
+        self.make_picture()
+        card = self.press()
+        measure = lambda font, size, text: len(text) * size * .5
+        lines = lambda: [p['text'] for p in layout.build(state.session(), 700, 3000, 1, measure, 'fast', None, {})
+                         ['prims'] if p.get('t') == 'text' and '%' in p['text']]
+        self.assertEqual(lines(), ['0% · Starting · usually about 2–3 minutes'] * 2, "the button's and the card's")
+        title = next(d['title'] for d in self.runtime.manifest['tools'] if d['name'] == 'image_to_3d')
+        rows, reported = [], []
+        def watch():
+            rows.extend(row['title'] for row in cloud_jobs.ui_rows())
+            if card['status'] == 'running' and card['progress']['message'] != 'Starting' and not reported:
+                reported.append((dict(card['progress']), lines()))
+            return not state.running_clicks
+        self.assertTrue(self.until(watch))
+        self.assertIn(title, rows, 'a Background jobs row while it ran')
+        self.assertTrue(reported, 'the job reported while it ran')
+        progress, shown = reported[0]
+        line = ' · '.join(filter(None, (f"{progress['pct']}%", progress['message'].rstrip('.…'),
+                                        'usually about 2–3 minutes')))
+        self.assertEqual(shown, [line, line])
+        self.assertEqual(card['status'], 'done', card['output'])
+        self.assertEqual(lines(), [], 'none once it is done')
+
+    def test_a_models_3d_call_says_how_long_it_usually_takes_on_its_card(self):
+        self.assertTrue(self.execute().ok)
+        self.assertNotIn('usually', state.session()['items'][-1], 'no time known for a picture: none said')
+        path = self.applied[0]['outputs'][0]['path']
+        cloud_jobs.note_picture_seen(Path(path))  # The model looked at it, as image_to_3d asks first.
+        for arguments, usual in (({'image': path}, 'usually about 2–3 minutes'),
+                                 ({'image': path, 'quality': 'draft'}, 'usually under a minute')):
+            with self.subTest(usual):
+                self.assertTrue(self.execute('image_to_3d', arguments).ok)
+                self.assertEqual(state.session()['items'][-1]['usually'], usual)
 
     def test_an_ask_during_a_click_is_answered_on_its_own_card_never_by_a_later_turns(self):
         """Review, 2026-10-26: a click's call has no turn of the panel's, so a server limit's ask waited forever, and
@@ -1120,7 +1273,8 @@ class CloudEndToEndTest(unittest.TestCase):
         self.assertIn('The user kept this cloud job running: it was not canceled', kept.text)
         self.assertFalse(cloud_jobs._registry[handle]['cancel'].is_set())
         [question] = [details['cancel_job'] for details in asked]
-        self.assertEqual(question['title'], 'Image generation')
+        self.assertEqual(question['title'], next(row['title'] for row in self.runtime.manifest['tools']
+                                                 if row['name'] == 'image_generate'))
         self.assertGreater(question['held'], 0)
         # "Cancel it": the cancel goes, and its credits come back.
         self.execute('job_status', {'job_id': handle, 'cancel': True})

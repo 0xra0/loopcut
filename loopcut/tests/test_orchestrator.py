@@ -1446,15 +1446,16 @@ class RoleTypesTest(unittest.TestCase):
 
 
 class PromptTest(unittest.TestCase):
-    def test_the_orchestrators_fixed_cost_stays_under_10830_tokens(self):
+    def test_the_orchestrators_fixed_cost_stays_under_11310_tokens(self):
         """Service prompt size plus the public schemas stays within the fixed-cost cap."""
         from prompt_index_fixture import built_index
         index = built_index()
         fixed = context.fixed_tokens("", agent._orchestrator_schemas(), prompt_id="orchestrator", index=index)
         # 10,534 on 2026-10-17 with the captures' labels switch; 10,549 on 2026-10-24, when the tool summaries
         # were asked for in the user's language; 10,654 on 2026-10-26 with set_extras (0.2.20, paid extras); 10,825
-        # with read_result as well (rc/0.2.20).
-        self.assertLessEqual(fixed, 10830)
+        # with read_result as well (rc/0.2.20); the consent-gated file-opening tool (0.2.22); 11,143 on 2026-10-31
+        # with check_shading and export_for_engine; 11,299 with add_detail_normal; 11,373 with both (0.2.22).
+        self.assertLessEqual(fixed, 11380)
         self.assertLessEqual(fixed, context.fixed_tokens(agent.SYSTEM_PROMPT, TOOL_SCHEMAS()) * 1.3 + 200)
 
     def test_step_titles_are_in_the_language_the_user_writes_in(self):
@@ -1598,7 +1599,7 @@ class PromptTest(unittest.TestCase):
         self.assertIn("not a price per approval", code)
         self.assertIn('"Armchair"', code)
         self.assertEqual(orchestrator.describe("delegate", {"wave": reference_wave(), "dry_run": True})[0],
-                         "Check a helper plan: Armchair, SideTable")
+                         "Planning helpers for Armchair, SideTable")
 
     def test_own_key_approval_labels_the_shared_api_spending_limit(self):
         summary, _ = self.approval("https://api.example.com/v1", usd=1.25, seconds=900)
@@ -2291,9 +2292,10 @@ class FinishGateTest(unittest.TestCase):
         passing = lambda checks: [{"status": "pass"} for _ in checks]
         self.assertIsNone(orchestrator.finish_gate(self.session, self.turn, self.reply("All set."), passing))
         self.assertEqual(self.session["items"][-1]["text"], "All set.\n\nVerified by Loopcut on this scene: 2 of 2 checks.\n"
-                                                            "Requirements (your words): 2 of 2 covered.")
+                         "These results cover selected checks only; they do not establish overall task completion.")
         self.assertEqual(self.session["messages"][-1]["content"], "All set.\n\nVerified by Loopcut on this scene: 2 of 2 "
-                         "checks.\nRequirements (the user's words): 2 of 2 covered.", "the model's copy is unchanged")
+                         "checks.\nThese results cover selected checks only; they do not establish overall task completion.",
+                         "the model's copy is unchanged")
 
     def test_the_verified_block_names_the_requirements_no_check_covers(self):
         """GPT-6.1 Sol's asset pack (20260929-230207): "Verified 35/35" while the sign stood on the ground,
@@ -2312,8 +2314,9 @@ class FinishGateTest(unittest.TestCase):
         self.assertIsNone(orchestrator.finish_gate(self.session, self.turn, self.reply("Done."), passing), "no bounce")
         self.assertEqual(self.session["items"][-1]["text"].split("\n\n", 1)[1],
                          "Verified by Loopcut on this scene: 3 of 3 checks.\n"
-                         "Requirements (your words): 2 of 4 covered, 1 partly covered, 1 unverified.\n"
-                         "- partly covered: \"a hanging sign\": sign c1 pass; nothing measures \"hanging\" (a suspended "
+                         "These results cover selected checks only; they do not establish overall task completion.\n"
+                         "Request checks: 1 partly checked, 1 unverified.\n"
+                         "- partly checked: \"a hanging sign\": sign c1 pass; nothing measures \"hanging\" (a suspended "
                          "check would)\n"
                          "- unverified: \"Use a consistent hand-painted look\": no check")
         rows = [("c", {"kind": "suspended", "a": "S", "b": "S", "quote": "a hanging sign"}, {"status": "pass"}),
@@ -2321,7 +2324,7 @@ class FinishGateTest(unittest.TestCase):
                  {"status": "fail"}),
                 ("e", {"kind": "dims", "name": "Lamp", "size": [1, 1, 1], "quote": "a tall lamp"}, {"status": "unavailable"})]
         self.assertEqual([(e["quote"], e["status"]) for e in orchestrator.coverage(["under 2000 triangles"], rows)],
-                         [("under 2000 triangles", "unverified"), ("a hanging sign", "covered"),
+                         [("under 2000 triangles", "unverified"), ("a hanging sign", "checks_passed"),
                           ("an armchair on the rug", "failed"), ("a tall lamp", "unverified")],
                          "a number after under is a budget, not a placement")
 
@@ -2422,9 +2425,9 @@ class OwnChecksTest(unittest.TestCase):
         self.assertEqual(self.ran, [])
         self.assertIsNone(self.turn.job.own.get("o1"))
 
-    def test_the_panel_says_your_words_and_each_quote_is_still_the_users_exact_words(self):
-        """Guard (0.2.20): only the requirements line's framing turned second person in the panel. A check still
-        quotes the user word for word, a paraphrase is still refused, and the quote reaches both copies as written."""
+    def test_known_gaps_keep_exact_user_quotes_in_both_the_panel_and_model_copy(self):
+        """A check still quotes the user word for word, a paraphrase is still refused, and the quote reaches both
+        copies as written. Passing checks do not certify every quoted requirement as covered."""
         crystal = {"kind": "exists", "name": "Crystal"}
         paraphrase = orchestrator.checks(add=[{**crystal, "quote": "crystals placed on the carpet"}])
         self.assertFalse(paraphrase.ok)
@@ -2435,13 +2438,12 @@ class OwnChecksTest(unittest.TestCase):
         passing = lambda checks: [{"status": "pass"} for _ in checks]
         self.assertIsNone(orchestrator.finish_gate(self.session, self.turn, types.SimpleNamespace(text="Done."), passing))
         shown, model = self.session["items"][-1]["verification"], self.session["messages"][-1]["content"]
-        quoted = '- partly covered: "Crystals on the rug": o1 pass; nothing measures "on" (a contact check would)'
+        quoted = '- partly checked: "Crystals on the rug": o1 pass; nothing measures "on" (a contact check would)'
         self.assertIn(quoted, shown.split("\n"))
         self.assertIn(quoted, model.split("\n"))
-        self.assertIn("Requirements (your words): 1 of 2 covered, 1 partly covered.", shown)
+        self.assertIn("Request checks: 1 partly checked.", shown)
         self.assertNotIn("the user", shown)
-        self.assertTrue(model.endswith(shown.replace(orchestrator.YOUR_REQUIREMENTS, orchestrator.REQUIREMENTS)),
-                        "the panel's copy differs from the model's in the framing alone")
+        self.assertTrue(model.endswith(shown), "both copies retain the measured scope and known gaps")
 
     def test_a_retire_reason_quotes_the_user_in_their_languages_quote_marks(self):
         words = "カメラはそのまま\nやっぱりランプを窓辺に"
@@ -2525,7 +2527,7 @@ class OwnChecksTest(unittest.TestCase):
         self.assertTrue(result.ok, result.text)
         self.assertEqual([c["id"] for c in self.ran[0]], ["c2", "o1"], "earlier turns' and this turn's")
         self.assertEqual(result.text, "Ran every check on the live scene now: 2 of 2 pass.\nPass: crystal c2, o1\n"
-                                      "Requirements (the user's words): 2 of 2 covered.")
+                                      "These results cover selected checks only; they do not establish overall task completion.")
         self.assertEqual(orchestrator.checks(add=[], retire=[]).text, result.text)
         self.assertEqual(list(self.turn.job.own), ["o1"], "nothing added or retired")
         self.assertEqual(orchestrator.describe("checks", {})[0], "Checks: run all now")

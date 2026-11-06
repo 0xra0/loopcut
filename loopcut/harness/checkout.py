@@ -24,14 +24,17 @@ OUT = WORKSPACE / "out"
 def use() -> None:
     # Harness runs are not users: no usage events (telemetry.py) unless a run asks for them.
     os.environ.setdefault("LOOPCUT_TELEMETRY", "off")
-    loaded = [name for name in sys.modules if name == "loopcut" or name.startswith("loopcut.")]
-    if loaded:
+    if any(name == "loopcut" or name.startswith("loopcut.") for name in sys.modules):
         import addon_utils
         addon_utils.disable("loopcut")
-        for name in loaded:
-            sys.modules.pop(name, None)
+    # Listed after disabling: the bundled copy's unregister() imports modules of its own (dev_reload and others), and
+    # one left behind is another version's code, which version_guard rightly refuses a turn over.
+    for name in [name for name in sys.modules if name == "loopcut" or name.startswith("loopcut.")]:
+        sys.modules.pop(name, None)
     spec = importlib.util.spec_from_file_location(
         "loopcut", PACKAGE / "__init__.py", submodule_search_locations=[str(PACKAGE)])
     module = importlib.util.module_from_spec(spec)
     sys.modules["loopcut"] = module
     spec.loader.exec_module(module)
+    from loopcut import version_guard
+    version_guard.register("loopcut", PACKAGE, module.bl_info["version"])

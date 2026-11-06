@@ -15,7 +15,8 @@ the finish gate appends to the orchestrator's final reply.
 
 A brief's advisory list holds the brief's own targets rather than the user's words: any kind without
 a quote, and ADVISORY_KINDS (no_modifiers, flat_shaded, inside_bounds, triangles), measured through
-facts.measure. run(advisory=True) marks each result "advisory": a miss is shown to the worker and
+facts.measure, and shading (shading.py: flat custom normals, stray or smeared hard edges, a normal map
+baked against flat normals or a mesh changed after its bake). run(advisory=True) marks each result "advisory": a miss is shown to the worker and
 the orchestrator, and never fails a worker, refuses its report or holds up the finish.
 
 Measuring reuses the tools the models use: contact.evaluate for contact, overlap and a light
@@ -102,6 +103,7 @@ ADVISORY_KINDS = {
     "flat_shaded": (("name",), ("max_smooth",)),
     "inside_bounds": (("name",), ("bounds", "tol")),
     "triangles": (("name",), ("min", "max")),
+    "shading": (("name",), ()),
 }
 MAX_ADVISORY = 8
 
@@ -992,6 +994,21 @@ class _Point:
         return self.co, self.co
 
 
+def _shading(c, _spawn):
+    """shading.check on the object and its meshes: a miss is its problems, each with its fix."""
+    from . import shading
+    ob = _object(c["name"])
+    meshes = [o for o in (ob, *ob.children_recursive) if o.type == "MESH"]
+    if not meshes:
+        raise _Unavailable(f"{ob.name} has no mesh to check")
+    results = shading.check(meshes[:shading.MAX_OBJECTS])
+    problems = shading.lines(results, with_notes=False, limit=4)
+    if problems:
+        raise _Fail(" ".join(problems))
+    shapes = sorted({r["fact"]["shape"].replace("_", "-") for r in results if "fact" in r})
+    return f"{len(results)} mesh{'es' * (len(results) != 1)} shade as their shape asks ({', '.join(shapes) or 'not measured'})"
+
+
 def _light_inside(c, _spawn):
     from . import contact
     light = _object(c["light"])
@@ -1328,7 +1345,7 @@ MEASURE = {"exists": _exists, "count": _count, "dims": _dims, "contact": _contac
            "in_frame": _in_frame, "faces_max": _faces_max, "origin_base": _origin_base, "material_on": _material_on,
            "light_inside": _light_inside, "light": _light, "setting": _setting, "animated": _animated, "unchanged": _unchanged,
            "file": _file, "no_modifiers": _no_modifiers, "flat_shaded": _flat_shaded, "inside_bounds": _inside_bounds,
-           "triangles": _triangles_band, "preserved": _preserved}
+           "triangles": _triangles_band, "preserved": _preserved, "shading": _shading}
 
 
 def run(checks: list, spawn=None, scope: dict | None = None, advisory: bool = False) -> list[dict]:

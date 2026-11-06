@@ -47,6 +47,25 @@ def _hash(value):
     return value
 
 
+class Stored:
+    """A tool file the service already keeps, sent by its SHA-256 and never uploaded: a re-bake's high-poly, a
+    retopology job's files.model. When only that job is known, sha256 is empty until cloud_jobs.resolve_stored
+    reads it from the job (agent thread); found(sha256), when given, records it (main thread)."""
+
+    def __init__(self, sha256: str = "", job: str = "", found=None):
+        self.sha256, self.job, self.found = sha256, job, found
+
+    def __repr__(self):
+        return f"Stored({self.sha256 or 'from ' + self.job})"
+
+
+def digest(value) -> str:
+    """The SHA-256 a tool file is sent under: a Stored one's own, else the file's."""
+    if isinstance(value, Stored):
+        return _hash(value.sha256)
+    return sha256(Path(value))
+
+
 def _batches(items, size):
     if not isinstance(size, int) or isinstance(size, bool) or size < 1:
         raise ValueError("Batch size must be positive")

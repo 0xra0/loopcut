@@ -14,6 +14,7 @@ import importlib.util
 import json
 import sys
 import types
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 
@@ -50,6 +51,23 @@ def _version(name: str) -> str:
     return ".".join(map(str, sys.modules[name].bl_info["version"]))
 
 
+def billing_display(layout, *args, **kwargs):
+    """Keep legacy billing snapshots focused on billing; transcript controls have their own tests."""
+    with ExitStack() as stack:
+        if hasattr(layout, "_message_copy"):
+            stack.enter_context(patch.object(layout, "_message_copy", return_value=0))
+            stack.enter_context(patch.object(layout, "HEADER_BUTTONS",
+                                            tuple(row for row in layout.HEADER_BUTTONS if row[0] != "header.copy")))
+        display = layout.build(*args, **kwargs)
+    for prim in display["prims"]:
+        prim.pop("src", None)
+    for hit in display["hits"]:
+        if hit["id"] == "header.title" and hit["action"][0] == "copy_menu":
+            hit["action"] = ("noop", None)
+            hit["tip"] = hit["tip"].removesuffix(" · Conversation menu")
+    return display
+
+
 def panel(folder: Path = PACKAGE, name: str = "_flag_off_panel") -> dict:
     _load(folder, name)
     layout = importlib.import_module(name + ".ui.layout")
@@ -78,11 +96,11 @@ def panel(folder: Path = PACKAGE, name: str = "_flag_off_panel") -> dict:
                 ui = {"selection": [], "context_budget": 24000, "account": account, "credits": "94 credits ($0.94)",
                       "credit_balance": 94, "today": "Today: 6 credits", "now": 0.0, "chatgpt_plan": False,
                       "allowance_notice": {"item": card, "conversation": session["id"]}}
-                display = layout.build(session, width, 900, 1.0, measure, "fast", None, ui)
+                display = billing_display(layout, session, width, 900, 1.0, measure, "fast", None, ui)
                 shots[f"{name_}_billing_{billing}"] = {"prims": display["prims"], "hits": display["hits"]}
             session = state.new_session()
             session["items"] = [state.item_user("hello")]
-            display = layout.build(session, 420, 700, 1.0, measure, "fast", None,
+            display = billing_display(layout, session, 420, 700, 1.0, measure, "fast", None,
                                    {"selection": [], "context_budget": 24000, "account": account, "now": 0.0,
                                     "credits": "100 credits ($1.00)", "credit_balance": 100})
             shots[f"idle_billing_{billing}"] = {"prims": display["prims"], "hits": display["hits"]}

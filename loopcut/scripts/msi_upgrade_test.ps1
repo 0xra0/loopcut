@@ -6,12 +6,15 @@
 # starts Loopcut from there.
 #     msi_upgrade_test.ps1 <old.msi> <new.msi> <new .zip> <add-on version, like v0.2.7> <log folder>
 # For a disposable machine (the release workflow's runner): it really installs, for all users.
+# -OpenInstanceMode Cached keeps a guarded second instance open without re-enable; Reenable also
+# exercises older installs whose turn entry points predate the guard. Both save a real panel screenshot.
 param(
   [Parameter(Mandatory)][string]$Old,
   [Parameter(Mandatory)][string]$New,
   [Parameter(Mandatory)][string]$NewZip,
   [Parameter(Mandatory)][string]$Version,
-  [Parameter(Mandatory)][string]$Logs
+  [Parameter(Mandatory)][string]$Logs,
+  [ValidateSet('None', 'Cached', 'Reenable')][string]$OpenInstanceMode = 'None'
 )
 $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force -Path $Logs | Out-Null
@@ -53,7 +56,11 @@ function Related([string]$upgrade) {
 }
 function Install([string]$msi, [string]$log) {
   $started = Get-Date
-  $process = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @('/i', "`"$msi`"", '/qn', '/norestart', '/l*v', "`"$log`"")
+  $process = Start-Process msiexec.exe -PassThru -ArgumentList @('/i', "`"$msi`"", '/qn', '/norestart', '/l*v', "`"$log`"")
+  if (-not $process.WaitForExit(600000)) {
+    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+    throw 'MSI installation exceeded 600 seconds'
+  }
   $seconds = [int]((Get-Date) - $started).TotalSeconds
   if ($process.ExitCode -ne 0) {
     Get-Content -LiteralPath $log -Tail 40 | Write-Host
@@ -80,7 +87,75 @@ Install $Old (Join-Path $Logs 'install-old.log')
 Expect ((State $oldCode) -eq 5) 'the old product is installed'
 Expect ((State $newCode) -eq -1) 'the new product code is unknown to Windows before its install (no maintenance mode)'
 
-Install $New (Join-Path $Logs 'install-new.log')
+$witness = $null
+try {
+  if ($OpenInstanceMode -ne 'None') {
+    $oldFolder = Get-ChildItem -LiteralPath (Join-Path $env:ProgramFiles 'Loopcut') -Directory |
+      Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'blender.exe') } | Select-Object -First 1
+    if ($null -eq $oldFolder) { throw 'Old installed executable was not found' }
+    $witnessOut = Join-Path (Resolve-Path -LiteralPath $Logs).Path 'open-instance'
+    if (Test-Path -LiteralPath $witnessOut) { throw "Use a fresh log folder: $witnessOut exists" }
+    New-Item -ItemType Directory -Path $witnessOut | Out-Null
+    foreach ($part in @('blender', 'config', 'data', 'tmp')) {
+      New-Item -ItemType Directory -Path (Join-Path $witnessOut $part) | Out-Null
+    }
+    $emptyEnv = Join-Path $witnessOut 'empty.env'
+    [IO.File]::WriteAllText($emptyEnv, '')
+    $childEnvironment = @{
+      BLENDER_USER_RESOURCES = (Join-Path $witnessOut 'blender')
+      LOOPCUT_CONFIG_DIR = (Join-Path $witnessOut 'config')
+      LOOPCUT_DATA_DIR = (Join-Path $witnessOut 'data')
+      LOOPCUT_ENV_FILE = $emptyEnv
+      LOOPCUT_UPDATE_URL = 'off'
+      LOOPCUT_TELEMETRY = 'off'
+      LOOPCUT_DEV = '0'
+      LOOPCUT_SERVICE_URL = 'http://127.0.0.1:1'
+      PYTHONDONTWRITEBYTECODE = '1'
+      PYTHONNOUSERSITE = '1'
+      PYTHONPATH = ''
+      PYTHONHOME = ''
+      TEMP = (Join-Path $witnessOut 'tmp')
+      TMP = (Join-Path $witnessOut 'tmp')
+    }
+    $previousEnvironment = @{}
+    try {
+      foreach ($name in $childEnvironment.Keys) {
+        $previousEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+        [Environment]::SetEnvironmentVariable($name, $childEnvironment[$name], 'Process')
+      }
+      $check = Join-Path $PSScriptRoot '..\harness\fq_update_mixed_check.py'
+      $witness = Start-Process -FilePath (Join-Path $oldFolder.FullName 'blender.exe') -PassThru `
+        -ArgumentList @('--python-use-system-env', '--factory-startup', '--python-exit-code', '1', '--python', "`"$check`"", '--', '--msi-witness', "`"$witnessOut`"") `
+        -RedirectStandardOutput (Join-Path $witnessOut 'stdout.log') -RedirectStandardError (Join-Path $witnessOut 'stderr.log')
+    } finally {
+      foreach ($name in $previousEnvironment.Keys) {
+        [Environment]::SetEnvironmentVariable($name, $previousEnvironment[$name], 'Process')
+      }
+    }
+    $deadline = [DateTime]::UtcNow.AddSeconds(60)
+    while (-not (Test-Path -LiteralPath (Join-Path $witnessOut 'ready.json'))) {
+      if ($witness.HasExited -or [DateTime]::UtcNow -gt $deadline) {
+        throw "Second instance did not become ready: see $witnessOut"
+      }
+      Start-Sleep -Milliseconds 250
+    }
+    Expect (-not $witness.HasExited) "second installed Blender is open (PID $($witness.Id))"
+  }
+  Install $New (Join-Path $Logs 'install-new.log')
+  if ($null -ne $witness) {
+    if ($witness.HasExited) { throw 'MSI closed the second instance; no surviving-instance proof' }
+    @{version=$Version; reenable=($OpenInstanceMode -eq 'Reenable')} | ConvertTo-Json |
+      Set-Content -LiteralPath (Join-Path $witnessOut 'install-complete.json') -Encoding UTF8
+    if (-not $witness.WaitForExit(120000)) { throw "Second instance check timed out: $witnessOut" }
+    $proof = Get-Content -LiteralPath (Join-Path $witnessOut 'summary.json') -Raw | ConvertFrom-Json
+    Expect (($witness.ExitCode -eq 0) -and $proof.ok) 'surviving second instance shows a restart card with its draft intact'
+    if (-not $proof.ok) { throw "Second instance check failed: $($proof.error)" }
+  }
+} finally {
+  if (($null -ne $witness) -and (-not $witness.HasExited)) {
+    Stop-Process -Id $witness.Id -Force -ErrorAction SilentlyContinue
+  }
+}
 $log = Get-Content -LiteralPath (Join-Path $Logs 'install-new.log') -Raw
 Expect ($log -match [regex]::Escape("Adding WIX_UPGRADE_DETECTED property. Its value is '$oldCode'")) 'the new .msi found the old one as an upgrade (WIX_UPGRADE_DETECTED)'
 Expect ($log -match 'Doing action: RemoveExistingProducts') 'RemoveExistingProducts ran'

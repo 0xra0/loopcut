@@ -104,7 +104,8 @@ class FileActionsTest(unittest.TestCase):
         f = frame()
         layout._item_assistant(f, 0, self.item, 10, 0, 400)
         self.assertEqual([h['action'] for h in f.hits], [('reference_open', str(self.file)),
-                         ('reference_folder', str(self.file)), ('reference_url', 'https://example.com')])
+                         ('reference_folder', str(self.file)), ('reference_url', 'https://example.com'),
+                         ('copy_message', 0)])
         self.assertEqual(next(p['text'] for p in f.prims if p['id'] == 'item0.p0.l0'), 'Saved file docs')
         self.assertTrue(all(h['y'] > 0 for h in f.hits))
 
@@ -112,7 +113,7 @@ class FileActionsTest(unittest.TestCase):
         self.file.unlink()
         f = frame(missing_paths={str(self.file)})
         layout._item_assistant(f, 0, self.item, 10, 0, 400)
-        self.assertEqual([h['action'] for h in f.hits], [('reference_url', 'https://example.com')])
+        self.assertEqual([h['action'] for h in f.hits], [('reference_url', 'https://example.com'), ('copy_message', 0)])
         self.assertEqual(next(p['color'] for p in f.prims if p['id'] == 'item0.ref0.name'), T.TEXT_FAINT)
 
     def test_cap_and_narrow_rows(self):
@@ -128,11 +129,11 @@ class FileActionsTest(unittest.TestCase):
         for a, b in zip(f.hits, f.hits[1:]):
             self.assertTrue(a['y'] + a['h'] <= b['y'] or a['x'] + a['w'] <= b['x'])
 
-    def test_streaming_has_no_actions(self):
+    def test_streaming_has_only_copy_and_no_file_actions(self):
         self.item['streaming'] = True
         f = frame()
         layout._item_assistant(f, 0, self.item, 0, 0, 420)
-        self.assertEqual(f.hits, [])
+        self.assertEqual([h['action'] for h in f.hits], [('copy_message', 0)])
 
     def test_expanded_image_has_box_and_open_above_original_output(self):
         card = state.item_tool('view_image', 'View image', '')
@@ -252,7 +253,7 @@ class HostActionsTest(unittest.TestCase):
         namespace['account'].status = lambda: None
         source = ADDONS / 'loopcut/ui/host.py'
         names = {'_do_action', '_image_paths', '_missing_paths', '_refresh_missing_paths', '_prune_images',
-                 'tag_redraw_all', 'draw_area'}
+                 'tag_redraw_all', 'draw_area', '_windows_has_app'}
         tree = ast.parse(source.read_text())
         nodes = [n for n in tree.body if getattr(n, 'name', None) in names]
         # Inline expansion must preserve typing; Escape can close it.
@@ -450,6 +451,16 @@ class HostActionsTest(unittest.TestCase):
 
     def test_open_png_shows_default_app_confirmation(self):
         self.assert_open_confirmation('.png')
+
+    def test_open_without_an_app_for_the_type_opens_its_folder_instead(self):
+        self.host['_windows_has_app'] = lambda suffix: False
+        with tempfile.TemporaryDirectory() as tmp:
+            file = Path(tmp) / 'a.fbx'
+            file.touch()
+            self.action(self.session, ('reference_open', str(file)))
+            self.open.assert_called_once_with(filepath=str(file.parent))
+            self.assertEqual(self.notice_text(), 'No app is set to open .fbx files, so Loopcut opened the folder '
+                                                 'with a.fbx instead (outside Blender).')
 
     def test_open_mp4_shows_default_app_confirmation(self):
         self.assert_open_confirmation('.mp4')

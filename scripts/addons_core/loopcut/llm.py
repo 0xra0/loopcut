@@ -12,6 +12,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from email.utils import parsedate_to_datetime
 from dataclasses import dataclass, field
 from typing import Callable
 from urllib.parse import urlparse
@@ -41,6 +42,8 @@ USER_AGENT = "Loopcut (Blender add-on)"
 
 RETRY_STATUSES = {429, 500, 502, 503, 504, 529}
 RETRY_DELAYS = (1.0, 3.0, 8.0)
+CHATGPT_RETRY_DELAYS = (1.0, 3.0, 8.0, 20.0, 45.0)
+CHATGPT_RETRY_WAIT = 90.0
 MAX_RETRY_AFTER = 30.0
 CONNECTION_LOST = "connection_lost"  # LLMError.code when the connection kept dropping: the panel offers Try again.
 EMPTY_REPLY = "empty_reply"  # LLMError.code: the model answered with nothing to show or run, twice (agent._request).
@@ -58,6 +61,18 @@ FILTERED_FINISHES = frozenset({"sensitive", "content_filter"})
 # sends uncompressed (_gzip_refused). Never to another provider or a LOOPCUT_SERVICE_URLS stand-in.
 GZIP_REFUSED = (400, 415)
 _gzip_refused = False
+
+
+def retry_delay(delay: float, retry_after: str, *, cap: float | None = None) -> float:
+    """Respect either Retry-After form within a bounded, cancellable wait."""
+    try:
+        seconds = float(retry_after)
+    except (TypeError, ValueError):
+        try:
+            seconds = parsedate_to_datetime(retry_after).timestamp() - time.time()
+        except (TypeError, ValueError, OverflowError):
+            return delay
+    return max(delay, min(seconds, MAX_RETRY_AFTER if cap is None else cap)) if math.isfinite(seconds) else delay
 
 
 def dropped_connection(ex) -> bool:
@@ -291,8 +306,7 @@ def _open(build: Callable[[], urllib.request.Request], base_url: str, timeout: f
                                str(error.get("code") or error.get("type") or ""), error,
                                account_from_headers(ex.headers)) from ex
             delay = delays[attempt]
-            if retry_after.replace(".", "", 1).isdigit():
-                delay = min(max(delay, float(retry_after)), MAX_RETRY_AFTER)
+            delay = retry_delay(delay, retry_after)
             print(f"Loopcut: retrying the request after HTTP {ex.code} ({attempt + 1}/{len(delays)}, "
                   f"waiting {delay:g}s)")
         except urllib.error.URLError as ex:
