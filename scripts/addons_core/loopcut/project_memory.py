@@ -13,15 +13,14 @@ from typing import Any
 MEMORY_PROP_KEY = "loopcut_project_memory"
 
 
-def _recovery_path() -> Path:
+def _recovery_path() -> Path | None:
     """Path to the durable disk sidecar file for project memory recovery across crashes."""
     import bpy
     filepath = getattr(getattr(bpy, "data", None), "filepath", "")
     if filepath:
         p = Path(filepath)
         return p.parent / f".{p.stem}_recovery.json"
-    temp_dir = Path(getattr(getattr(bpy, "app", None), "tempdir", "") or tempfile.gettempdir())
-    return temp_dir / "loopcut_recovery_default.json"
+    return None
 
 
 def load_memory() -> dict:
@@ -44,7 +43,7 @@ def load_memory() -> dict:
     # Merge records from durable disk sidecar
     try:
         sidecar = _recovery_path()
-        if sidecar.is_file():
+        if sidecar is not None and sidecar.is_file():
             disk_data = json.loads(sidecar.read_text(encoding="utf-8"))
             if isinstance(disk_data, dict):
                 for k, v in disk_data.items():
@@ -69,10 +68,13 @@ def save_memory(mem: dict) -> None:
     # Persist atomically to disk sidecar so stages survive an unexpected crash before .blend save
     try:
         sidecar = _recovery_path()
-        sidecar.parent.mkdir(parents=True, exist_ok=True)
-        tmp = sidecar.with_suffix(".tmp")
-        tmp.write_text(json.dumps(mem, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(sidecar)
+        if sidecar is not None:
+            sidecar.parent.mkdir(parents=True, exist_ok=True)
+            tmp = sidecar.with_suffix(".tmp")
+            tmp.write_text(json.dumps(mem, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(sidecar)
+    except OSError:
+        pass
     except OSError:
         pass
 
