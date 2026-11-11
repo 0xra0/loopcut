@@ -544,7 +544,7 @@ def _addons_line() -> str:
     except bundled_addons.BundledAddonError as ex:  # A broken bundle manifest never stops a turn.
         print(f"Loopcut: bundled add-ons: {ex}")
         bundled = []
-    return addons.line(addons.enabled(), bundled)
+    return addons.line(addons.enabled(), bundled, len(addons.installed_off()))
 
 
 MODEL_ROUTES = {"chatgpt": "the user's ChatGPT plan (Sign in with ChatGPT)", "loopcut": "the user's Loopcut account",

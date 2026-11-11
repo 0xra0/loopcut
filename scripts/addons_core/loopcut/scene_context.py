@@ -304,6 +304,26 @@ def for_message(text: str, since: dict | None = None) -> str:
         lines.append("selected: nothing")
     lines.append(_digest(scene.objects, selected))
     lines += _scene_facts(scene.objects)
+    from . import context_manager, project_memory
+    if active and active.type == "MESH" and active.data:
+        topo = context_manager.get_topology_summary(active)
+        mods = context_manager.get_modifiers_summary(active)
+        cons = context_manager.get_constraints_summary(active)
+        mats = context_manager.get_materials_summary(active)
+        topo_parts = [f"active mesh: {topo['verts']}v/{topo['faces']}f/{topo['tris']}tris"]
+        if mods:
+            topo_parts.append(f"modifiers: {', '.join(mods)}")
+        if cons:
+            topo_parts.append(f"constraints: {', '.join(cons)}")
+        if mats:
+            topo_parts.append(f"materials: {', '.join(mats)}")
+        lines.append(" | ".join(topo_parts))
+    refs = context_manager.get_reference_images()
+    if refs:
+        lines.append(f"references: {', '.join(refs[:3])}")
+    proj_mem = project_memory.summary_for_context()
+    if proj_mem:
+        lines.append(proj_mem)
     lines += _since_last_step(since)
     lines += [_describe_mention(name) for name in parse_mentions(text)[:MAX_MENTIONS]]
     return "<scene_context>\n" + "\n".join(lines) + "\n</scene_context>"

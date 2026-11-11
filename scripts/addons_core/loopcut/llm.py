@@ -155,6 +155,8 @@ def normalize_tool_arguments(name: str, arguments: str) -> str:
     """
     if not isinstance(arguments, str):
         return arguments
+    if name != "run_python":
+        return arguments
     try:
         json.loads(arguments)
         return arguments  # Already valid; preserve the original byte-for-byte.

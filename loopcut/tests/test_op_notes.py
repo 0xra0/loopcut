@@ -18,6 +18,18 @@ sys.modules.setdefault("bpy", fake_bpy)
 
 from loopcut import api_docs, cost_guard, op_notes, tools, workspace  # noqa: E402
 
+
+# Their bpy stub has no addon_utils; addons.py's own tests cover the installed-but-off add-ons.
+_no_off_addons = mock.patch("loopcut.addons.installed_off", return_value=[])
+
+
+def setUpModule():
+    _no_off_addons.start()
+
+
+def tearDownModule():
+    _no_off_addons.stop()
+
 TEXT = op_notes.NOTES["uv.pack_islands"][0][1]
 NOTICE = f"{op_notes.NOTICE_PREFIX} {TEXT}"
 

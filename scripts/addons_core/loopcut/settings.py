@@ -13,7 +13,7 @@ import urllib.request
 
 import bpy
 
-from . import account, chatgpt_auth, cloud_account, config, credentials
+from . import account, chatgpt_auth, cloud_account, config, credentials, thinking
 
 PACKAGE = __package__
 
@@ -56,9 +56,9 @@ PROVIDERS = (
      "Claude Sonnet 4.6 (Thinking)."),
     # Appended, so the stored enum values of the rows above stay what they were. Strata's server ignores the model
     # name and serves the model its run-*.sh started (port 8099 here; Strata's own default is 8080).
-    ("STRATA", "Strata (this computer)", "http://127.0.0.1:8099/v1", "strata",
-     "Model requests stay on this computer: Qwen3.8-Flash-Next on Strata's engine. Start it with --vision so it "
-     "can read viewport captures. Set LOOPCUT_SKILLS_DIR to a folder of skills to teach it this computer's work."),
+    ("STRATA", "Strata (this computer)", config.STRATA_BASE_URL, config.STRATA_MODEL,
+     "Model requests stay on this computer: Swift 1.5 (Qwen3.8-Flash-Next) on Strata's engine. Start it with "
+     "/mnt/ssd/Strata/run-swift-abl-iq2_xs.sh, whose config turns on --vision so it can read viewport captures. Set LOOPCUT_SKILLS_DIR to a folder of skills to teach it this computer's work."),
 )
 _BY_ID = {p[0]: p for p in PROVIDERS}
 _models: list[str] = []  # Filled by "Fetch models"; not saved.
@@ -340,17 +340,17 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
 
     provider: bpy.props.EnumProperty(
         name="Provider", items=[(p[0], p[1], p[2] or "Your own endpoint") for p in PROVIDERS],
-        default="AGY", update=_provider_changed)
+        default="STRATA", update=_provider_changed)
     tier: bpy.props.StringProperty(
         name="Model", default="fast", update=_tier_changed,
         description="Which Loopcut model answers; the menu says how much usage each takes against the default")
     base_url: bpy.props.StringProperty(
-        name="Base URL", default=config.AGY_BASE_URL, update=_connection_changed,
+        name="Base URL", default=config.STRATA_BASE_URL, update=_connection_changed,
         description="OpenAI-compatible endpoint. Must be https, or http on 127.0.0.1")
     api_key: bpy.props.StringProperty(
         name="API Key", subtype="PASSWORD", options={"SKIP_SAVE"}, get=_get_key, set=_set_key,
         description="Stored in Loopcut's own file in your Blender config folder, not in preferences")
-    model: bpy.props.StringProperty(name="Model", default=config.AGY_MODEL, update=_connection_changed,
+    model: bpy.props.StringProperty(name="Model", default=config.STRATA_MODEL, update=_connection_changed,
                                    description="Type your provider's model name, or use refresh and pick from the menu")
     reasoning_effort: bpy.props.EnumProperty(
         name="Reasoning", items=[("low", "Low", "Fastest"), ("medium", "Medium", ""), ("high", "High", "Slowest")],
@@ -388,6 +388,18 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
     ask_every_paid_call: bpy.props.BoolProperty(
         name="Ask before every paid call", default=False, update=_changed,
         description="Every step that costs credits, or uses your own vendor key, asks first")
+    local_privacy_mode: bpy.props.BoolProperty(
+        name="Local privacy", default=True, update=_changed,
+        description="No anonymous usage telemetry and no conversation-log sharing. Chats stay on this computer "
+                    "when the provider is Strata")
+    thinking_profile: bpy.props.EnumProperty(
+        name="Thinking Mode",
+        items=[("fast", "Fast", "Minimal reasoning overhead for straightforward operations"),
+               ("balanced", "Balanced", "Balanced reasoning for general modeling and shading"),
+               ("deep", "Deep", "Deep reasoning for geometry repair, procedural modeling and debugging")],
+        default="balanced", update=_changed)
+    strata_status: bpy.props.StringProperty(
+        name="Strata Status", default="Not checked yet: press Test Strata", options={"SKIP_SAVE"})
     auto_look: bpy.props.BoolProperty(
         name="Look after every change", default=True, update=_changed,
         description="After each step that changes the scene, the agent gets a picture of the result. "
@@ -515,6 +527,11 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
                 row.menu("LOOPCUT_MT_models", text="", icon="DOWNARROW_HLT")
             from . import own_key_ui
             own_key_ui.draw(column, self)  # What the check found, right under the key and the model.
+        if self.provider == "STRATA":
+            # The last Test result: draw runs on every redraw, so it never waits on the network.
+            s_row = column.row(align=True)
+            s_row.label(text=self.strata_status, icon="INFO")
+            s_row.operator("loopcut.strata_test", text="Test Strata", icon="CHECKMARK")
         note = provider_note(self.provider)
         if note:
             lines = wrap(note, 90)
@@ -538,11 +555,14 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
             agent.column().prop(self, "chatgpt_effort")
         elif agy_provider:
             agent.column().prop(self, "agy_effort")
+        elif self.provider == "STRATA":
+            agent.column().prop(self, "thinking_profile")
         else:
             agent.column().prop(self, "reasoning_effort")
         flags = agent.column()
         flags.use_property_split = False  # A checkbox reads best with its whole label beside it.
         flags.prop(self, "auto_run")
+        flags.prop(self, "local_privacy_mode")
         flags.prop(self, "auto_look")
         if not chatgpt:  # On the ChatGPT plan one agent does the whole job (config.load_roles).
             row = flags.row()
@@ -859,11 +879,10 @@ def preferences():
     prefs = addon.preferences if addon else None
     if prefs is not None and getattr(prefs, "provider", None) == "LOOPCUT":
         if not account.signed_in() and not credentials.api_key(getattr(prefs, "base_url", "")):
-            prefs.provider = "AGY"
-            prefs.base_url = config.AGY_BASE_URL
-            prefs.model = config.AGY_MODEL
-            if hasattr(prefs, "agy_effort") and not prefs.agy_effort:
-                prefs.agy_effort = config.AGY_EFFORT
+            # Local: Strata (Swift 1.5) on this computer needs no account or key.
+            prefs.provider = "STRATA"
+            prefs.base_url = config.STRATA_BASE_URL
+            prefs.model = config.STRATA_MODEL
     return prefs
 
 
@@ -1096,7 +1115,8 @@ def values() -> dict[str, str]:
         return {}
     found = {
         "LOOPCUT_REASONING_EFFORT": _plan_effort(prefs) if prefs.provider == "CHATGPT" else (
-            getattr(prefs, "agy_effort", config.AGY_EFFORT) if prefs.provider == "AGY" else prefs.reasoning_effort
+            getattr(prefs, "agy_effort", config.AGY_EFFORT) if prefs.provider == "AGY" else
+            thinking.reasoning_effort(prefs.thinking_profile) if prefs.provider == "STRATA" else prefs.reasoning_effort
         ),
         "LOOPCUT_AUTO_RUN": "true" if prefs.auto_run else "false",
         "LOOPCUT_AUTO_LOOK": "true" if prefs.auto_look else "false",
@@ -1196,8 +1216,31 @@ class LOOPCUT_OT_storage_cleanup(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class LOOPCUT_OT_strata_test(bpy.types.Operator):
+    """Test connection to the local Strata server and verify model status."""
+    bl_idname = "loopcut.strata_test"
+    bl_label = "Test Strata Connection"
+
+    def execute(self, context):
+        from . import strata
+        prefs = preferences()
+        base_url = getattr(prefs, "base_url", config.STRATA_BASE_URL) if prefs else config.STRATA_BASE_URL
+        res = strata.test_strata_connection(base_url)
+        if res["ok"]:
+            msg = f"Strata Online: {res.get('backend', '').upper()} backend, {res.get('latency_ms', 0)}ms. Model: {res.get('active_model')}"
+            self.report({"INFO"}, msg)
+            if prefs:
+                prefs.strata_status = msg
+        else:
+            msg = f"Strata Offline: {res.get('error', 'Connection failed')}"
+            self.report({"WARNING"}, msg)
+            if prefs:
+                prefs.strata_status = msg
+        return {"FINISHED"}
+
+
 _CLASSES = (LoopcutPreferences, LOOPCUT_OT_storage_cleanup, LOOPCUT_OT_fetch_models, LOOPCUT_OT_anthropic_get_key, LOOPCUT_OT_use_provider,
-            LOOPCUT_OT_pick_model,
+            LOOPCUT_OT_pick_model, LOOPCUT_OT_strata_test,
             LOOPCUT_MT_models, LOOPCUT_OT_pick_tier, LOOPCUT_MT_tiers,
             LOOPCUT_OT_polypizza_get_key, LOOPCUT_OT_blenderkit_get_key, LOOPCUT_OT_clear_vendor_key)
 

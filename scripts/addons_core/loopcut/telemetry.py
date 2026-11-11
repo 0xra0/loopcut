@@ -214,6 +214,9 @@ def enabled() -> bool:
     """Main thread: the preference, the environment switch, and an interactive Blender."""
     if env_off() or _stopped:
         return False
+    from . import privacy
+    if privacy.is_privacy_mode_enabled():
+        return False
     try:
         import bpy
         if getattr(bpy.app, "background", True):

@@ -14,6 +14,18 @@ sys.modules.setdefault("bpy", types.ModuleType("bpy"))
 from loopcut import addons, api_docs, bundled_addons as bundled  # noqa: E402
 
 
+# Their bpy stub has no addon_utils; addons.py's own tests cover the installed-but-off add-ons.
+_no_off_addons = mock.patch("loopcut.addons.installed_off", return_value=[])
+
+
+def setUpModule():
+    _no_off_addons.start()
+
+
+def tearDownModule():
+    _no_off_addons.stop()
+
+
 class BundledTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

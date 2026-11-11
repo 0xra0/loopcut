@@ -932,7 +932,8 @@ class SettingsTest(unittest.TestCase):
         self.assertNotIn(OWN_KEY, (self.folder / ui.own_key.CACHE_FILE).read_text(encoding="utf-8"))
 
     def draw_preferences(self, provider, stored):
-        self.prefs.provider = provider
+        # As _provider_changed does on a real switch; this stub runs no update callbacks.
+        self.prefs.provider, self.prefs.base_url = provider, self.settings._BY_ID[provider][2]
         self.prefs.orchestrate = stored
         self.prefs.layout = Layout()
         # These panels have their own tests; stub their drawing to exercise the preferences page.

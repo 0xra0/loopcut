@@ -16,6 +16,18 @@ sys.modules.setdefault("bpy", fake_bpy)
 from loopcut import api_docs, tools  # noqa: E402
 
 
+# Their bpy stub has no addon_utils; addons.py's own tests cover the installed-but-off add-ons.
+_no_off_addons = mock.patch("loopcut.addons.installed_off", return_value=[])
+
+
+def setUpModule():
+    _no_off_addons.start()
+
+
+def tearDownModule():
+    _no_off_addons.stop()
+
+
 class Properties(dict):
     def __iter__(self):
         return iter(self.values())

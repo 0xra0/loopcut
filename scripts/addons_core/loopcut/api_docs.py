@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 
 import bpy
 
-from . import bundled_addons, capabilities, op_notes, scene_diff
+from . import addons, bundled_addons, capabilities, op_notes, scene_diff
 
 MAX_CHARS = 6000
 MAX_SEARCH_RESULTS = 40   # With detail; 25 without, within result_store.LIMIT.
@@ -636,7 +636,7 @@ def _search(query: str) -> list[str]:
     hits = sorted(((0 if all(t in path.lower() for t in terms) else 1, len(path), path)
                    for path, text in _index if all(t in text for t in terms)))
     if not hits:
-        hints = bundled_addons.search_hints(query)
+        hints = bundled_addons.search_hints(query) + addons.search_off(query)
         # Models search in four or five words ('fcurves action layers animation') and got nothing
         # (eval, 2026-09-27): rank by how many words match, then as above.
         scored = sorted((-matched, -sum(t in path.lower() for t in terms), len(path), path)
@@ -650,7 +650,8 @@ def _search(query: str) -> list[str]:
     cap = CONCISE_SEARCH_RESULTS if _concise else MAX_SEARCH_RESULTS
     lines = [f"{len(hits)} match(es) for {query!r}" + (f", first {cap}" if len(hits) > cap else "")
              + "; pass one as `path` for details:"]
-    return lines + ["  " + path for _, _, path in hits[:cap]]
+    # An off add-on registers nothing in RNA, so a search for its job finds only what is on (2026-11-11).
+    return lines + ["  " + path for _, _, path in hits[:cap]] + addons.search_off(query)
 
 
 def inspect_api(path: str = "", search: str = "", detail: bool = False) -> str:
@@ -673,6 +674,8 @@ def _inspect(path: str, search: str) -> str:
     try:
         if search:
             lines = _search(search)
+        elif (turned_on := addons.enable_installed(path)) is not None:
+            lines = [turned_on]
         else:
             package, path = bundled_addons.matching_path(path)
             notice = bundled_addons.ensure_enabled(package) if package else ""
@@ -692,7 +695,7 @@ def _inspect(path: str, search: str) -> str:
                                 f"import {package['id']} fails.")
             if notice:
                 lines.insert(0, notice)
-    except (bundled_addons.BundledAddonError, OSError, ValueError) as ex:
+    except (bundled_addons.BundledAddonError, OSError, ValueError, RuntimeError) as ex:
         raise ApiError(str(ex)) from ex
     text = "\n".join(lines)
     if len(text) > MAX_CHARS:

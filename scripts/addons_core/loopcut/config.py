@@ -110,6 +110,12 @@ AGY_EFFORT = "high"
 AGY_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
+# The default provider: Strata's OpenAI-compatible server on this computer (run-swift-abl-iq2_xs.sh serves Swift 1.5
+# on 8099). The server ignores the model name and answers with the model its run script started.
+STRATA_BASE_URL = "http://127.0.0.1:8099/v1"
+STRATA_MODEL = "strata"
+
+
 def agy(base_url: str) -> bool:
     return (base_url or "").strip().startswith("agy://") or (base_url or "").strip() == "agy"
 

@@ -1219,6 +1219,10 @@ def start_report(note: str, email: str, include: bool, on_done=None) -> bool:
     import bpy
     if _report["status"] == "sending" or getattr(bpy.app, "background", True):
         return False
+    from . import privacy
+    if privacy.is_privacy_mode_enabled():
+        _report.update(status="error", code="", message="Local privacy is on in Loopcut's preferences: log sharing is off.")
+        return False
     from . import conversations
     try:
         context = _sender_context()
