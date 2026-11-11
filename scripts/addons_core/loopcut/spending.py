@@ -51,6 +51,7 @@ MAX_SETTING = 100_000
 
 RUN, COST, VENDOR, BURST_ASK, BUDGET = "run", "cost", "vendor", "burst", "budget"
 NOT_ASKED = "not_asked"  # ONLY_ASKED: a paid call the user did not ask for, refused with no card.
+VALUE = "value"  # The independent reviewer needs the user's judgment; never overrides NOT_ASKED.
 AUTO, ASK, ONLY_ASKED = "AUTO", "ASK", "ONLY_ASKED"  # The extras preference (settings.extras_mode, set_extras).
 EXTRAS = (AUTO, ASK, ONLY_ASKED)
 CANCEL = "cancel_job"  # The model's cancel of a running paid job (cloud._job_status): {title, held, pct}.
@@ -221,6 +222,8 @@ def ask_lines(kind: str, details: dict, spend: dict, settings: Settings, *, call
     lines = [f"Asked by {worker}, working in the background." if worker else ""]
     if details.get('input_warning'):
         lines.append(details['input_warning'])
+    if details.get("value_reason"):
+        lines.append(details["value_reason"])
     credits, vendor = details.get("credits"), details.get("vendor")
     if vendor:
         lines.append(f"Uses your own {vendor} key: your {vendor} account pays, not credits.")
