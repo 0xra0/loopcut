@@ -400,6 +400,12 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
         default="balanced", update=_changed)
     strata_status: bpy.props.StringProperty(
         name="Strata Status", default="Not checked yet: press Test Strata", options={"SKIP_SAVE"})
+    strata_run_script: bpy.props.StringProperty(
+        name="Strata Run Script", default="", subtype='FILE_PATH', update=_changed,
+        description="Path to Strata start script. If empty, auto-discovered.")
+    strata_config_path: bpy.props.StringProperty(
+        name="Strata Config", default="", subtype='FILE_PATH', update=_changed,
+        description="Path to Strata configuration JSON. If empty, auto-discovered.")
     auto_look: bpy.props.BoolProperty(
         name="Look after every change", default=True, update=_changed,
         description="After each step that changes the scene, the agent gets a picture of the result. "
@@ -529,9 +535,13 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
             own_key_ui.draw(column, self)  # What the check found, right under the key and the model.
         if self.provider == "STRATA":
             # The last Test result: draw runs on every redraw, so it never waits on the network.
-            s_row = column.row(align=True)
+            s_box = column.box()
+            s_row = s_box.row(align=True)
             s_row.label(text=self.strata_status, icon="INFO")
             s_row.operator("loopcut.strata_test", text="Test Strata", icon="CHECKMARK")
+            s_row.operator("loopcut.strata_verify_vision", text="Verify Vision", icon="IMAGE_DATA")
+            s_box.prop(self, "strata_run_script")
+            s_box.prop(self, "strata_config_path")
         note = provider_note(self.provider)
         if note:
             lines = wrap(note, 90)
@@ -1239,8 +1249,32 @@ class LOOPCUT_OT_strata_test(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class LOOPCUT_OT_strata_verify_vision(bpy.types.Operator):
+    """Actively test Strata vision inference with a small test image."""
+    bl_idname = "loopcut.strata_verify_vision"
+    bl_label = "Verify Strata Vision"
+
+    def execute(self, context):
+        from . import strata
+        prefs = preferences()
+        base_url = getattr(prefs, "base_url", config.STRATA_BASE_URL) if prefs else config.STRATA_BASE_URL
+        model = getattr(prefs, "model", "") if prefs else ""
+        res = strata.verify_strata_vision(base_url, model=model)
+        if res["vision_verified"]:
+            msg = f"Strata Vision Verified: {res['reply']}"
+            self.report({"INFO"}, msg)
+            if prefs:
+                prefs.strata_status = msg
+        else:
+            msg = f"Strata Vision Failed: {res.get('error') or res.get('details')}"
+            self.report({"WARNING"}, msg)
+            if prefs:
+                prefs.strata_status = msg
+        return {"FINISHED"}
+
+
 _CLASSES = (LoopcutPreferences, LOOPCUT_OT_storage_cleanup, LOOPCUT_OT_fetch_models, LOOPCUT_OT_anthropic_get_key, LOOPCUT_OT_use_provider,
-            LOOPCUT_OT_pick_model, LOOPCUT_OT_strata_test,
+            LOOPCUT_OT_pick_model, LOOPCUT_OT_strata_test, LOOPCUT_OT_strata_verify_vision,
             LOOPCUT_MT_models, LOOPCUT_OT_pick_tier, LOOPCUT_MT_tiers,
             LOOPCUT_OT_polypizza_get_key, LOOPCUT_OT_blenderkit_get_key, LOOPCUT_OT_clear_vendor_key)
 

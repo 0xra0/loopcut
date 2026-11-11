@@ -1539,11 +1539,15 @@ def execute(name: str, arguments_json: str) -> ToolResult:
         if not isinstance(arguments, dict):
             raise ValueError("arguments must be a JSON object")
     except ValueError as ex:
-        return ToolResult(f"Invalid tool arguments: {ex}", ok=False, plan_refused=name == "delegate", input_mistake=True)
+        from . import tool_repair
+        repair_msg = tool_repair.build_argument_repair_prompt(name, str(ex))
+        return ToolResult(f"Invalid tool arguments: {ex}\n\n{repair_msg}", ok=False, plan_refused=name == "delegate", input_mistake=True)
     try:
         inspect.signature(fn).bind(**arguments)
     except TypeError as ex:
-        return ToolResult(f"Bad arguments for {name}: {ex}", ok=False, plan_refused=name == "delegate", input_mistake=True)
+        from . import tool_repair
+        repair_msg = tool_repair.build_argument_repair_prompt(name, str(ex))
+        return ToolResult(f"Bad arguments for {name}: {ex}\n\n{repair_msg}", ok=False, plan_refused=name == "delegate", input_mistake=True)
     _undo_owed.append("")
     try:
         return fn(**arguments)
