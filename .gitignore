@@ -91,3 +91,12 @@ blendcache_*
 
 # Local distillation packets and unreviewed drafts.
 /.distill-out/
+
+# Build directories
+/build-*/
+
+# Local patch archives
+Loopcut_*.zip
+Loopcut_Current_Main_Updated_Patches/
+Loopcut_Exact_Files_Fix_2026_10_27/
+
