@@ -274,34 +274,37 @@ def _measure_pixal3d_flaws(obj) -> dict:
     }
 
 
-def _apply_refinement_stages(obj, target_symmetry: bool, min_thickness: float, quad_target: int) -> list[str]:
+def _apply_refinement_stages(obj, target_symmetry: bool, min_thickness: float, quad_target: int,
+                             skip_loose: bool = False, skip_holes: bool = False) -> list[str]:
     stages = []
-    try:
-        bpy.ops.object.mode_set(mode='EDIT')
-        bpy.ops.mesh.select_all(action='SELECT')
-        if hasattr(bpy.ops.mesh, "delete_loose"):
-            bpy.ops.mesh.delete_loose()
-        stages.append("clean_loose")
-    except (RuntimeError, AttributeError):
-        pass
-    finally:
+    if not skip_loose:
         try:
-            bpy.ops.object.mode_set(mode='OBJECT')
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='SELECT')
+            if hasattr(bpy.ops.mesh, "delete_loose"):
+                bpy.ops.mesh.delete_loose()
+            stages.append("clean_loose")
         except (RuntimeError, AttributeError):
             pass
+        finally:
+            try:
+                bpy.ops.object.mode_set(mode='OBJECT')
+            except (RuntimeError, AttributeError):
+                pass
 
-    try:
-        bpy.ops.object.mode_set(mode='EDIT')
-        if hasattr(bpy.ops.mesh, "fill_holes"):
-            bpy.ops.mesh.fill_holes(sides=4)
-        stages.append("fix_non_manifold")
-    except (RuntimeError, AttributeError):
-        pass
-    finally:
+    if not skip_holes:
         try:
-            bpy.ops.object.mode_set(mode='OBJECT')
+            bpy.ops.object.mode_set(mode='EDIT')
+            if hasattr(bpy.ops.mesh, "fill_holes"):
+                bpy.ops.mesh.fill_holes(sides=4)
+            stages.append("fix_non_manifold")
         except (RuntimeError, AttributeError):
             pass
+        finally:
+            try:
+                bpy.ops.object.mode_set(mode='OBJECT')
+            except (RuntimeError, AttributeError):
+                pass
 
     if min_thickness > 0:
         try:
@@ -372,7 +375,31 @@ def pixal3d_refine(object_name=None, target_symmetry=True, min_thickness=0.005, 
         raise CommandError(f"No object found for refinement (object_name={object_name!r})")
 
     initial = _measure_pixal3d_flaws(target)
-    stages = _apply_refinement_stages(target, target_symmetry, float(min_thickness), int(quad_target))
+
+    # Durable pipeline resumption from project memory
+    pipe_name = f"pixal3d_refine_{getattr(target, 'name', 'mesh')}"
+    from loopcut import project_memory
+    potential = ["clean_loose", "fix_non_manifold"]
+    if float(min_thickness) > 0:
+        potential.append("solidify_thin_shells")
+    if target_symmetry:
+        potential.append("symmetrize")
+    if int(quad_target) > 0:
+        potential.append("quad_remesh")
+
+    remaining = set(project_memory.resume_pipeline(pipe_name, potential))
+
+    stages = _apply_refinement_stages(
+        target,
+        target_symmetry=("symmetrize" in remaining),
+        min_thickness=(float(min_thickness) if "solidify_thin_shells" in remaining else 0.0),
+        quad_target=(int(quad_target) if "quad_remesh" in remaining else 0),
+        skip_loose=("clean_loose" not in remaining),
+        skip_holes=("fix_non_manifold" not in remaining),
+    )
+    for st in stages:
+        project_memory.record_completed_stage(pipe_name, st)
+
     final = _measure_pixal3d_flaws(target)
 
     acc_non_manifold = final.get("non_manifold_edges", 0) <= max(0, initial.get("non_manifold_edges", 0) // 2)

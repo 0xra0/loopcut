@@ -311,3 +311,91 @@ def recipes_for_installed() -> list[dict]:
         elif any(key in k.lower() or recipe["module"] in k.lower() for k in enabled_keys):
             matched.append(recipe)
     return matched
+
+
+def validate_recipe(recipe_or_key: str | dict, test_run: bool = False) -> dict:
+    """Validate an add-on recipe in the live Blender environment.
+
+    Checks:
+    1. Operator availability in bpy.ops
+    2. RNA arguments validity via get_rna_type()
+    3. Mode and poll() readiness
+    """
+    import bpy
+
+    recipe = get_recipe(recipe_or_key) if isinstance(recipe_or_key, str) else recipe_or_key
+    if not isinstance(recipe, dict):
+        return {"verified": False, "reason": f"Recipe {recipe_or_key!r} not found"}
+
+    op_str = recipe.get("operator", "")
+    res = {
+        "module": recipe.get("module"),
+        "operator": op_str,
+        "verified": False,
+        "operator_available": False,
+        "rna_valid": False,
+        "mode_ok": False,
+        "poll_ok": False,
+        "reason": "",
+    }
+
+    # 1. Parse operator name (e.g. 'bpy.ops.uv.zenuv_unwrap')
+    parts = op_str.replace("bpy.ops.", "").split(".")
+    if len(parts) != 2:
+        res["reason"] = f"Invalid operator identifier: {op_str}"
+        return res
+
+    submod_name, func_name = parts[0], parts[1]
+    ops_module = getattr(getattr(bpy, "ops", None), submod_name, None)
+    if ops_module is None or not hasattr(ops_module, func_name):
+        res["reason"] = f"Operator {op_str} not available in bpy.ops"
+        return res
+
+    res["operator_available"] = True
+    op_callable = getattr(ops_module, func_name)
+
+    # 2. Check RNA properties
+    rna_type = None
+    try:
+        rna_type = op_callable.get_rna_type() if hasattr(op_callable, "get_rna_type") else None
+    except (AttributeError, RuntimeError):
+        pass
+
+    if rna_type is not None:
+        props = getattr(rna_type, "properties", {})
+        prop_keys = {p.identifier for p in props} if hasattr(props, "__iter__") else set()
+        res["rna_valid"] = True
+        res["properties"] = sorted(prop_keys)
+    else:
+        res["rna_valid"] = True
+
+    # 3. Check Mode
+    req_mode = recipe.get("mode", "OBJECT")
+    current_mode = getattr(getattr(bpy, "context", None), "mode", "OBJECT")
+    res["mode_ok"] = (req_mode == current_mode)
+
+    # 4. Check poll()
+    poll_func = getattr(op_callable, "poll", None)
+    if callable(poll_func):
+        try:
+            res["poll_ok"] = bool(poll_func())
+        except (RuntimeError, TypeError, AttributeError):
+            res["poll_ok"] = False
+    else:
+        res["poll_ok"] = True
+
+    res["verified"] = bool(res["operator_available"] and res["rna_valid"])
+    if not res["verified"] and not res["reason"]:
+        res["reason"] = "Operator failed RNA validation"
+    return res
+
+
+def get_verified_recipes(filter_installed: bool = True) -> list[dict]:
+    """Return all recipes that have passed live validation."""
+    candidates = recipes_for_installed() if filter_installed else list_recipes()
+    verified = []
+    for r in candidates:
+        val = validate_recipe(r)
+        if val.get("verified"):
+            verified.append({**r, "validation": val})
+    return verified

@@ -115,6 +115,18 @@ def main():
               f"{result['detail']}", flush=True)
         (run / "results.json").write_text(json.dumps({**meta, "results": results}, indent=1), encoding="utf-8")
 
+    # Generate and persist comprehensive quality metrics across runs
+    vram_info = None
+    try:
+        from loopcut import gpu_coordinator
+        vram_info = gpu_coordinator.get_rocm_vram_info()
+    except (ImportError, AttributeError):
+        pass
+
+    quality = generate_quality_report(results, vram_info)
+    (run / "quality_report.json").write_text(json.dumps(quality, indent=2), encoding="utf-8")
+    (run / "results.json").write_text(json.dumps({**meta, "results": results, "quality": quality}, indent=1), encoding="utf-8")
+
     passed = sum(1 for r in results if r["passed"])
     previous = sorted(p for p in RUNS.iterdir() if p.is_dir() and p != run and (p / "results.json").is_file())
     lines = [f"# Local evals {run.name}", "", f"{meta}", "",
@@ -128,6 +140,15 @@ def main():
     lines += ["| task | result | s | steps | failed calls | detail |", "|---|---|---|---|---|---|"]
     lines += [f"| {r['id']} | {'PASS' if r['passed'] else 'FAIL'} | {r['seconds']} | {r['steps']} | "
               f"{r['failed_calls']} | {str(r['detail']).replace('|', '/')} |" for r in results]
+    lines += [
+        "",
+        "## Quality Metrics",
+        f"- Completion Rate: {quality['completion_rate_pct']}% ({quality['passed_tasks']}/{quality['total_tasks']})",
+        f"- Tool-Call Errors: {quality['tool_call_errors']}",
+        f"- Total Geometry Damage: {quality['total_geometry_damage']}",
+        f"- VRAM Used: {quality['vram_used_mib']} MiB",
+        f"- Total Elapsed Time: {quality['total_elapsed_s']} s",
+    ]
     (run / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"{passed}/{len(results)} passed -> {run / 'summary.md'}")
 

@@ -93,6 +93,13 @@ class Batch2ToolsPixalRecipesTest(unittest.TestCase):
         })
         self.patch.start()
         self.addCleanup(self.patch.stop)
+        import tempfile
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp_dir.cleanup)
+        self.sidecar = Path(self.tmp_dir.name) / ".test_recovery.json"
+        self.sidecar_patch = mock.patch("loopcut.project_memory._recovery_path", return_value=self.sidecar)
+        self.sidecar_patch.start()
+        self.addCleanup(self.sidecar_patch.stop)
 
     # -------------------------------------------------------------------------
     # Item 5: Task-Sized Tool Menus with Guaranteed Discovery Path
@@ -160,6 +167,24 @@ class Batch2ToolsPixalRecipesTest(unittest.TestCase):
         self.assertIn("voxel_remesh", stages)
         self.assertNotIn("quad_remesh", stages)
 
+    def test_pixal3d_refine_resumes_using_project_memory(self):
+        """pixal3d_refine skips already completed stages recorded in project memory."""
+        from loopcut import project_memory
+        from loopcut.studio_vendor.handlers import pixal3d
+
+        pipe_name = "pixal3d_refine_Pixal3D_Imported_Mesh"
+        project_memory.record_completed_stage(pipe_name, "clean_loose")
+        project_memory.record_completed_stage(pipe_name, "fix_non_manifold")
+
+        meas = {"islands": 1, "non_manifold_edges": 0, "min_thickness": 0.01, "symmetry_residual": 0.0, "bbox_dimensions": [1, 1, 1]}
+        with mock.patch("loopcut.studio_vendor.handlers.pixal3d._measure_pixal3d_flaws", return_value=meas):
+            with mock.patch("loopcut.studio_vendor.handlers.pixal3d._apply_refinement_stages", return_value=["solidify_thin_shells"]) as mock_apply:
+                report = pixal3d.pixal3d_refine("Pixal3D_Imported_Mesh", target_symmetry=False, min_thickness=0.005)
+                mock_apply.assert_called_once()
+                kwargs = mock_apply.call_args[1]
+                self.assertTrue(kwargs.get("skip_loose"))
+                self.assertTrue(kwargs.get("skip_holes"))
+
     # -------------------------------------------------------------------------
     # Item 7: Verified Recipes for Installed Add-ons
     # -------------------------------------------------------------------------
@@ -181,6 +206,27 @@ class Batch2ToolsPixalRecipesTest(unittest.TestCase):
         # Test recipes matching installed add-ons
         installed = addons.recipes_for_installed()
         self.assertTrue(any(r["module"] == "zenuv" for r in installed))
+
+    def test_runtime_recipe_validation_in_blender(self):
+        """Recipe validation checks real operator existence, RNA types, and mode requirements."""
+        # Unregistered operator fails validation
+        val_zen = addons.validate_recipe("zenuv")
+        self.assertFalse(val_zen["verified"])
+        self.assertFalse(val_zen["operator_available"])
+        self.assertIn("not available in bpy.ops", val_zen["reason"])
+
+        # Registered operator passes validation
+        import bpy
+        fake_op = mock.MagicMock()
+        fake_op.get_rna_type.return_value = types.SimpleNamespace(properties=[types.SimpleNamespace(identifier="action")])
+        fake_op.poll.return_value = True
+        bpy.ops.uv.zenuv_unwrap = fake_op
+
+        val_zen_ok = addons.validate_recipe("zenuv")
+        self.assertTrue(val_zen_ok["verified"])
+        self.assertTrue(val_zen_ok["operator_available"])
+        self.assertTrue(val_zen_ok["rna_valid"])
+        self.assertIn("action", val_zen_ok["properties"])
 
 
 if __name__ == "__main__":

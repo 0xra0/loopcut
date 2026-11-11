@@ -229,3 +229,54 @@ CHECK GREEN
 ```
 CHECK GREEN
 ```
+
+
+---
+
+# Batch 5 Report: Crash-Durable Memory Sidecar, Connected Eval Quality Metrics, and Live Add-on Recipe Validation
+
+## Summary of Changes
+
+### Item 5: Make Recovery Durable Across a Crash
+- **Files Changed**:
+  - `scripts/addons_core/loopcut/project_memory.py`
+  - `scripts/addons_core/loopcut/studio_vendor/handlers/pixal3d.py`
+  - `loopcut/tests/test_batch3_memory_gpu_evals.py`
+  - `loopcut/tests/test_batch2_tools_pixal_recipes.py`
+- **Caller that runs the code**:
+  - `project_memory.save_memory`, `project_memory.load_memory`, `project_memory.record_completed_stage`, `project_memory.resume_pipeline`, `pixal3d.pixal3d_refine`
+- **Test that proves it**:
+  - `Batch3MemoryGpuEvalsTest.test_crash_durable_recovery_survives_without_save`
+  - `Batch2ToolsPixalRecipesTest.test_pixal3d_refine_resumes_using_project_memory`
+- **Observable Check**:
+  - `save_memory` atomically writes stage records and project memory to a disk sidecar file (`_recovery_path()`) alongside the `.blend` (or in temp/cache).
+  - When Blender crashes before the user or agent saves the `.blend`, `load_memory()` merges recovered records from disk, preserving stage completions and constraints.
+  - `pixal3d_refine` queries `resume_pipeline`, passing `skip_loose` and `skip_holes` to skip already completed work when resuming a pipeline run.
+
+### Item 6: Show Measured Quality in Eval Output
+- **Files Changed**:
+  - `loopcut/harness/local_evals/run.py`
+- **Caller that runs the code**:
+  - `run.py:main`, `run.py:generate_quality_report`
+- **Test that proves it**:
+  - `Batch3MemoryGpuEvalsTest.test_quality_metrics_reporter`
+- **Observable Check**:
+  - `run.py` calls `generate_quality_report` after task execution, querying live ROCm VRAM from `gpu_coordinator.get_rocm_vram_info()`.
+  - Quality metrics (completion rate %, tool-call errors, total geometry damage, elapsed time, VRAM usage) are written to `quality_report.json`, embedded into `results.json`, and formatted into `summary.md`.
+
+### Item 7: Validate Add-on Recipes in Blender
+- **Files Changed**:
+  - `scripts/addons_core/loopcut/addons.py`
+  - `loopcut/tests/test_batch2_tools_pixal_recipes.py`
+- **Caller that runs the code**:
+  - `addons.validate_recipe`, `addons.get_verified_recipes`
+- **Test that proves it**:
+  - `Batch2ToolsPixalRecipesTest.test_runtime_recipe_validation_in_blender`
+- **Observable Check**:
+  - `validate_recipe` verifies operator registration in `bpy.ops`, introspects RNA types and properties via `get_rna_type().properties`, verifies required context modes, and checks operator `poll()` status.
+  - Unregistered operators return `verified: False` with descriptive diagnostics; `get_verified_recipes` returns only recipes verified in the active Blender session.
+
+## `./check.sh main` Last Line
+```
+CHECK GREEN
+```
