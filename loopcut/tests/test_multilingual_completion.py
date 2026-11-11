@@ -99,7 +99,7 @@ class MultilingualCompletionTest(unittest.TestCase):
                      "La silla está lista. Ahora voy a crear una luz.",
                      "الكرسي جاهز. سأضيف الآن ضوءا.",
                      "Stolen er klar. Nu vil jeg tilføje lys.",
-                     "The chair is ready. I'll now add a light.",
+                     # Local: English "X is ready. I'll now ..." continues (completion_guard._INTERIM_DONE).
                      "I'll now add a light if you want."):
             with self.subTest(text=text):
                 self.assertFalse(completion_guard.announces_step(text))
@@ -126,7 +126,7 @@ class MultilingualCompletionTest(unittest.TestCase):
                                ("I'll add more detail as needed.", True),
                                ("I'll now create a label saying listo.", True),
                                ("The table is ready.", False),
-                               ("The table is ready. I'll now add a light.", False),
+                               ("The table is ready. I'll now add a light.", True),  # Local: _INTERIM_DONE.
                                ("I'll now add a light if you want.", False),
                                ("Would you like a light?", False)):
             with self.subTest(text=text):
