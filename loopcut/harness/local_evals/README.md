@@ -6,10 +6,19 @@ Strata (or any OpenAI-compatible server on 127.0.0.1), taught by the skills in `
 
 | File | What it does |
 | --- | --- |
-| `tasks.py` | 13 tasks: prompt, starting scene, a check that reads the evaluated scene, a reference solution |
+| `tasks.py` | 15 tasks (including Pixal3D armor repair and debris cleanup): prompt, starting scene, a check that reads the evaluated scene, a reference solution |
 | `selfcheck.py` | Every check fails on the untouched scene and passes on its reference. No model. ~5 s |
 | `run_task.py` | One task as a real agent turn in a GUI Blender (the way `harness/live_check.py` runs one) |
-| `run.py` | All tasks, each in its own Blender; writes `results.json`, `summary.md`, transcripts |
+| `run.py` | All tasks, each in its own Blender; writes `results.json`, `summary.md`, transcripts, and quality metrics report |
+
+## Quality Tracking Metrics Over Time
+
+The evaluation runner tracks key quality and performance dimensions:
+- **Completion rate (`completion_rate_pct`)**: Percentage of tasks satisfying all objective scene acceptance checks.
+- **Tool-call errors (`tool_call_errors`)**: Count of model schema mismatches, bad arguments, or runtime tool failures.
+- **Geometry damage (`total_geometry_damage`)**: Measured surface distortion or unintended mesh degradation.
+- **Elapsed time (`total_elapsed_s`)**: Execution latency per task and cumulative workflow duration.
+- **VRAM footprint (`vram_used_mib`)**: GPU memory usage tracked via `gpu_coordinator` ROCm sysfs before and after stages.
 
 ```sh
 # no model: are the checks sound?

@@ -525,6 +525,73 @@ def sword_reference():
     o.location.z = 0.08
 
 
+def pixal3d_armor_setup():
+    clear()
+    o = mesh_object("PixalArmor", "primitive_cube_add", size=1.0)
+    o.scale = (0.5, 0.2, 0.8)
+    bpy.ops.object.transform_apply(scale=True)
+    # Open a face so mesh has non-manifold boundary edges
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='DESELECT')
+    bpy.ops.object.mode_set(mode='OBJECT')
+    if o.data.polygons:
+        o.data.polygons[0].select = True
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.delete(type='ONLY_FACE')
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+
+def pixal3d_armor_check():
+    o = get("PixalArmor")
+    if not o or o.type != "MESH":
+        return False, "no PixalArmor mesh"
+    import bmesh
+    bm = bmesh.new()
+    bm.from_mesh(o.data)
+    non_manifold = sum(1 for e in bm.edges if not e.is_manifold)
+    bm.free()
+    dims = o.dimensions
+    min_dim = min(dims)
+    ok = (non_manifold == 0 and min_dim >= 0.05)
+    return ok, f"{non_manifold} non-manifold edges, min dimension {min_dim:.3f}m"
+
+
+def pixal3d_armor_reference():
+    o = get("PixalArmor")
+    if o:
+        bpy.ops.object.select_all(action='DESELECT')
+        o.select_set(True)
+        bpy.context.view_layer.objects.active = o
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='SELECT')
+        if hasattr(bpy.ops.mesh, "fill_holes"):
+            bpy.ops.mesh.fill_holes(sides=4)
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+
+def pixal3d_islands_setup():
+    clear()
+    mesh_object("PixalScan", "primitive_cylinder_add", radius=0.4, depth=1.0)
+    bpy.ops.mesh.primitive_cube_add(size=0.05, location=(1.0, 1.0, 1.0))
+    debris1 = bpy.context.object
+    debris1.name = "Debris1"
+
+
+def pixal3d_islands_check():
+    o = get("PixalScan")
+    if not o or o.type != "MESH":
+        return False, "no PixalScan mesh"
+    debris = get("Debris1")
+    ok = (debris is None or debris.name not in bpy.data.objects)
+    return ok, f"debris present: {debris is not None}"
+
+
+def pixal3d_islands_reference():
+    d = get("Debris1")
+    if d:
+        bpy.data.objects.remove(d, do_unlink=True)
+
+
 TASKS = {
     "red_sphere": ("Add a UV sphere of radius 0.5 m resting on top of the cube, centred on it, with a pure red "
                    "material (red base colour).", red_sphere_setup, red_sphere_check, red_sphere_reference),
@@ -554,6 +621,10 @@ TASKS = {
     "longsword": ("Model a simple longsword as one mesh object named Longsword: blade along +Z, total length 1.2 m, a "
                   "crossguard about 0.25 m wide, a grip and a pommel, origin at the middle of the grip.",
                   sword_setup, sword_check, sword_reference),
+    "pixal3d_repair": ("Refine PixalArmor: eliminate all non-manifold edges, preserve shell thickness (at least 0.05 m), and ensure symmetry across X.",
+                       pixal3d_armor_setup, pixal3d_armor_check, pixal3d_armor_reference),
+    "pixal3d_islands": ("Clean PixalScan: remove floating disconnected debris pieces (such as Debris1) so only the main object remains without geometry damage.",
+                        pixal3d_islands_setup, pixal3d_islands_check, pixal3d_islands_reference),
 }
 lods_check.base_tris = 0
 

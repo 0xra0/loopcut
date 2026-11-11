@@ -106,3 +106,51 @@ CHECK GREEN
 ```
 CHECK GREEN
 ```
+
+---
+
+# Batch 3 Report: Project Memory Recovery, GPU Coordinator, and Quality Tracking
+
+## Summary of Changes
+
+### Item 8: Strengthen Project Memory and Recovery
+- **Files Changed**:
+  - `scripts/addons_core/loopcut/project_memory.py`
+- **Caller that runs the code**:
+  - `project_memory.set_target_export_format`, `project_memory.record_completed_stage`, `project_memory.resume_pipeline`, `project_memory.record_failed_approach`, `project_memory.summary_for_context`, `agent.py` context manager
+- **Test that proves it**:
+  - `Batch3MemoryGpuEvalsTest.test_strengthened_project_memory_and_resumption`
+- **Observable Check**:
+  - `target_export_format`, `completed_stages`, and `failed_approaches` persist into scene JSON property `loopcut_project_memory`.
+  - `resume_pipeline` filters out completed stages (`clean_loose`, `fix_non_manifold`) leaving only unexecuted stages (`solidify_thin_shells`, `symmetrize`, `quad_remesh`), enabling crash-proof pipeline resumption without duplicating work.
+  - `summary_for_context` reports project constraints, export format, completed stage counts, and approaches to avoid.
+
+### Item 9: Coordinate GPU-Heavy Stages
+- **Files Changed**:
+  - `scripts/addons_core/loopcut/gpu_coordinator.py`
+- **Caller that runs the code**:
+  - `gpu_coordinator.acquire_gpu_stage`, `gpu_coordinator.release_gpu_stage`, `gpu_coordinator.get_vram_status`, `studio.action`
+- **Test that proves it**:
+  - `Batch3MemoryGpuEvalsTest.test_gpu_coordinator_vram_and_queue`
+- **Observable Check**:
+  - `acquire_gpu_stage` checks VRAM headroom and grants an exclusive GPU lease for the active job (`job_strata_1`). Competing job (`job_comfy_1`) is safely queued. When `job_strata_1` releases, the stage promotes `job_comfy_1`.
+
+### Item 10: Track Quality Over Time
+- **Files Changed**:
+  - `loopcut/harness/local_evals/tasks.py`
+  - `loopcut/harness/local_evals/run.py`
+  - `loopcut/harness/local_evals/README.md`
+- **Caller that runs the code**:
+  - `tasks.py`, `selfcheck.py`, `run.py`, `eval_run.generate_quality_report`
+- **Test that proves it**:
+  - `Batch3MemoryGpuEvalsTest.test_local_evals_pixal3d_cases_present`
+  - `Batch3MemoryGpuEvalsTest.test_quality_metrics_reporter`
+- **Observable Check**:
+  - Added `pixal3d_repair` (boundary edge non-manifold repair) and `pixal3d_islands` (debris cleanup) to `TASKS`.
+  - Running headless Blender `selfcheck.py` verifies all 15 tasks (`SELFCHECK 15/15 ok`).
+  - `generate_quality_report` tracks completion rate (%), tool-call errors, geometry damage, elapsed time, and VRAM use.
+
+## `./check.sh main` Last Line
+```
+CHECK GREEN
+```

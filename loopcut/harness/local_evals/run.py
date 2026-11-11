@@ -44,6 +44,27 @@ def server_up(base_url):
         return False
 
 
+def generate_quality_report(results: list[dict], vram_info: dict | None = None) -> dict:
+    """Generate comprehensive quality tracking metrics over time."""
+    total = len(results)
+    passed = sum(1 for r in results if r.get("passed"))
+    rate = round((passed / total * 100.0), 1) if total > 0 else 0.0
+    failed_calls = sum(int(r.get("failed_calls") or 0) for r in results)
+    elapsed = sum(float(r.get("seconds") or 0.0) for r in results)
+    damage = sum(float(r.get("geometry_damage") or 0.0) for r in results)
+    vram_used = int((vram_info or {}).get("used_mib") or 0)
+
+    return {
+        "total_tasks": total,
+        "passed_tasks": passed,
+        "completion_rate_pct": rate,
+        "tool_call_errors": failed_calls,
+        "total_geometry_damage": round(damage, 4),
+        "total_elapsed_s": round(elapsed, 1),
+        "vram_used_mib": vram_used,
+    }
+
+
 def main():
     ids = task_ids()
     ap = argparse.ArgumentParser()
