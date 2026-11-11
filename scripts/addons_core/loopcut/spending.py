@@ -3,7 +3,8 @@
 The owner: "better ux revolving around credits and credit use ... we probably shouldn't have it ask every
 single time, but we also don't want it just going crazy and one agent just doing hella shit in the background".
 
-- A paid call costing at most min(the server's approval.confirm_over_credits, the user's "Ask above") runs on its
+- The first paid use of each tool asks with its price; approval is stored per account on this installation.
+- A later paid call costing at most min(the server's approval.confirm_over_credits, the user's "Ask above") runs on its
   own; above that its card asks, Approve / Cancel, with the cost and the balance before and after. The server
   sends 0 to add-ons older than 0.2.4, so every priced call asks there. A quoted tool is decided on its quote.
 - Auto-approved spend in one chat is capped by the chat budget. The call that would cross it asks once: "This
@@ -37,6 +38,7 @@ Pure apart from a lock that serializes the agent's and the workers' threads. The
 with the conversation (conversations.py); the approved own-key vendors are consent, so they are not saved.
 """
 
+import json
 import math
 import re
 import threading
@@ -56,6 +58,40 @@ DAILY, RATE = "daily_limit_reached", "rate_limited"  # The server's refusals tha
 SERVER_LIMITS = (DAILY, RATE)
 
 lock = threading.RLock()
+
+
+def _paid_tools(runtime) -> list[str]:
+    """Per-install consent in the account-scoped state directory; damaged state asks again."""
+    try:
+        with (runtime.cache_dir / "paid-tools.json").open("rb") as handle:
+            raw = handle.read(16385)
+        rows = json.loads(raw) if len(raw) <= 16384 else None
+        if (not isinstance(rows, list) or len(rows) > 128
+                or any(not isinstance(name, str) or not re.fullmatch(r"(?:managed|byok)\.[a-z][a-z0-9_]{0,63}", name)
+                       for name in rows)):
+            return []
+        return rows
+    except (OSError, ValueError):
+        return []
+
+
+def first_use(runtime, tool: str, backend: str = 'managed') -> bool:
+    with runtime.lock:
+        return backend + '.' + tool not in _paid_tools(runtime)
+
+
+def note_use(runtime, tool: str, backend: str = 'managed') -> None:
+    """Remember consent only after approval; a failed save keeps future calls asking."""
+    from .cloud import _write_json
+    with runtime.lock:
+        rows = _paid_tools(runtime)
+        key = backend + '.' + tool
+        if key not in rows:
+            rows.append(key)
+            try:
+                _write_json(runtime.cache_dir / "paid-tools.json", rows[-128:])
+            except OSError as ex:
+                print(f"Loopcut: could not save paid-tool consent: {ex}")
 
 
 @dataclass(frozen=True)
@@ -121,6 +157,10 @@ def decide(details: dict, spend: dict, settings: Settings, *, calls: int = 0, bu
     vendor, credits = details.get("vendor"), details.get("credits")
     if settings.asks_each:
         return COST
+    if details.get('input_warning'):
+        return COST
+    if details.get("first_use"):
+        return VENDOR if vendor and vendor not in vendors else COST
     if vendor:
         if vendor not in vendors:
             return VENDOR
@@ -179,13 +219,19 @@ def ask_lines(kind: str, details: dict, spend: dict, settings: Settings, *, call
     """What the card says above its buttons: what was hit, then the balance before and after. Short lines that
     wrap at 260 px; the cost itself is the card's cost line."""
     lines = [f"Asked by {worker}, working in the background." if worker else ""]
+    if details.get('input_warning'):
+        lines.append(details['input_warning'])
     credits, vendor = details.get("credits"), details.get("vendor")
     if vendor:
         lines.append(f"Uses your own {vendor} key: your {vendor} account pays, not credits.")
+        if details.get('first_use'):
+            lines.append("First use of this paid tool.")
         lines.append(f"Allow {vendor} calls in this chat?" if kind == VENDOR else "")
     elif kind == COST:
         limit = threshold(details, settings)
         lines.append("You asked to approve every paid call." if settings.asks_each
+                     else "This image needs your approval." if details.get('input_warning')
+                     else "First use of this paid tool." if details.get("first_use")
                      else "Its price is not known yet." if not _amount(credits)
                      else "Every paid call asks on this account." if limit == 0
                      else f"Over {_n(limit)} credits, so it asks first." if limit is not None
@@ -244,6 +290,8 @@ def declined(kind: str, details: dict, settings: Settings, *, calls: int = 0) ->
     limit = threshold(details, settings)
     reason = {COST: (f"it costs {_n(credits)} credits" if _amount(credits) else "its price was not known")
                     + (", and they approve every paid call" if settings.asks_each
+                       else ", and the image has input concerns" if details.get('input_warning')
+                       else ", and this is their first use of this paid tool" if details.get('first_use')
                        else f", over the {_n(limit)} credits that run without asking" if limit is not None else ""),
               VENDOR: f"it uses their own {vendor} key",
               BURST_ASK: f"it would be paid call {calls + 1} in this turn",

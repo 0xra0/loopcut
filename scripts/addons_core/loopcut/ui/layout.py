@@ -11,7 +11,7 @@ import math
 import re
 from pathlib import Path
 
-from .. import allowance, chat_credits, config, spending, state
+from .. import allowance, chat_credits, chatgpt_auth, config, nudges, spending, state
 from . import textedit
 from . import theme as T
 from .markdown import REFERENCE_LIMIT, split_markdown
@@ -27,6 +27,45 @@ STATUS_GLYPH = {
 }
 
 CODE_TOOLS = {"run_python", "run_blender"}
+# A card's plain words for its tool where the tool's id stood (rel020-axe: "run_python" under a step's ask, and on
+# every expanded card): (what it does, for an ask or a step still going; what it did, once done). The id stays the
+# card's and the model's; a tool with no words here shows none.
+TOOL_LABELS = {
+    "run_python": ("Runs a script", "Ran a script"),
+    "run_blender": ("Runs Blender in the background", "Ran Blender in the background"),
+    "shell": ("Runs a command", "Ran a command"),
+    "import_asset": ("Adds a library model", "Added a library model"),
+    "search_assets": ("Searches the model libraries", "Searched the model libraries"),
+    "get_scene_info": ("Reads the scene", "Read the scene"),
+    "get_object_info": ("Reads object details", "Read object details"),
+    "inspect_api": ("Looks up Blender's features", "Looked up Blender's features"),
+    "read_result": ("Reads an earlier result", "Read an earlier result"),
+    "capture_viewport": ("Looks at the scene", "Looked at the scene"),
+    "compare_with_reference": ("Compares with the reference", "Compared with the reference"),
+    "look_at_reference": ("Looks at the reference", "Looked at the reference"),
+    "inspect_scene": ("Renders a check picture", "Rendered a check picture"),
+    "frame_camera": ("Frames the camera", "Framed the camera"),
+    "checks": ("Checks the result", "Checked the result"),
+    "delegate": ("Works with helpers", "Worked with helpers"),
+}
+TOOL_LABELS.update({old: TOOL_LABELS[new] for new, olds in (  # Saved cards of the tools since merged (tools.RENAMED).
+    ("import_asset", ("import_polyhaven", "import_blenderkit", "import_polypizza")),
+    ("search_assets", ("search_polyhaven", "search_blenderkit", "search_polypizza"))) for old in olds})
+# A job row's note where its saved scene's revision hash stood (rel020-pro: "Saved revision cf8c7d4c78ff").
+JOB_SAVED = "Saved a checkpoint"
+
+
+def tool_label(item: dict) -> str:
+    """TOOL_LABELS' words for a card: what it did once done, else what it does; "" for a tool it has none for."""
+    words = TOOL_LABELS.get(item.get("name"))
+    return (words[1] if item.get("status") == "done" else words[0]) if words else ""
+
+
+def wave_title(item: dict) -> str:
+    """A wave card's title for people ("Working on it · 1 helper"); its saved text ("Wave 1 · 1 worker") is the record."""
+    rows = item.get("rows") or []
+    going = any(row.get("status") in state.WAVE_RUNNING for row in rows)
+    return f"{'Working on it' if going else 'Finished'} · {len(rows)} helper{'' if len(rows) == 1 else 's'}"
 # A waiting card's buttons. _chat gives their hits the card's identity, which agent.decide checks (ui.host). The
 # render choice's options and a short card's Upgrade too (render_offer.click, render_offer.upgrade).
 ANSWERS = frozenset({"approve", "approve_always", "reject", "render_choice", "paid_upgrade"})
@@ -82,6 +121,15 @@ class Frame:
         self.hits: list[dict] = []
         self.input: dict | None = None
         self.cards: list[dict] = []  # The waiting cards _chat drew, nearest the input first (ui.host._shown_card).
+        self.transcript: dict[int, dict] = {}
+
+    def copy_part(self, item: int, text: str, kind: str, separator="\n\n") -> tuple[int, int]:
+        """Register only text explicitly supplied by a transcript drawer, before scroll culling."""
+        entry = self.transcript.setdefault(item, {"kind": kind, "text": ""})
+        prefix = separator if entry["text"] else ""
+        start = len(entry["text"]) + len(prefix)
+        entry["text"] += prefix + text
+        return item, start
 
     def px(self, value: float) -> int:
         return round(value * self.scale)
@@ -93,11 +141,13 @@ class Frame:
         self.prims.append({"t": "rect", "id": id, "x": x, "y": y, "w": w, "h": h, "color": color,
                            "radius": radius, "border": border, "border_color": border_color})
 
-    def text(self, id, x, y, text, size, color, font="ui"):
+    def text(self, id, x, y, text, size, color, font="ui", src=None):
         """`y` is the top of the line box; the box is line_height(size) tall."""
         if text:
             self.prims.append({"t": "text", "id": id, "x": x, "y": y, "h": self.line_height(size),
                                "text": text, "size": size, "color": color, "font": font})
+            if src is not None:
+                self.prims[-1]["src"] = src
 
     def hit(self, id, x, y, w, h, action, tip: str = ""):
         """`tip` is shown when the mouse rests on the area; lines are separated by newlines."""
@@ -108,13 +158,14 @@ class Frame:
         self.prims.append({"t": "ring", "id": id, "x": x, "y": y, "w": diameter, "h": diameter,
                            "share": max(0.0, min(1.0, share)), "thickness": thickness, "color": color, "track": track})
 
-    def paragraph(self, id, x, y, width, text, size, color, font="ui") -> int:
+    def paragraph(self, id, x, y, width, text, size, color, font="ui", src=None) -> int:
         line_height = self.line_height(size)
-        for n, (_, line) in enumerate(wrap(text, font, size, width, self.measure)):
-            self.text(f"{id}.l{n}", x, y + n * line_height, line.rstrip(), size, color, font)
+        for n, (offset, line) in enumerate(wrap(text, font, size, width, self.measure)):
+            span = (src[0], src[1] + offset, src[1] + offset + len(line)) if src is not None else None
+            self.text(f"{id}.l{n}", x, y + n * line_height, line.rstrip(), size, color, font, src=span)
         return (n + 1) * line_height
 
-    def code_block(self, id, x, y, width, source, max_lines=None) -> int:
+    def code_block(self, id, x, y, width, source, max_lines=None, src=None) -> int:
         size, pad = self.px(T.FONT_SIZE_CODE), self.px(8)
         lines = wrap(source, "mono", size, width - 2 * pad, self.measure)
         hidden = 0
@@ -123,9 +174,10 @@ class Frame:
         line_height = self.line_height(size)
         height = len(lines) * line_height + 2 * pad + (line_height if hidden else 0)
         self.rect(f"{id}.bg", x, y, width, height, T.CODE_BG, self.px(T.RADIUS_SMALL), 1, T.CARD_BORDER)
-        for n, (_, line) in enumerate(lines):
+        for n, (offset, line) in enumerate(lines):
+            span = (src[0], src[1] + offset, src[1] + offset + len(line)) if src is not None else None
             self.text(f"{id}.l{n}", x + pad, y + pad + n * line_height, line.rstrip(), size,
-                      T.CODE_TEXT, "mono")
+                      T.CODE_TEXT, "mono", src=span)
         if hidden:
             self.text(f"{id}.more", x + pad, y + pad + len(lines) * line_height,
                       f"… {hidden} more lines", size, T.TEXT_FAINT, "mono")
@@ -181,6 +233,7 @@ def _checkpoint_row(f: Frame, n: int, item: dict, x, y, width) -> int:
 def _item_user(f: Frame, n: int, item: dict, x, y, width) -> int:
     pad, size, small = f.px(T.CARD_PAD), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
     mark = len(f.prims)
+    src = f.copy_part(n, item["text"], "user")
     text_width = width - 2 * pad
     deliveries = list(item.get("helper_deliveries") or [])
     if item.get("queued"):  # Helper delivery and the main agent's pending reply are separate.
@@ -188,7 +241,7 @@ def _item_user(f: Frame, n: int, item: dict, x, y, width) -> int:
         tag_width = round(f.measure("ui", small, tag))
         f.text(f"item{n}.queued", x + width - pad - tag_width, y + pad, tag, small, T.TEXT_FAINT)
         text_width -= tag_width + f.px(8)
-    text_height = f.paragraph(f"item{n}.user", x + pad, y + pad, text_width, item["text"], size, T.TEXT) \
+    text_height = f.paragraph(f"item{n}.user", x + pad, y + pad, text_width, item["text"], size, T.TEXT, src=src) \
         if item["text"] else 0
     if item.get("images"):
         text_height += f.px(4) if item["text"] else 0
@@ -220,6 +273,7 @@ def _item_user(f: Frame, n: int, item: dict, x, y, width) -> int:
             text_height += action_height
     if item.get("checkpoint"):
         text_height += _checkpoint_row(f, n, item, x + pad, y + pad + text_height, width - 2 * pad)
+    text_height += _message_copy(f, n, x + pad, y + pad + text_height, width - 2 * pad)
     height = text_height + 2 * pad
     f.prims.insert(mark, {"t": "rect", "id": f"item{n}.user.card", "x": x, "y": y, "w": width, "h": height,
                           "color": T.CARD, "radius": f.px(T.RADIUS), "border": 1,
@@ -286,12 +340,13 @@ def _item_assistant(f: Frame, n: int, item: dict, x, y, width) -> int:
         verification = ""
     segments = split_markdown(text)
     for k, (kind, body) in enumerate(segments):
+        src = f.copy_part(n, body, "assistant")
         if k:
             cursor += f.px(6)
         if kind == "code":
-            cursor += f.code_block(f"item{n}.code{k}", x, cursor, width, body)
+            cursor += f.code_block(f"item{n}.code{k}", x, cursor, width, body, src=src)
         else:
-            cursor += f.paragraph(f"item{n}.p{k}", x, cursor, width, body, size, T.TEXT)
+            cursor += f.paragraph(f"item{n}.p{k}", x, cursor, width, body, size, T.TEXT, src=src)
     if verification:
         from .. import orchestrator, rig_gate
         small, expanded = f.px(T.FONT_SIZE_SMALL), item.get("expanded", False)
@@ -302,14 +357,16 @@ def _item_assistant(f: Frame, n: int, item: dict, x, y, width) -> int:
         # The model's summary leads; Loopcut's checks fold to one line under it that opens them (0.2.19 gate: the
         # final reply read as a checklist).
         folded = f"{orchestrator.checked_line(verification, alone=not segments)} {'▾' if expanded else '▸'}"
-        height = f.paragraph(f"item{n}.verification.summary", x, cursor, width, folded, small, T.TEXT_MUTED)
+        src = f.copy_part(n, folded, "assistant")
+        height = f.paragraph(f"item{n}.verification.summary", x, cursor, width, folded, small, T.TEXT_MUTED, src=src)
         f.hit(f"item{n}.verification.toggle", x, cursor, width, height, ("toggle", n),
               "Hide what Loopcut checked" if expanded else "Show what Loopcut checked on the scene")
         cursor += height
         if expanded:  # for_user again: a reply saved before 0.2.20 holds the model's wording.
+            src = f.copy_part(n, orchestrator.for_user(verification), "assistant")
             cursor += f.px(4)
             cursor += f.paragraph(f"item{n}.verification", x, cursor, width, orchestrator.for_user(verification),
-                                  small, T.TEXT_MUTED)
+                                  small, T.TEXT_MUTED, src=src)
         found = rig_gate.footer_action(item, f.ui.get("watch_rigs") or ())
         if found:  # R7-D2: "Watch it" runs character_rig show, free; only an allowlisted op on a Loopcut rig.
             cursor += f.px(6)
@@ -326,7 +383,20 @@ def _item_assistant(f: Frame, n: int, item: dict, x, y, width) -> int:
             f.text(f"item{n}.credits.check", x, cursor, "✓", small, T.TEXT_MUTED if item.get("turn_stopped") else T.OK)
             f.text(f"item{n}.credits", x + f.px(16), cursor, line, small, T.TEXT_MUTED)
             cursor += f.line_height(small)
+    cursor += _message_copy(f, n, x, cursor, width)
     return cursor - y
+
+
+def _message_copy(f: Frame, n, x, y, width) -> int:
+    if not f.transcript.get(n, {}).get("text"):
+        return 0
+    small, gap = f.px(T.FONT_SIZE_SMALL), f.px(4)
+    label_width = f.measure("ui", small, "Copy")
+    left = x + width - label_width - gap
+    f.text(f"item{n}.copy", left, y + gap, "Copy", small, T.TEXT_MUTED)
+    f.hit(f"item{n}.copy", left - gap, y, label_width + 2 * gap,
+          f.line_height(small) + 2 * gap, ("copy_message", n), "Copy message")
+    return f.line_height(small) + 2 * gap
 
 
 def _reference_rows(f: Frame, n, references, x, y, width) -> int:
@@ -449,32 +519,36 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
     inner_x, inner_w, cursor = x + pad, width - 2 * pad, y + f.px(7)
     f.text(f"item{n}.tool.glyph", inner_x, cursor, glyph, size, glyph_color)
     label_x = inner_x + f.px(18)
-    summary = "Rig your character" if rig else item["summary"] or item["name"]
+    name = tool_label(item)  # Never the tool's id: that is the model's.
+    summary = "Rig your character" if rig else item["summary"] or name or "A step"
     if awaiting and item.get("ask_title"):  # What the ask is about, in place of the tool (spending.ask_title).
         summary = item["ask_title"]
     if plan_repair:
-        summary = {"resolved": "Helper started", "retried": "Adjusted the helper plan and retried",
-                   "adjusting": "Adjusting the helper plan…", "capped": "Helper limit for this turn"}.get(
-            plan_repair, "Helper plan needs adjustment")
-    show_name = not rig and expanded and item["name"].strip().casefold() != summary.strip().casefold()
+        summary = {"resolved": "Helper started", "retried": "Changed the plan and tried again",
+                   "adjusting": "Changing the plan…", "capped": "Helper limit for this turn"}.get(
+            plan_repair, "The plan needs changes")
+    show_name = bool(name) and not rig and expanded and name.strip().casefold() != summary.strip().casefold()
     if awaiting:
         label_width = inner_w - f.px(18)
-        cursor += f.paragraph(f"item{n}.tool.summary", label_x, cursor, label_width, summary, size, T.TEXT)
+        src = f.copy_part(n, summary, "tool")
+        cursor += f.paragraph(f"item{n}.tool.summary", label_x, cursor, label_width, summary, size, T.TEXT, src=src)
         if show_name:
             cursor += f.paragraph(f"item{n}.tool.name", label_x, cursor, label_width,
-                                  item["name"], small, T.TEXT_FAINT)
+                                  name, small, T.TEXT_FAINT)
     else:
-        name_width = round(f.measure("ui", small, item["name"])) if show_name else 0
+        name_width = round(f.measure("ui", small, name)) if show_name else 0
         detail_width = name_width + pad + f.px(10) if show_name else 0
         running = _running_time(item, f.ui.get("now"))
         running_width = round(f.measure("ui", small, running)) + f.px(10) if running else 0
         label = wrap(summary, "ui", size, inner_w - f.px(18) - detail_width - running_width, f.measure)[0][1].rstrip()
         if len(label) < len(summary.strip()):
             label += "…"
-        f.text(f"item{n}.tool.summary", label_x, cursor, label, size, T.TEXT_MUTED)
+        src = f.copy_part(n, label, "tool")
+        f.text(f"item{n}.tool.summary", label_x, cursor, label, size, T.TEXT_MUTED,
+               src=(*src, src[1] + len(label)))
         if show_name:
             f.text(f"item{n}.tool.name", x + width - pad - name_width, cursor + (row - f.line_height(small)) // 2,
-                   item["name"], small, T.TEXT_FAINT)
+                   name, small, T.TEXT_FAINT)
         if running:
             f.text(f"item{n}.tool.running", x + width - pad - detail_width - running_width + f.px(10),
                    cursor + (row - f.line_height(small)) // 2, running, small, T.TEXT_MUTED)
@@ -534,6 +608,9 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
         from . import render_choice
         local = render_choice.local_progress(f, n, item, inner_x, cursor, inner_w)
         cursor += local
+    progress = _progress_line(item) if status == "running" and not rig and not local else ""
+    if progress:  # A cloud job's own progress while it runs, and how long such a call usually takes (cloud.USUALLY).
+        cursor += f.paragraph(f"item{n}.tool.progress", inner_x, cursor, inner_w, progress, small, T.TEXT_MUTED)
     if item.get("outcome") and not rig and not local:  # A cloud report's line (cloud_jobs.report_line); its JSON is the output's.
         cursor += f.paragraph(f"item{n}.tool.outcome", inner_x, cursor, inner_w, item["outcome"], small, T.TEXT_MUTED)
 
@@ -646,7 +723,7 @@ def _item_tool(f: Frame, n: int, item: dict, x, y, width) -> int:
         always_x = inner_x + run_width + reject_width + f.px(16)
         # A render or bake has its own "always", apart from the one for ordinary steps.
         always = "Always allow renders" if item.get("heavy") else "Always allow"
-        if not item.get("paid_approval") and not item.get("install") and always_x + f.measure("ui", small, always) + f.px(20) <= inner_x + inner_w:
+        if not item.get("paid_approval") and not item.get("install") and not item.get("always_ask") and always_x + f.measure("ui", small, always) + f.px(20) <= inner_x + inner_w:
             f.button(f"item{n}.tool.always", always_x, cursor, always, T.BUTTON_GHOST, T.TEXT_MUTED,
                      ("approve_always", n))
             f.hits[-1]["tip"] = (
@@ -675,7 +752,9 @@ _AFTER_RETRY = frozenset({"changes", "merge", "notice"})  # The turn's end cards
 def _item_error(f: Frame, n: int, item: dict, x, y, width) -> int:
     pad, size = f.px(T.CARD_PAD), f.px(T.FONT_SIZE)
     mark = len(f.prims)
-    height = f.paragraph(f"item{n}.error", x + pad, y + pad, width - 2 * pad, item["text"], size, T.ERROR) + 2 * pad
+    src = f.copy_part(n, item["text"], "error")
+    height = f.paragraph(f"item{n}.error", x + pad, y + pad, width - 2 * pad, item["text"], size, T.ERROR,
+                         src=src) + 2 * pad
     # A dropped connection, the gateway's vendor failing: Try again sends the same request (agent.resume), while
     # only cards about the stopped turn follow (what it changed, a notice), so never on an older error, nor where
     # resume would refuse (the history ends on a reply: a Codex turn stopped after its last message).
@@ -759,7 +838,19 @@ def _item_notice(f: Frame, n: int, item: dict, x, y, width) -> int:
     pad, small = f.px(T.CARD_PAD), f.px(T.FONT_SIZE_SMALL)
     mark = len(f.prims)
     cursor = y + pad
-    cursor += f.paragraph(f"item{n}.notice", x + pad, cursor, width - 2 * pad, item["text"], small, T.TEXT_MUTED)
+    src = f.copy_part(n, item["text"], "notice")
+    cursor += f.paragraph(f"item{n}.notice", x + pad, cursor, width - 2 * pad, item["text"], small, T.TEXT_MUTED,
+                          src=src)
+    if item.get("storage"):
+        cursor += _button_row(f, x + pad, cursor + f.px(8), width - 2 * pad, [
+            (f"item{n}.storage.clean", "Clean up", T.BUTTON_GHOST, T.TEXT, ("storage_cleanup", None)),
+            (f"item{n}.storage.prefs", "Storage preferences", T.BUTTON_GHOST, T.TEXT, ("storage_preferences", None)),
+            (f"item{n}.storage.continue", "Continue without checkpoints", T.BUTTON_GHOST, T.TEXT, ("storage_continue", None))]) + f.px(8)
+    if item.get("saved_path"):
+        path = item["saved_path"]
+        cursor += _button_row(f, x + pad, cursor + f.px(8), width - 2 * pad, [
+            (f"item{n}.saved.open", "Open", T.BUTTON_GHOST, T.TEXT, ("reference_open", path)),
+            (f"item{n}.saved.folder", "Show in folder", T.BUTTON_GHOST, T.TEXT, ("reference_folder", path))]) + f.px(8)
     if item["checkpoint"] and f.checkpoints.get(item["checkpoint"], "ok") == "ok":
         cursor += f.px(8)
         f.button(f"item{n}.notice.action", x + pad, cursor, item["action_label"], T.BUTTON_GHOST, T.TEXT,
@@ -838,12 +929,23 @@ def _item_offer(f: Frame, n: int, item: dict, x, y, width) -> int:
     return height
 
 
+def _progress_line(item: dict) -> str:
+    """A running cloud call's line: its job's "45% · Generating model" (cloud._card_progress) and how long such a call
+    usually takes (cloud.usually), either alone; "" with neither."""
+    progress = item.get("progress") if isinstance(item.get("progress"), dict) else {}
+    usual = item.get("usually") if isinstance(item.get("usually"), str) else ""
+    if type(progress.get("pct")) is not int:
+        return usual[:1].upper() + usual[1:]
+    message = str(progress.get("message") or "").strip().rstrip(".…")
+    return " · ".join(part for part in (f"{progress['pct']}%", message, usual) if part)
+
+
 def _to_3d_buttons(f: Frame, n: int, item: dict, x, y, width) -> int:
     """A made picture, small, and its Turn it into 3D button (agent.turn_into_3d), priced from the catalog: the
     click approves that price, and passes it. Turning into 3D… while its call runs, Turned into 3D ✓ once done, and
     nothing while a turn runs. After Make it again, each picture shows which one its button converts. Returns the
     height."""
-    offer, cursor = item["to_3d"], y
+    offer, cursor, small = item["to_3d"], y, f.px(T.FONT_SIZE_SMALL)
     pictures, credits = offer["pictures"], offer.get("credits")
     for k, picture in enumerate(pictures):
         what = "it" if len(pictures) == 1 else f"picture {k + 1}"
@@ -864,6 +966,12 @@ def _to_3d_buttons(f: Frame, n: int, item: dict, x, y, width) -> int:
             price = f" · about {credits:,g} credits" if credits else ""
             button = (id, f"Turn {what} into 3D{price}", T.BUTTON, T.BUTTON_TEXT, ("to_3d", (n, k, credits)))
         cursor += _button_row(f, x, cursor, width, [button])
+        if state == "running":  # Its click's card is further down, often out of view: its progress here too.
+            click = [f.session.get("id"), picture.get("job") or picture.get("image")]
+            card = next((i for i in reversed(f.session.get("items", ())) if i.get("click") == click), None)
+            line = _progress_line(card) if card is not None and card.get("status") == "running" else ""
+            if line:
+                cursor += f.paragraph(f"{id}.progress", x, cursor, width, line, small, T.TEXT_MUTED)
     return cursor - y
 
 
@@ -964,9 +1072,16 @@ def _limit_buttons(f: Frame, n: int | str | None, item: dict, id: str) -> list:
         buttons.append((id + ".upgrade", upgrade.get("label") or "Upgrade", T.BUTTON, T.BUTTON_TEXT,
                         ("limit_upgrade", n)))
     if item["reason"] in HOSTED_LIMITS and status == "":
-        buttons.append((id + ".chatgpt", "Switch to ChatGPT plan", T.BUTTON_GHOST, T.TEXT, ("limit_chatgpt", n))
+        label = "Switch to ChatGPT plan"
+        if item.get("chatgpt_limit"):
+            label = ("Cancel ChatGPT retry" if nudges.chatgpt_reset_pending(item) else
+                     "Continue on ChatGPT at reset" if nudges.chatgpt_reset_wait(item) else "Continue on ChatGPT")
+        buttons.append((id + ".chatgpt", label, T.BUTTON_GHOST, T.TEXT, ("limit_chatgpt", n))
                        if f.ui.get("chatgpt_plan") else
                        (id + ".chatgpt", "Sign in with ChatGPT", T.BUTTON_GHOST, T.TEXT, ("sign_in", "chatgpt")))
+        if item.get("chatgpt_limit"):
+            buttons.append((id + ".usage", "ChatGPT usage ↗", T.BUTTON_GHOST, T.TEXT,
+                            ("open_web", chatgpt_auth.USAGE_URL)))
         buttons.append((id + ".key", "Use my own API key", T.BUTTON_GHOST, T.TEXT, ("own_key", None)))
     if item["reason"] == "model_not_in_plan":
         buttons.append((id + ".fast", "Use Fast instead", T.BUTTON_GHOST, T.TEXT, ("limit_fast", n)))
@@ -993,12 +1108,14 @@ def _item_limit(f: Frame, n: int, item: dict, x, y, width) -> int:
         status, upgrade = "", None  # Saved cards cannot offer a purchase while billing is closed.
         item = state.item_limit(item["text"], item["reason"], item["plan"], item["resets_at"], None)
     if status == "done":
-        title, body, color = "Upgraded", item["text"], T.OK
+        title, body, color = ("Continuing on ChatGPT" if item.get("continued_on") == "chatgpt" else "Upgraded"), item["text"], T.OK
     elif status == "waiting":
         title, color = "Waiting for your upgrade", T.WARN
         body = "Finish in the browser. Loopcut refreshes your plan and available models when it is active."
     else:
         title, color = _LIMIT_TITLES.get(item["reason"], "Allowance used"), T.WARN
+        if item.get("chatgpt_limit"):
+            title = "ChatGPT and Loopcut limits reached"
         if not config.billing_open() and item["reason"] == "model_not_in_plan":
             title = "Model unavailable"
         body = item["text"] + (f"\n{upgrade['note']}" if upgrade and upgrade.get("note") else "")
@@ -1007,7 +1124,13 @@ def _item_limit(f: Frame, n: int, item: dict, x, y, width) -> int:
             body = body.replace(item["resets_at"], reset)
             if reset not in body:
                 body += f"\nResets {reset}."
-        if item["reason"] in HOSTED_LIMITS:  # M7: a ChatGPT plan can carry on where Loopcut's allowance stopped.
+        if item.get("chatgpt_limit"):
+            reset = (item["chatgpt_limit"] or {}).get("resets_at")
+            body += (f"\nChatGPT resets {state.reset_label(reset, now=f.ui.get('now'))}. "
+                     "Choose Continue on ChatGPT at reset to switch back and retry then while this chat stays open, "
+                     "or upgrade Loopcut to continue."
+                     if reset else "\nCheck ChatGPT usage for its reset time, or upgrade Loopcut to continue.")
+        elif item["reason"] in HOSTED_LIMITS:  # M7: a ChatGPT plan can carry on where Loopcut's allowance stopped.
             if f.ui.get("chatgpt_plan"):
                 body += "\nYour ChatGPT plan can carry on now."
             elif item["reason"] != "free_daily_limit":  # The server's free_daily_limit text already says it.
@@ -1065,6 +1188,8 @@ def _own_ai(f: Frame) -> bool:
 
 def _offer_card(f: Frame, item: dict) -> str:
     """Which new card a limit item gets: "credits" (out of credits), "offer" (variant B), or "" (0.2.13's card)."""
+    if item.get("chatgpt_limit"):
+        return ""  # Both recovery choices belong on the same saved card.
     if item.get("reason") == chat_credits.CODE:
         return "credits"
     upgrade = item.get("upgrade")
@@ -1592,7 +1717,7 @@ def _item_wave(f: Frame, n: int, item: dict, x, y, width) -> int:
     pad, size, small = f.px(T.CARD_PAD), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
     mark = len(f.prims)
     inner_x, inner_w, cursor = x + pad, width - 2 * pad, y + pad
-    f.text(f"item{n}.wave.title", inner_x, cursor, _ellipsize(f, item["text"], size, inner_w), size, T.TEXT)
+    f.text(f"item{n}.wave.title", inner_x, cursor, _ellipsize(f, wave_title(item), size, inner_w), size, T.TEXT)
     cursor += f.line_height(size) + f.px(4)
     row_height, small_height = f.line_height(size), f.line_height(small)
     for k, row in enumerate(item.get("rows", [])):
@@ -1950,7 +2075,9 @@ def _code_repairs(items: list, busy: bool, active_turn_id=None) -> dict:
                 or item.get("status") != "failed" or item.get("output", "").startswith("Not run.")):
             continue
         if busy and turns[n] in {active, ("legacy", legacy)}:
-            repairs[n] = "correcting"
+            # Correcting only until a later step of the turn has run: then it carried on (rel020-pro: "Loopcut is
+            # correcting it" stayed on a step fixed minutes before).
+            repairs[n] = "continued" if last_step.get(turns[n], n) > n else "correcting"
         elif turns[n] not in errors and last_step.get(turns[n]) != n:
             repairs[n] = "continued"
     return repairs
@@ -1958,11 +2085,13 @@ def _code_repairs(items: list, busy: bool, active_turn_id=None) -> dict:
 
 def _chat(f: Frame, session: dict, top: int, bottom: int) -> float:
     """Lays the conversation out at y=0, then slides it into the viewport. Returns max scroll."""
+    from .. import orchestrator
     pad, gap = f.px(T.PAD), f.px(T.GAP)
+    f.chat_bounds = (top, bottom)
     x, width = pad, f.width - 2 * pad
     items = list(session["items"])  # Snapshot: the worker thread appends while we draw.
     active_turn = getattr(session.get("turn"), "plan_turn", "") if session.get("busy") else ""
-    repairs = _plan_repairs(items, active_turn)
+    repairs = _plan_repairs(items, "" if active_turn and orchestrator.planning_stopped(session) else active_turn)
     code_repairs = _code_repairs(items, session.get("busy", False), session.get("active_turn_id"))
     first_prim, first_hit, cursor = len(f.prims), len(f.hits), 0
 
@@ -2039,6 +2168,24 @@ def _chat(f: Frame, session: dict, top: int, bottom: int) -> float:
     # Cull what is scrolled away; the header and input paint over any partial overlap.
     f.prims[first_prim:] = [p for p in f.prims[first_prim:] if p["y"] + p["h"] > top and p["y"] < bottom]
     f.hits[first_hit:] = [h for h in f.hits[first_hit:] if h["y"] + h["h"] > top and h["y"] < bottom]
+    selected = transcript_range({"transcript": f.transcript}, session)
+    if selected:
+        highlighted = []
+        for p in f.prims[first_prim:]:
+            if "src" in p:
+                item, start, end = p["src"]
+                a, b = selected
+                lo = max(start, a[1]) if item == a[0] else start
+                hi = min(end, b[1]) if item == b[0] else end
+                if a[0] <= item <= b[0] and hi > lo:
+                    text = f.transcript[item]["text"][start:end]
+                    left = f.measure(p["font"], p["size"], text[:lo - start])
+                    right = f.measure(p["font"], p["size"], text[:hi - start])
+                    highlighted.append({"t": "rect", "id": f"chat.selection.{p['id']}", "x": p["x"] + left,
+                                        "y": p["y"], "w": right - left, "h": p["h"], "color": T.SELECTION,
+                                        "radius": 0, "border": 0, "border_color": T.NONE})
+            highlighted.append(p)
+        f.prims[first_prim:] = highlighted
     return max_scroll
 
 
@@ -2053,14 +2200,26 @@ def relative_time(then: float, now: float) -> str:
 def _history(f: Frame, session: dict, ui: dict, top: int, bottom: int) -> None:
     pad, size, small = f.px(T.PAD), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
     x, width, cursor = pad, f.width - 2 * pad, top + pad
-    f.text("history.heading", x, cursor, "Conversations for this file", small, T.TEXT_MUTED)
+    all_chats = ui.get("history_all", True)
+    f.text("history.heading", x, cursor, "All conversations" if all_chats else "Conversations for this file", small, T.TEXT_MUTED)
     cursor += f.line_height(small) + f.px(8)
+    f.button("history.scope", x, cursor, "This file" if all_chats else "All conversations", T.BUTTON_GHOST, T.TEXT,
+             ("history_scope", not all_chats))
+    cursor += f.px(32)
     rows = ui.get("history") or []
     if not rows:
         f.text("history.empty", x, cursor, "Nothing saved yet.", size, T.TEXT_FAINT)
     card_pad = f.px(T.CARD_PAD)
     row_height = f.line_height(size) + f.line_height(small) + 2 * card_pad
-    for n, row in enumerate(rows):
+    page_size = max(1, int((bottom - cursor - f.px(38)) // (row_height + f.px(8))))
+    pages = max(1, (len(rows) + page_size - 1) // page_size)
+    page = min(max(0, ui.get("history_page", 0)), pages - 1)
+    if pages > 1:
+        f.button("history.prev", x, cursor, "Previous", T.BUTTON_GHOST, T.TEXT, ("history_page", max(0, page - 1)))
+        f.button("history.next", x + f.px(100), cursor, "Next", T.BUTTON_GHOST, T.TEXT,
+                 ("history_page", min(pages - 1, page + 1)))
+        cursor += f.px(32)
+    for n, row in enumerate(rows[page * page_size:(page + 1) * page_size]):
         if cursor + row_height > bottom:
             break
         current = row["id"] == session["id"]
@@ -2664,7 +2823,7 @@ def _input(f: Frame, session: dict, top: int, model: str) -> None:
     size, lines, visible = _input_lines(f, session, inner_w)
     line_height = f.line_height(size)
     small = f.px(T.FONT_SIZE_SMALL)
-    focused, busy = session["focused"], session["busy"]
+    focused, busy = session["focused"] and session.get("transcript_cursor") is None, session["busy"]
     hover = f.ui.get("hover")
 
     f.rect("input.zone", 0, top, f.width, f.height - top, T.BG)
@@ -2768,6 +2927,7 @@ HEADER_BUTTONS = (  # Right to left: id, glyph, tooltip.
     ("header.history", "↺", "History"),
     ("header.new", "+", "New chat"),
     ("header.jobs", "▤", "Background jobs"),
+    ("header.copy", "⋯", "Conversation menu"),
 )
 
 
@@ -2782,7 +2942,9 @@ def _header(f: Frame, session: dict, view: str = "chat") -> int:
     f.text("header.title", title_x, y, "Loopcut", size, T.TEXT)
     title_w = round(f.measure("ui", size, "Loopcut"))
     version = config.version_label()
-    f.hit("header.title", title_x, 0, title_w, height, ("noop", None), tip=f"Loopcut {version}")
+    compact = f.width < f.px(320)
+    f.hit("header.title", title_x, 0, title_w, height, ("copy_menu" if compact else "noop", None),
+          tip=f"Loopcut {version}" + (" · Conversation menu" if compact else ""))
     crumb = {"history": "History", "jobs": "Jobs", "vote": "What's next"}.get(view)
     if crumb and f.width > f.px(370):
         f.text("header.crumb", title_x + round(f.measure("ui", size, "Loopcut")) + f.px(8), y, "›  " + crumb, size,
@@ -2791,11 +2953,15 @@ def _header(f: Frame, session: dict, view: str = "chat") -> int:
     hover, box, gap = f.ui.get("hover"), f.px(24), f.px(2)
     right = f.width - pad
     for id, glyph, tip in HEADER_BUTTONS:
+        if id == "header.copy" and compact:
+            continue
         bx, by = right - box, (height - box) // 2
         if id == "header.history":
             action, tip = (("history_close", None), "Back to chat") if view == "history" else (("history_open", None), tip)
         elif id == "header.jobs":
             action, tip = (("history_close", None), "Back to chat") if view == "jobs" else (("jobs_open", None), tip)
+        elif id == "header.copy":
+            action = ("copy_menu", None)
         else:
             action = {"header.close": ("close_panel", None), "header.settings": ("service_settings", None),
                       "header.new": ("new_chat", None)}[id]
@@ -2812,6 +2978,18 @@ def _header(f: Frame, session: dict, view: str = "chat") -> int:
     if view == "chat" and version_x + f.measure("ui", small, version) <= right:
         f.text("header.version", version_x, (height - f.line_height(small)) // 2, version, small, T.TEXT_MUTED)
     return height
+
+
+def _copy_menu(f: Frame, top: int) -> None:
+    if not f.ui.get("copy_menu"):
+        return
+    pad, height = f.px(8), f.px(32)
+    label, size = "Copy conversation", f.px(T.FONT_SIZE_SMALL)
+    width = min(f.width, f.measure("ui", size, label) + 2 * pad)
+    x = f.width - width
+    f.rect("copy_menu.bg", x, top, width, height, T.CARD, f.px(T.RADIUS_SMALL), 1, T.CARD_BORDER)
+    f.text("copy_menu.label", x + pad, top + (height - f.line_height(size)) // 2, label, size, T.TEXT)
+    f.hit("copy_menu.conversation", x, top, width, height, ("copy_conversation", None))
 
 
 def _overlaps(a: dict, b: dict) -> bool:
@@ -3050,7 +3228,7 @@ def _jobs(f: Frame, top, bottom):
         f.text(f"job.{id}.title", pad, cursor, title, small, T.TEXT)
         detail = f"{row['camera']} · {row['width']}×{row['height']} · {row['samples']} samples · {row['budget_seconds']}s/attempt"
         f.text(f"job.{id}.detail", pad, cursor + f.px(22), _ellipsize(f, detail, small, f.width - pad * 2), small, T.TEXT_MUTED)
-        note = row.get("error") or f"Saved revision {row.get('scene_revision', '')[:12]} · {id[:8]}"
+        note = row.get("error") or JOB_SAVED  # Its revision and id stay the job's (Output opens its folder).
         f.text(f"job.{id}.note", pad, cursor + f.px(42), _ellipsize(f, note, small, f.width - pad * 2), small, T.TEXT_FAINT)
         x = pad
         buttons = [("Cancel", "job_cancel")] if row["state"] in {"queued", "running", "cancelling"} else [("Resume", "job_resume")]
@@ -3096,6 +3274,16 @@ def build(session: dict, width: int, height: int, scale: float, measure, model: 
     input_top = height - (f.px(VOTE_FOOTER_HEIGHT) if view == "vote" else input_height(f, session))
     header_bottom = f.px(T.HEADER_HEIGHT)
     top = header_bottom + _update_banner_height(f)
+    recovery = ui.get("recovery_conversation")
+    if recovery and view == "chat" and recovery["id"] != session["id"]:
+        pad, small = f.px(T.PAD), f.px(T.FONT_SIZE_SMALL)
+        top += f.paragraph("recovery.text", pad, top, width - 2 * pad,
+                           "Your interrupted conversation is available.", small, T.TEXT_MUTED) + f.px(4)
+        f.button("recovery.open", pad, top, "Reopen conversation", T.BUTTON_GHOST, T.TEXT,
+                 ("open_conversation", recovery["id"]))
+        f.button("recovery.dismiss", width - pad - f.px(72), top, "Dismiss", T.BUTTON_GHOST, T.TEXT_MUTED,
+                 ("recovery_dismiss", None))
+        top += f.px(32)
     if view == "jobs":
         max_scroll = 0.0
         _jobs(f, top, input_top)
@@ -3113,9 +3301,66 @@ def build(session: dict, width: int, height: int, scale: float, measure, model: 
     else:
         _input(f, session, input_top, model)
         _popup(f, header_bottom)
+    _copy_menu(f, header_bottom)
     _tooltip(f)
     return {"width": width, "height": height, "scale": scale, "max_scroll": max_scroll,
-            "prims": f.prims, "hits": f.hits, "input": f.input, "cards": f.cards}
+            "prims": f.prims, "hits": f.hits, "input": f.input, "cards": f.cards,
+            "transcript": f.transcript, "chat_bounds": getattr(f, "chat_bounds", None)}
+
+
+def copy_text(display: dict, item: int | None = None) -> str:
+    """Copy registered display text; never inspect the underlying item or model messages."""
+    transcript = display.get("transcript", {})
+    if item is not None:
+        return transcript.get(item, {}).get("text", "")
+    labels = {"user": "You: ", "assistant": "Loopcut: "}
+    return "\n\n".join(labels.get(entry["kind"], "") + entry["text"]
+                       for entry in transcript.values() if entry["text"])
+
+
+def transcript_range(display: dict, session: dict):
+    points = [session.get("transcript_anchor"), session.get("transcript_cursor")]
+    transcript = display.get("transcript", {})
+    if any(point is None or point[0] not in transcript for point in points):
+        return None
+    points = [(n, max(0, min(offset, len(transcript[n]["text"])))) for n, offset in points]
+    return tuple(sorted(points)) if points[0] != points[1] else None
+
+
+def selected_transcript(display: dict, session: dict) -> str:
+    selected = transcript_range(display, session)
+    if not selected:
+        return ""
+    a, b = selected
+    return "\n\n".join(entry["text"][a[1] if n == a[0] else 0:b[1] if n == b[0] else len(entry["text"])]
+                       for n, entry in display["transcript"].items() if a[0] <= n <= b[0])
+
+
+def transcript_index(display: dict, x: float, y_top: float, measure, clamp=False):
+    """Map a drawn glyph to an item offset; dragging may clamp to the nearest visible line."""
+    bounds = display.get("chat_bounds")
+    if not bounds or (not clamp and not bounds[0] <= y_top < bounds[1]):
+        return None
+    lines = [p for p in display["prims"] if "src" in p]
+    if not clamp:
+        lines = [p for p in lines if p["y"] <= y_top < p["y"] + p["h"]
+                 and p["x"] <= x <= p["x"] + measure(p["font"], p["size"], p["text"])]
+    if not lines:
+        return None
+    line = min(lines, key=lambda p: abs(y_top - (p["y"] + p["h"] / 2)))
+    item, start, end = line["src"]
+    text = display["transcript"][item]["text"][start:end]
+    local_x = x - line["x"]
+    low, high = 0, len(text)
+    while low < high:
+        mid = (low + high) // 2
+        left = measure(line["font"], line["size"], text[:mid])
+        right = measure(line["font"], line["size"], text[:mid + 1])
+        if local_x < (left + right) / 2:
+            high = mid
+        else:
+            low = mid + 1
+    return item, start + low
 
 
 def hit_at(display: dict, x: float, y_top: float) -> dict | None:

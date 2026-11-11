@@ -837,10 +837,21 @@ def _held(ob) -> list[str]:
         targets = [getattr(item, p.identifier, None) for p in item.bl_rna.properties if p.type == "POINTER"]
         targets += [getattr(t, "target", None) for t in getattr(item, "targets", ())]  # Armature constraint.
         if isinstance(item, bpy.types.NodesModifier):
-            targets += [item[key] for key in item.keys()]  # Its inputs.
+            targets += _node_inputs(item)
         for target in dict.fromkeys(t for t in targets if kept(t)):
             held.append(f"{item.name} target {target.name}")
     return held
+
+
+def _node_inputs(modifier) -> list:
+    """A Geometry Nodes modifier's input values. Blender 5.2 keeps them as modifier.properties.inputs.<socket>.value
+    and refuses keys() on a modifier ("doesn't support IDProperties"), which failed every merge of a build with one
+    (an-room-b, 2026-11-01); earlier versions keep them as the modifier's ID properties."""
+    inputs = getattr(getattr(modifier, "properties", None), "inputs", None)
+    if inputs is None:
+        return [modifier[key] for key in modifier.keys()]
+    return [getattr(getattr(inputs, p.identifier, None), "value", None) for p in inputs.bl_rna.properties
+            if p.type == "POINTER" and p.identifier != "rna_type"]
 
 
 def _why_conflict(key: str, live, spawn: Spawn, uid2spawn: dict) -> dict:

@@ -161,9 +161,12 @@ def draw_area() -> None:
     from .. import cloud, cloud_account
     cloud.panel_seen()
     if not _runtime.get("first_panel_seen"):
-        from .. import telemetry
+        from .. import telemetry, conversations
         telemetry.first_use("panel_opened")
         _runtime["first_panel_seen"] = True
+        candidate = conversations.recovery_candidate()
+        if candidate and candidate["id"] != state.session()["id"]:
+            state.ui["recovery_conversation"] = candidate
     prefs = settings.preferences()
     session = state.session()
     draw.retain_images(_image_paths(session))
@@ -408,6 +411,7 @@ def _filter_picker() -> None:
 def _close_popups() -> None:
     state.ui["picker"], state.ui["model_menu"] = None, False
     state.ui["service_settings"] = False
+    state.ui["copy_menu"] = False
 
 
 def _pick_from_picker(session: dict, index: int) -> None:
@@ -481,14 +485,44 @@ def _scroll_to_waiting(session: dict, area_pointer) -> None:
     session["scroll"] = entry["scroll"] if entry else 0.0
 
 
-def _do_action(session: dict, action, drawn: tuple | None = None) -> None:
+def _windows_has_app(suffix: str) -> bool:
+    """Whether Windows has an app registered to open files with this suffix. Without one, Windows shows its
+    "pick an app" dialog instead of opening the file. Other systems, and any lookup failure, count as yes."""
+    if sys.platform != "win32" or not suffix:
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+        query = ctypes.windll.shlwapi.AssocQueryStringW
+        query.restype = ctypes.c_long
+        query.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPWSTR,
+                          ctypes.POINTER(wintypes.DWORD)]
+        size = wintypes.DWORD(0)
+        # ASSOCF_INIT_IGNOREUNKNOWN (0x400) fails for unregistered types; ASSOCSTR_EXECUTABLE (2) asks for the app.
+        # Only HRESULT_FROM_WIN32(ERROR_NO_ASSOCIATION), 0x80070483, means there is none; other failures (a handler
+        # whose executable can't be resolved, such as a packaged app) still open the file.
+        return query(0x400, 2, suffix, None, None, ctypes.byref(size)) != -2147023741
+    except (AttributeError, OSError, ValueError):
+        return True
+
+
+def _do_action(session: dict, action, drawn: tuple | None = None, display: dict | None = None) -> None:
     """drawn: the clicked hit's card (layout._chat), for a waiting card's buttons (agent.decide)."""
     kind, index = action
     if kind in ("limit_upgrade", "limit_chatgpt", "own_key") or (kind == "sign_in" and index == "chatgpt"):
         item = (state.ui.get("allowance_notice") or {}).get("item")
         if item:  # A way on was picked: the pop-up, if one is open, steps aside for it.
             item["popup_closed"] = True
-    if kind == "reference_url":
+    if kind == "copy_menu":
+        opened = state.ui.get("copy_menu", False)
+        _close_popups()
+        state.ui["copy_menu"] = not opened
+    elif kind in {"copy_message", "copy_conversation"}:
+        text = layout.copy_text(display or {}, index if kind == "copy_message" else None)
+        if text:
+            bpy.context.window_manager.clipboard = text
+        _close_popups()
+    elif kind == "reference_url":
         account.open_browser(index)
     elif kind == "preview_open":
         path, title = index
@@ -513,19 +547,24 @@ def _do_action(session: dict, action, drawn: tuple | None = None) -> None:
             if not target.exists():
                 error = f"Could not open {target.name or target}: the file is no longer at {target}."
             else:
+                no_app = kind == "reference_open" and target.is_file() and not _windows_has_app(target.suffix)
                 if kind == "reference_folder" and not target.is_dir():
                     target = target.parent
-                if "FINISHED" not in bpy.ops.wm.path_open(filepath=str(target)):
+                # With no app for the type, Windows' "pick an app" hand-off can hold Blender until it is
+                # answered, so open the file's folder instead.
+                opened = target.parent if no_app else target
+                if "FINISHED" not in bpy.ops.wm.path_open(filepath=str(opened)):
                     error = f"Could not open {target.name or target}: Blender could not hand it to another app."
                 else:
                     app = "your default app"
                     if kind == "reference_folder":
                         app = "Finder" if sys.platform == "darwin" else "your file manager"
+                    text = f"Opened {target.name or target} in {app} (outside Blender)."
+                    if no_app:
+                        text = (f"No app is set to open {target.suffix.lower()} files, so Loopcut opened the folder "
+                                f"with {target.name} instead (outside Blender).")
                     # UI only: never saved with the conversation or sent to the model.
-                    state.ui["action_notice"] = {
-                        "text": f"Opened {target.name or target} in {app} (outside Blender).",
-                        "until": time.time() + 6.0,
-                    }
+                    state.ui["action_notice"] = {"text": text, "until": time.time() + 6.0}
         except (OSError, ValueError, RuntimeError) as ex:
             error = f"Could not open {index}: {ex}"
         finally:
@@ -626,10 +665,19 @@ def _do_action(session: dict, action, drawn: tuple | None = None) -> None:
     elif kind == "limit_chatgpt":
         prefs = settings.preferences()  # The user's own pick: their ChatGPT plan carries the turn on (M7).
         if prefs is not None and not session["busy"]:
+            if (_local_limit_action(session, index) and isinstance(index, int)
+                    and 0 <= index < len(session["items"]) and session["items"][index].get("chatgpt_limit")):
+                from .. import nudges
+                if nudges.watch_chatgpt_reset(session, session["items"][index]):
+                    return
             prefs.provider = "CHATGPT"
             state.clear_allowance_notice(invalidate=True)
             config_changed()
             if _local_limit_action(session, index) and state.can_resume(session):
+                if isinstance(index, int) and session["items"][index].get("chatgpt_limit"):
+                    session["items"][index]["status"] = "done"
+                    session["items"][index]["continued_on"] = "chatgpt"
+                    session["items"][index]["text"] = "Continuing this request on your ChatGPT plan."
                 agent.resume()
     elif kind == "cloud_dismiss":
         from .. import cloud
@@ -748,9 +796,29 @@ def _do_action(session: dict, action, drawn: tuple | None = None) -> None:
         _restore_later(session["items"][index]["checkpoint"], edit=bool(session.get("confirm_edit")))
     elif kind == "restore":
         _restore_later(index)
-    elif kind == "history_open":
-        state.ui["history"] = conversations.list_for(conversations.project_key(bpy.data.filepath))
+    elif kind in {"history_open", "history_scope"}:
+        all_chats = bool(index) if kind == "history_scope" else state.ui.get("history_all", True)
+        state.ui["history_all"] = all_chats
+        state.ui["history_page"] = 0
+        state.ui["history"] = conversations.list_for(None if all_chats else conversations.project_key(bpy.data.filepath))
         state.ui["view"] = "history"
+    elif kind == "history_page":
+        state.ui["history_page"] = index
+    elif kind == "storage_cleanup":
+        result = checkpoints.cleanup_storage(reclaim_bytes=checkpoints.FREE_RESERVE)
+        session["items"].append(state.item_notice(
+            f"Loopcut storage: {result['bytes'] / 1024**2:.1f} MB. "
+            f"Cleaned up {result['removed'] / 1024**2:.1f} MB. New checkpoints will be tried on your next request."))
+        session.pop("checkpoints_disabled", None)
+    elif kind == "storage_preferences":
+        _open_settings()
+    elif kind == "storage_continue":
+        session["checkpoints_disabled"] = True
+        session["pending_checkpoint"] = None
+        for item in session["items"]:
+            if item.get("storage"):
+                item.pop("storage")
+                item["text"] = "Continuing without new checkpoints for this conversation. Save your work regularly."
     elif kind == "history_close":
         state.ui["view"] = "chat"
     elif kind == "jobs_open":
@@ -781,7 +849,10 @@ def _do_action(session: dict, action, drawn: tuple | None = None) -> None:
         agent.turn_into_3d(*index, drawn=drawn)
     elif kind == "accept_quarantine":
         _accept_quarantine(session, session["items"][index])
+    elif kind == "recovery_dismiss":
+        state.ui.pop("recovery_conversation", None)
     elif kind == "open_conversation":
+        state.ui.pop("recovery_conversation", None)
         _switch(session, lambda: conversations.load(index))
     elif kind == "new_chat":
         def fresh():
@@ -1133,6 +1204,47 @@ def scroll(session: dict, event) -> None:
     session["scroll"] = max(session["scroll"], 0.0)  # Upper bound is clamped at draw time.
 
 
+def _paste_image_later(window, pointer: int, session: dict) -> None:
+    """Let the input modal finish before its area changes editor, then restore keyboard focus."""
+    def save_and_redraw():
+        current = state.session()
+        try:
+            conversations.save(current)
+        except Exception as ex:
+            current["items"].append(state.item_error(f"Could not save the image paste: {ex}"))
+        tag_redraw_all()
+
+    def paste():
+        attached = False
+        try:
+            if state.session() is not session:
+                raise RuntimeError("the conversation changed")
+            area = next((a for a in window.screen.areas if a.as_pointer() == pointer), None)
+            if area is None or not is_host(area):
+                raise RuntimeError("the Loopcut panel or screen changed")
+            from .. import attachments
+            with bpy.context.temp_override(window=window, area=area, region=_window_region(area)):
+                before = len(session["attachments"])
+                for problem in attachments.paste_image(session, bpy.context):
+                    session["items"].append(state.item_error(problem))
+                attached = len(session["attachments"]) > before
+            # Switching editors invalidates the old modal's region; obtain the restored region anew.
+            with bpy.context.temp_override(window=window, area=area, region=_window_region(area)):
+                if "RUNNING_MODAL" not in bpy.ops.loopcut.interact("INVOKE_DEFAULT", keyboard=True):
+                    raise RuntimeError("the input did not take keyboard focus")
+        except Exception as ex:
+            message = ("Image pasted, but keyboard focus could not be restored" if attached
+                       else "The clipboard image was not pasted")
+            state.session()["items"].append(state.item_error(f"{message}: {ex}. Click the input and try again, or attach an image file."))
+        save_and_redraw()
+        return None
+    try:
+        bpy.app.timers.register(paste, first_interval=0.0)
+    except Exception as ex:
+        state.session()["items"].append(state.item_error(f"The clipboard image was not pasted: {ex}. Try attaching an image file."))
+        save_and_redraw()
+
+
 class LOOPCUT_OT_interact(bpy.types.Operator):
     """Click and type in the Loopcut panel"""
     bl_idname = "loopcut.interact"
@@ -1150,11 +1262,13 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
             display = _displays.get(context.area.as_pointer())
             x, y, inside = _local(_window_region(context.area), event)
             action = layout.hit_test(display, x, y) if inside and display else None
-            if not action or action[0] != "focus":
+            text = layout.transcript_index(display, x, y, draw.measure) if inside and display and not action else None
+            if (not action or action[0] != "focus") and text is None:
                 return {"PASS_THROUGH"}
         session = state.session()
         self.area_pointer = context.area.as_pointer()
         self._selecting = False
+        self._transcript = False
         self._input_click = None
         if not self.keyboard:
             self._click(session, context.area, event)
@@ -1165,6 +1279,7 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
 
     def _click(self, session, area, event) -> bool:
         previous_click = self._input_click if not self._selecting else None
+        was_transcript = self._transcript
         self._selecting = False
         self._input_click = None
         display = _displays.get(area.as_pointer())
@@ -1176,24 +1291,31 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
             hit = layout.hit_at(display, x, y) or {}
             action = hit.get("action")
             kind = action[0] if action else None
+            point = layout.transcript_index(display, x, y, draw.measure) if not action else None
+            if point is None:
+                session.pop("transcript_anchor", None)
+                session.pop("transcript_cursor", None)
+                self._transcript = False
             if kind not in POPUP_ACTIONS and kind not in ("picker_open", "model_menu"):
                 _close_popups()  # A click anywhere else puts a menu away.
-            if kind == "focus":
+            if point is not None:
+                count = self._click_count(previous_click if was_transcript else None, x, y, event)
+                if count >= 2:
+                    scratch = {"input": display["transcript"][point[0]]["text"], "cursor": 0}
+                    (textedit.select_line if count >= 3 else textedit.select_word)(scratch, point[1])
+                    session["transcript_anchor"] = (point[0], scratch["anchor"])
+                    session["transcript_cursor"] = (point[0], scratch["cursor"])
+                elif event.shift and session.get("transcript_anchor") is not None:
+                    session["transcript_cursor"] = point
+                else:
+                    session["transcript_anchor"] = session["transcript_cursor"] = point
+                self._transcript = True
+                self._selecting = event.value == "PRESS" and count < 2
+            elif kind == "focus":
                 index = layout.input_index(display, x, y, draw.measure)
                 if index is not None:
-                    double_click = event.value == "DOUBLE_CLICK"
-                    count, now = 2 if double_click else 1, time.monotonic()
-                    if event.value == "PRESS" and not event.shift:
-                        if previous_click:
-                            # Blender downgrades DOUBLE_CLICK to PRESS for modal operators.
-                            then, click_x, click_y, before = previous_click
-                            prefs = bpy.context.preferences.inputs
-                            if (now - then < prefs.mouse_double_click_time / 1000 and
-                                    max(abs(x - click_x), abs(y - click_y)) <= prefs.drag_threshold_mouse):
-                                count = before + 1
+                    count = self._click_count(previous_click if not was_transcript else None, x, y, event)
                     double_click = count >= 2
-                    if count < 3:
-                        self._input_click = (now, x, y, count)  # A third click in time selects the line.
                     if count >= 3:
                         textedit.select_line(session, index)
                     elif double_click:
@@ -1204,15 +1326,33 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
                         textedit.place_caret(session, index)
                     self._selecting = event.value == "PRESS" and not double_click
                     _update_mentions(session)
+            elif kind in {"copy_message", "copy_conversation"}:
+                _do_action(session, action, display=display)
             elif action and hit.get("card"):  # A waiting card's button: the card, in the ask, this frame drew.
                 _do_action(session, action, drawn=hit["card"])
             elif action:
                 _do_action(session, action)
         return inside
 
+    def _click_count(self, previous_click, x, y, event):
+        count, now = (2 if event.value == "DOUBLE_CLICK" else 1), time.monotonic()
+        if previous_click and event.value == "PRESS" and not event.shift:
+            then, click_x, click_y, before = previous_click
+            prefs = bpy.context.preferences.inputs
+            # Blender downgrades DOUBLE_CLICK to PRESS for modal operators.
+            if (now - then < prefs.mouse_double_click_time / 1000 and
+                    max(abs(x - click_x), abs(y - click_y)) <= prefs.drag_threshold_mouse):
+                count = before + 1
+        if count < 3 and not event.shift:
+            self._input_click = (now, x, y, count)
+        return count
+
     def _finish(self, session, area):
         self._selecting = False
         self._input_click = None
+        self._transcript = False
+        session.pop("transcript_anchor", None)
+        session.pop("transcript_cursor", None)
         session["focused"] = False
         state.ui["mentions"] = []
         if area:
@@ -1227,10 +1367,24 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
             state.ui.pop("preview", None)
             return True
         command = event.oskey or event.ctrl       # Cmd on macOS, Ctrl elsewhere; both accepted.
+        if getattr(self, "_transcript", False):
+            if kind == "ESC":
+                return False
+            if command and kind == "C":
+                text = layout.selected_transcript(_displays.get(self.area_pointer, {}), session)
+                if text:
+                    context.window_manager.clipboard = text
+                return True
+            if not (event.unicode and event.unicode.isprintable() and not command):
+                return True
+            # Typing after a click on chat text goes to the input box, as a click anywhere in the panel always did.
+            self._transcript = False
+            session.pop("transcript_anchor", None)
+            session.pop("transcript_cursor", None)
         by_word = event.alt or (event.ctrl and sys.platform != "darwin")
         if state.ui.get("picker") is not None and _picker_key(session, event):
             return True
-        if (state.ui.get("model_menu") or state.ui.get("service_settings")) and kind == "ESC":
+        if (state.ui.get("model_menu") or state.ui.get("service_settings") or state.ui.get("copy_menu")) and kind == "ESC":
             _close_popups()
             return True
         mentions = state.ui.get("mentions") or []
@@ -1293,7 +1447,12 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
             if cut:
                 context.window_manager.clipboard = cut
         elif command and kind == "V":
-            textedit.insert(session, context.window_manager.clipboard)
+            text = context.window_manager.clipboard
+            if text:
+                textedit.insert(session, text)
+            else:
+                _paste_image_later(context.window, self.area_pointer, session)
+                return False
         elif command and kind == "Z":
             textedit.undo(session)
         elif event.unicode and event.unicode.isprintable() and not command:
@@ -1331,6 +1490,8 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
                 return {"PASS_THROUGH"}
             if not self._click(session, area, event):
                 return self._finish(session, area)
+        elif kind in {"RIGHTMOUSE", "MIDDLEMOUSE"} and event.value == "PRESS" and self._transcript:
+            return self._finish(session, area)
         elif kind in {"MOUSEMOVE", "INBETWEEN_MOUSEMOVE"}:
             # Recover a missed release without mistaking a modifier release for the mouse button.
             if (self._selecting and getattr(event, "type_prev", None) == "LEFTMOUSE" and
@@ -1340,7 +1501,16 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
             if not self._selecting:
                 return {"PASS_THROUGH"}
             x, y, _ = _local(_window_region(area), event)
-            index = layout.input_index(_displays.get(area.as_pointer(), {}), x, y, draw.measure)
+            display = _displays.get(area.as_pointer(), {})
+            if self._transcript:
+                point = layout.transcript_index(display, x, y, draw.measure, clamp=True)
+                if point is not None:
+                    if point != session.get("transcript_cursor"):
+                        self._input_click = None
+                    session["transcript_cursor"] = point
+                area.tag_redraw()
+                return {"RUNNING_MODAL"}
+            index = layout.input_index(display, x, y, draw.measure)
             if index is not None:
                 if index != session["cursor"]:
                     self._input_click = None  # Dragging must not turn the next click into a double-click.
@@ -1349,14 +1519,20 @@ class LOOPCUT_OT_interact(bpy.types.Operator):
         elif event.value != "PRESS" or kind in {"TIMER", "RIGHTMOUSE", "MIDDLEMOUSE"}:
             return {"PASS_THROUGH"}
         else:
+            copy = kind == "C" and (getattr(event, "oskey", False) or getattr(event, "ctrl", False))
+            if (self._transcript or copy) and not _local(_window_region(area), event)[2]:
+                return self._finish(session, area)
             self._input_click = None
             if not self._key(context, session, event):
-                return self._finish(session, area)
+                result = self._finish(session, area)
+                if kind == "V" and (event.ctrl or event.oskey):
+                    result.discard("PASS_THROUGH")
+                return result
         area.tag_redraw()
         return {"RUNNING_MODAL"}
 
 
-POPUP_ACTIONS = {"noop", "picker_pick", "model_pick", "effort_pick", "mention_pick", "open_settings",
+POPUP_ACTIONS = {"noop", "copy_menu", "picker_pick", "model_pick", "effort_pick", "mention_pick", "open_settings",
                  "service_settings", "service_toggle", "project_generation"}
 
 
@@ -1388,9 +1564,9 @@ class LOOPCUT_OT_hover(bpy.types.Operator):
 
 
 class LOOPCUT_OT_attach_images(bpy.types.Operator):
-    """Attach images or a video clip to your next message"""
+    """Attach images or a clip, or import a 3D model into the scene"""
     bl_idname = "loopcut.attach_images"
-    bl_label = "Attach Images"
+    bl_label = "Attach Images or Import Model"
     bl_options = {"INTERNAL"}
 
     # What a file drop fills in (see LOOPCUT_FH_images) and what the file browser returns.
@@ -1399,6 +1575,9 @@ class LOOPCUT_OT_attach_images(bpy.types.Operator):
     filter_image: bpy.props.BoolProperty(default=True, options={"HIDDEN"})
     filter_movie: bpy.props.BoolProperty(default=True, options={"HIDDEN"})
     filter_folder: bpy.props.BoolProperty(default=True, options={"HIDDEN"})
+    filter_glob: bpy.props.StringProperty(
+        default="*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.tif;*.tiff;*.tga;*.mp4;*.mov;*.glb;*.gltf;*.fbx;*.obj",
+        options={"HIDDEN"})
 
     def invoke(self, context, event):
         if self.files:  # Dropped.
@@ -1410,9 +1589,12 @@ class LOOPCUT_OT_attach_images(bpy.types.Operator):
         from .. import attachments
         session = state.session()
         paths = [str(Path(self.directory) / entry.name) for entry in self.files if entry.name]
+        models = [p for p in paths if Path(p).suffix.lower() in attachments.MODEL_EXTENSIONS]
+        paths = [p for p in paths if p not in models]
+        problems = attachments.import_models(session, models)
         clips = [p for p in paths if attachments.is_video(p)]
         paths = [p for p in paths if p not in clips]
-        problems = attachments.add(session, paths)
+        problems += attachments.add(session, paths)
         if clips:  # One clip at a time: each needs its part chosen.
             problems += [f"{Path(p).name}: attach one clip at a time." for p in clips[1:]]
             window, clip = context.window, clips[0]
@@ -1433,7 +1615,7 @@ class LOOPCUT_OT_attach_images(bpy.types.Operator):
             bpy.app.timers.register(focus, first_interval=0.0)
         conversations.save(session)
         tag_redraw_all()
-        return {"FINISHED"} if len(problems) < len(paths) else {"CANCELLED"}
+        return {"FINISHED"} if len(problems) < len(paths) + len(models) else {"CANCELLED"}
 
 
 _clip_previews: dict = {}  # bpy.utils.previews collection for the clip dialog's thumbnail.
@@ -1523,7 +1705,7 @@ class LOOPCUT_FH_images(bpy.types.FileHandler):
     bl_idname = "LOOPCUT_FH_images"
     bl_label = "Attach to Loopcut"
     bl_import_operator = LOOPCUT_OT_attach_images.bl_idname
-    bl_file_extensions = ".png;.jpg;.jpeg;.webp;.bmp;.tif;.tiff;.tga;.mp4;.mov"  # attachments.ACCEPTED
+    bl_file_extensions = ".png;.jpg;.jpeg;.webp;.bmp;.tif;.tiff;.tga;.mp4;.mov;.glb;.gltf;.fbx;.obj"
 
     @classmethod
     def poll_drop(cls, context):

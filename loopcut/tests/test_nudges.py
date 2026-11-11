@@ -1,7 +1,7 @@
 """Conversion cards (nudges.py) and the server's billing switch, without Blender.
 
-The spec is loopcut-web docs/platform/onboarding-value-and-conversion.md §4: cards at the moment the account
-matters, frequency caps, nothing pitched that No generation or Private mode blocks, purchases only while the
+Cards appear when account state matters, with frequency caps, nothing pitched that No generation or
+Private mode blocks, purchases only while the
 manifest's flags.billing is on, and the model-source header only for signed-in installs.
 """
 
@@ -383,6 +383,50 @@ class CloudOfferTest(RuntimeFixture):
         self.locked(tool("sfx", kind="gen"), signed_in=False)
         self.assertEqual([(r["name"], r["why"]) for r in cloud.locked_tools()], [("sfx", "sign_in")])
 
+    def test_client_version_lock_names_the_required_version_and_offers_an_update(self):
+        runtime = self.locked(tool("auto_rig", title="Auto rig", kind="assist", available=False,
+                                   unavailable_reason="client_version", min_app_version="9.0.0"))
+        rows = cloud.locked_tools()
+        self.assertEqual([(r["why"], r.get("min_app_version")) for r in rows], [("client_version", "9.0.0")])
+        result = cloud._offer({"tool": "auto_rig"})
+        self.assertIn("needs Loopcut 9.0.0", result.text)
+        self.assertIn("update now", result.text.lower())
+        card = state.session()["items"][-1]
+        self.assertEqual(card["title"], "Auto rig needs Loopcut 9.0.0")
+        self.assertEqual(card["actions"][0]["label"], "Update now")
+        self.assertEqual(card["actions"][0]["arg"], "https://loopcut.org/download")
+        runtime.manifest["flags"]["billing"] = False
+        self.assertEqual(cloud.locked_tools()[0]["why"], "client_version", "updates are independent of sales")
+
+    def test_version_lock_is_explained_when_purchase_cards_are_hidden(self):
+        runtime = self.locked(tool("auto_rig", title="Auto rig", kind="assist", available=False,
+                                   unavailable_reason="client_version", min_app_version="9.0.0"), signed_in=False)
+        runtime.manifest["flags"]["billing"] = False
+        with patch.object(nudges, "may_show", return_value=False):
+            self.assertIn("needs Loopcut 9.0.0", cloud._offer({"tool": "auto_rig"}).text)
+        self.assertEqual(state.session()["items"][-1]["actions"][0]["label"], "Update now")
+
+    def test_unknown_required_version_does_not_invent_one_or_offer_credits(self):
+        self.locked(tool("auto_rig", title="Auto rig", kind="assist", available=False,
+                         unavailable_reason="client_version", min_app_version="invalid"))
+        result = cloud._offer({"tool": "auto_rig"})
+        self.assertIn("newer Loopcut version", result.text)
+        self.assertNotIn("credits", result.text.lower())
+        self.assertNotIn("invalid", result.text)
+
+    def test_version_locked_tools_have_update_cards_but_no_purchase_buttons(self):
+        runtime = self.locked(*(tool(name, kind="gen", available=False,
+                                    unavailable_reason="client_version", min_app_version="9.0.0",
+                                    cost={"credits_estimate": 80, "quote_required": False})
+                                for name in ("image_generate", "image_to_3d")))
+        for billing in (True, False):
+            with self.subTest(billing=billing):
+                runtime.manifest["flags"]["billing"] = billing
+                self.assertEqual(len(cloud.locked_tools(runtime)), 2)
+                self.assertEqual(cloud._offered(runtime, ("image_generate", "image_to_3d")), {})
+                self.assertIsNone(cloud.make_one_prices(runtime))
+                self.assertIsNone(cloud.to_3d_offer([{"image": "Preview", "job": "synthetic"}], runtime))
+
     def test_offer_tool_schema_execution_and_bookkeeping(self):
         self.locked(tool("sfx", kind="gen", title="Sound effects"), balance=0)
         schemas = {s["function"]["name"]: s for s in cloud.tool_schemas()}
@@ -403,9 +447,7 @@ class CloudOfferTest(RuntimeFixture):
         self.assertEqual(self.transport.replies, [], "the offer itself calls no service")
 
     def test_a_tool_locked_for_credits_says_its_price_and_the_balance_not_that_it_is_unavailable(self):
-        """rel019-lowcredit (2026-10-26): at 15 credits, image_to_3d (about 80) reached the model as "Locked Loopcut
-        cloud tools: Image to 3D", which it told the user as "photo-to-3D isn't available in this session", right
-        after the free Try it had made a model from a photo. Now the plain fact, with no advice about credits."""
+        """A credit lock gives the model the catalog price, without changing it into a generic availability lock."""
         self.locked(tool("image_to_3d", kind="gen", title="Image to 3D", available=False, unavailable_reason="credits",
                          cost={"credits_estimate": 80, "quote_required": False}), balance=15)
         offer = {s["function"]["name"]: s for s in cloud.tool_schemas()}[cloud.PREFIX + cloud.OFFER]["function"]
@@ -425,7 +467,7 @@ class CloudOfferTest(RuntimeFixture):
             headers = self.transport.calls[-1]["headers"]
             self.assertEqual(headers.get(cloud.MODEL_SOURCE_HEADER), "chatgpt" if signed_in else None)
         runtime = self.runtime(Reply(manifest()))
-        runtime.model_source = "someone@example.test"
+        runtime.model_source = "someone@example.com"
         runtime.refresh()
         self.assertNotIn(cloud.MODEL_SOURCE_HEADER, self.transport.calls[-1]["headers"], "only the four kinds")
 

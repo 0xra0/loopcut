@@ -190,3 +190,38 @@ class SharedNudgeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PlanAfterTest(unittest.TestCase):
+    """completion_guard.plan_after: the rest of a stated plan after its 3D step, which a Turn it into 3D click ran
+    (agent._finish_plan); "" when the plan stated nothing after it. The loop side is in test_cloud_e2e."""
+
+    CHAIN = ("I’ll create a full-body concept image of your original frog knight (6 credits), then turn it into a "
+             "textured 3D model (80 credits) and optimize it for game use (about 5 credits). I’ll make the concept "
+             "first so you can approve the design before I generate the model.",
+             "The concept shows the full frog knight and carrot sword on a plain background. Shall I turn this "
+             "design into the 3D model?")  # rel020-chain's first and last replies.
+
+    def test_the_steps_stated_after_the_3d_step(self):
+        cases = {
+            self.CHAIN: "and optimize it for game use (about 5 credits).",
+            ("Plan:\n1. Concept picture (6 credits)\n2. 3D model (80 credits)\n3. Game-ready mesh (about 5 credits)"
+             "\n\nShall I start?",): "Game-ready mesh (about 5 credits)",
+            ("I'll make a picture (6 credits), then turn it into a model (80 credits), then place it on your "
+             "desk.",): "then place it on your desk.",  # No 3D word: the step priced as the click was.
+            ("I'll make a picture (6 credits). Shall I turn it into 3D? After that I'll rig it (10 credits).",):
+                "After that I'll rig it (10 credits).",
+        }
+        for replies, rest in cases.items():
+            with self.subTest(replies[0][:40]):
+                self.assertEqual(completion_guard.plan_after(replies, 80), rest)
+
+    def test_nothing_stated_after_the_3d_step(self):
+        for replies in (("I'll make a concept picture (6 credits) and then turn it into a 3D model (80 credits). "
+                         "I'll show you the picture first.",),
+                        ("I'll make your 3D model: a concept picture first (6 credits), then the 3D conversion "
+                         "(80 credits).",),
+                        ("Here is your picture. You can turn it into 3D with the button below.",),
+                        ("I made the picture (6 credits).",), ()):
+            with self.subTest(replies[:1]):
+                self.assertEqual(completion_guard.plan_after(replies, 80), "")

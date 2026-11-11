@@ -20,8 +20,8 @@ fake_bpy.app = types.SimpleNamespace(driver_namespace={})
 sys.modules.setdefault("bpy", fake_bpy)
 
 from loopcut import (agent, asset_libraries, assets, autorig, blenderkit, camera, config, contact, context,  # noqa: E402
-                     conversations, files, inspection, job_tools, llm, polyhaven, polypizza, result_store, state,
-                     texture_tools, tools, uv_tools)
+                     conversations, detail_maps, engine_export, files, inspection, job_tools, llm, polyhaven, polypizza, result_store,
+                     shading, state, texture_tools, tools, uv_tools)
 
 TOOL_SCHEMAS = agent._tool_schemas  # test_agent_loop stubs these three; keep the real ones.
 CHANGES_SCENE = agent._changes_scene
@@ -32,11 +32,12 @@ FOUND = tools.ToolResult("found")
 OFFERED = [
     ("run_python", "change"), ("get_scene_info", "read"), ("get_object_info", "read"), ("inspect_api", "read"),
     ("compare_with_reference", ""), ("look_at_reference", "read"), ("capture_viewport", ""),
-    ("set_extras", ""), ("read_result", "read"), ("studio_guide", "read"), ("studio_action", "change"),
+    ("set_extras", ""), ("read_result", "read"), ("studio_guide", "read"), ("studio_action", "change"), ("open_file", ""),
     ("check_contact", "read"), ("list_files", ""), ("read_file", ""), ("write_file", ""), ("move_file", ""),
     ("see_render", ""), ("render_job", ""), ("inspect_scene", ""), ("search_assets", "read"),
     ("import_asset", "change"), ("frame_camera", "change"), ("inspect_uv", "read"), ("uv_unwrap", "change"),
-    ("transfer_textures", "change"), ("inspect_texture", "read"),
+    ("transfer_textures", "change"), ("inspect_texture", "read"), ("check_shading", "read"),
+    ("add_detail_normal", "change"), ("export_for_engine", "change"),
 ]
 RIG_OFFERED = [("character_rig", "change")]  # Only beside the account's cloud auto_rig (agent._tool_schemas).
 
@@ -103,7 +104,7 @@ class OfferedTest(unittest.TestCase):
         self.assertEqual(len(schemas), len(TOOL_SCHEMAS()), "a tool offered twice")
         dispatched = set().union(tools._DISPATCH, contact.DISPATCH, files.DISPATCH, job_tools.DISPATCH,
                                  inspection.DISPATCH, assets.DISPATCH, camera.DISPATCH, uv_tools.DISPATCH,
-                                 texture_tools.DISPATCH)
+                                 texture_tools.DISPATCH, shading.DISPATCH, detail_maps.DISPATCH, engine_export.DISPATCH)
         # read_result is the loop's own: agent.run_loop answers it from the loop's conversation, a worker's too.
         self.assertEqual(set(schemas), dispatched | {result_store.TOOL})
         self.assertNotIn(result_store.TOOL, dispatched)
@@ -360,7 +361,9 @@ class CodeTurnTest(unittest.TestCase):
                         self.assertEqual(cards[0]['output'], failed_output)
                         index = session['items'].index(cards[0])
                         repairs = layout._code_repairs(session['items'], True, session['active_turn_id'])
-                        self.assertEqual(repairs[index], 'correcting')
+                        # Correcting while it is the turn's last step; once a later one has run, it carried on.
+                        later = any(c['status'] in ('done', 'failed') for c in cards[1:])
+                        self.assertEqual(repairs[index], 'continued' if later else 'correcting')
                     return next(replies)
 
                 with mock.patch.object(agent, '_request', side_effect=request), \

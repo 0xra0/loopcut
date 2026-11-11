@@ -86,6 +86,7 @@ class Folder(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
+        self.enterContext(mock.patch.object(files, "blend_base", return_value=(self.root / "project", "")))
         os.environ["LOOPCUT_DATA_DIR"] = str(self.root / "data")
         self.addCleanup(os.environ.pop, "LOOPCUT_DATA_DIR", None)
         self.session = state.reset()
@@ -133,7 +134,7 @@ class LayoutTest(Folder):
 
     def test_the_workspace_is_open_though_it_is_in_loopcuts_data_but_its_hidden_names_are_not(self):
         self.assertEqual(files.check(self.ws / "build.py"), self.ws / "build.py")
-        with self.assertRaisesRegex(tools.ToolError, "hidden"):
+        with self.assertRaisesRegex(tools.ToolError, "off limits"):
             files.check(self.ws / ".loopcut" / "state.json")
         with self.assertRaisesRegex(tools.ToolError, "Loopcut's own data"):
             files.check(self.root / "data" / "conversations" / "x.json")

@@ -12,7 +12,7 @@ module gives Loopcut's single agent that setup; bringing the result into the liv
 never had to do, is apply_build.
 
 <data>/workspaces/<conversation id>/, the shell's working directory:
-  source.blend   the live scene as the conversation's first workspace turn began; snapshot_scene saves it
+  SOURCE         the live scene as the conversation's first workspace turn began; snapshot_scene saves it
                  again (the one before kept as source-<n>.blend). Every datablock carries its own name as
                  its stamp (ownership.STAMP) and each scene its snapshot's number (SNAPSHOT_PROP), so
                  apply_build knows what a build made, changed or left alone, however the build was run.
@@ -103,11 +103,11 @@ coding agent works in a terminal: a folder of your own, a shell, Blender, an ima
 
 Environment:
 - Your workspace is a folder for this conversation: the working directory of shell and run_blender, and what \
-relative paths in the file tools mean. It holds source.blend (the live scene as this conversation's first request \
+relative paths in the file tools mean. It holds {snapshot} (the live scene as this conversation's first request \
 found it; keep it as it is), the images the user attached, at full size, and every file you make. The <workspace> \
-note on a request lists it. snapshot_scene saves the live scene as source.blend again.
+note on a request lists it. snapshot_scene saves the live scene as {snapshot} again.
 - In shell, blender is this Blender and python3 its Python, with numpy. run_blender runs headless \
-(blender -b source.blend --python script.py) and lists files written. No window: save with bpy. There // is the \
+(blender -b {snapshot} --python script.py) and lists files written. No window: save with bpy. There // is the \
 workspace; in the live scene it is the .blend's folder.
 - Windows shell: cmd.exe. For Python, write_file a .py and run python3 file.py.
 - view_image shows you any image: your renders, crops, the references.
@@ -131,12 +131,12 @@ are shown as short records of each step; your files stay in the workspace.
 - Installed add-ons, if any, are listed at the end of this prompt.
 
 Leave what the user did not ask you to change as it was; never delete their objects, materials or files. When you \
-finish, say briefly what you did and anything the user must decide."""
+finish, say briefly what you did and anything the user must decide.""".replace("{snapshot}", SOURCE)
 
 # The live-scene tools the workspace agent keeps (agent._tool_schemas' names): the rest are the cheaper
 # single agent's ways to do what the shell, run_blender and view_image do here.
-LIVE_TOOLS = ("run_python", "get_scene_info", "inspect_api", "capture_viewport", "read_result", "search_assets",
-              "import_asset", "character_rig")
+LIVE_TOOLS = ("run_python", "get_scene_info", "inspect_api", "capture_viewport", "read_result", "open_file",
+              "search_assets", "import_asset", "character_rig")
 
 SCHEMAS = [  # Sent with every workspace request: every word here is paid for on every step.
     {"type": "function", "function": {
@@ -328,6 +328,8 @@ def _copy_references(session: dict, ws: Path) -> list[str]:
         try:
             origin = source if source.is_file() else conversations.image_path(session["id"], key)
             name = _reference_name(reference, taken, origin)
+            from . import checkpoints
+            checkpoints.require_space(ws / name, origin.stat().st_size, protect=(ws,))
             shutil.copy2(origin, ws / name)
         except Exception as ex:  # A missing image is said in the note, never a failed turn.
             print(f"Loopcut: could not copy {name} into the workspace: {ex!r}")
@@ -345,6 +347,7 @@ def ensure(session: dict) -> Path:
         path.mkdir(parents=True, exist_ok=True)
     _ROOTS.add(ws)
     _shims(ws)
+    (_own(ws) / "owner.json").write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
     _copy_references(session, ws)
     return ws
 
@@ -932,6 +935,22 @@ def written(ws: Path, before: dict, after: dict) -> str:
     return "Wrote: " + ", ".join(shown) + more
 
 
+def _publish_outputs(session: dict, ws: Path, before: dict, after: dict, destination: Path | None, on_main) -> list[str]:
+    """Only the explicit exports/ folder is published; previews and builds remain working files."""
+    from . import files
+    key = str.casefold if sys.platform in {"win32", "darwin"} else str
+    previous = {key(name): stat for name, stat in before.items()}
+    changed = [name for name, stat in after.items() if previous.get(key(name)) != stat
+               and Path(name).parts[0] == "exports"]
+    if not changed:
+        return []
+    names = [str(Path(name).relative_to("exports")) for name in changed]
+    destination = destination or on_main(lambda: files.blend_base()[0])
+    paths = files.publish_sources(ws / "exports", names, destination)
+    on_main(lambda: [files.saved_notice(path, session) for path in (paths if len(paths) <= 5 else [paths[0].parent])])
+    return [f"Saved to {path}. Give this full path in your reply." for path in paths]
+
+
 def log_tail(text: str, lines: int = LOG_TAIL) -> tuple[str, int]:
     """The last lines of a Blender log without its render progress and start-up lines; and how many of
     those were left out of the part shown."""
@@ -944,25 +963,32 @@ def log_tail(text: str, lines: int = LOG_TAIL) -> tuple[str, int]:
 # ------------------------------------------------------------------ snapshots
 
 def _save_snapshot(session: dict, ws: Path) -> dict:
-    """Main thread: the live scene into source.blend (a compressed copy, relative paths remapped, what
+    """Main thread: the live scene into SOURCE (a compressed copy, relative paths remapped, what
     nothing uses kept, as merge.save_spawn does) and its record: tokens, pointers and settings. The
-    previous source.blend is kept as source-<n>.blend. The stamps come after, in a background Blender."""
+    previous SOURCE is kept as source-<n>.blend. The stamps come after, in a background Blender."""
     import bpy
     from . import merge, ownership
     data = load_state(ws)
     number = len(data["snapshots"]) + 1
     path = ws / SOURCE
-    if path.exists() and data["snapshots"]:
-        previous = data["snapshots"][-1]
-        kept = ws / f"source-{previous['number']}.blend"
-        os.replace(path, kept)
-        previous["file"] = kept.name
+    from . import checkpoints
+    checkpoints.require_space(path, protect=(ws,))
+    temporary = ws / "source.pending.blend"
     unused = merge._unused()
     for idb in unused:
         idb.use_fake_user = True
     try:
-        bpy.ops.wm.save_as_mainfile(filepath=str(path), copy=True, compress=True, relative_remap=True)
+        result = bpy.ops.wm.save_as_mainfile(filepath=str(temporary), copy=True, compress=True, relative_remap=True)
+        if result != {"FINISHED"}:
+            raise ToolError("Blender could not save the workspace's scene copy.")
+        if path.exists() and data["snapshots"]:
+            previous = data["snapshots"][-1]
+            kept = ws / f"source-{previous['number']}.blend"
+            os.replace(path, kept)
+            previous["file"] = kept.name
+        os.replace(temporary, path)
     finally:
+        temporary.unlink(missing_ok=True)
         for idb in unused:
             idb.use_fake_user = False
     ids, tokens = ownership.spawn_state()
@@ -1006,12 +1032,12 @@ def stamp(ws: Path, entry: dict, is_cancelled) -> None:
 
 
 def snapshot_scene() -> ToolResult:
-    from . import state
+    from . import checkpoints, state
     session = state.session()
     ws = ensure(session)
     try:
         entry = _save_snapshot(session, ws)
-    except RuntimeError as ex:
+    except (RuntimeError, checkpoints.CheckpointError) as ex:
         raise ToolError(f"Could not save the scene into the workspace: {ex}") from ex
 
     def then(is_cancelled, on_main):
@@ -1060,7 +1086,9 @@ def start_turn(session: dict, is_cancelled, on_main, craft=None) -> None:
     problems = []
 
     def prepare():
+        from . import files
         ws = ensure(session)
+        session["deliverable_folder"] = str(files.blend_base()[0])
         before = set(session.get("workspace_refs", {}).values())
         data = load_state(ws)
         entry = None
@@ -1079,6 +1107,11 @@ def start_turn(session: dict, is_cancelled, on_main, craft=None) -> None:
             except ToolError as ex:
                 problems.append(f"{SOURCE} could not be prepared for apply_build: {ex}")
     text = note_text(ws, load_state(ws), attached, problems)
+    text += (f"\nSave final deliverables (.blend, exports and renders) to exports/ in the workspace; "
+             f"they are copied to {session['deliverable_folder']} after each command. "
+             "Keep previews and intermediate builds outside exports/. "
+             "Use full absolute paths and include the full paths in your reply. "
+             "The workspace is for scripts and intermediate scene copies.")
     notes = craft(router.user_request(message)) if craft else ""
     if notes:
         text += f"\n\n<craft_notes>\n{notes}\n</craft_notes>"
@@ -1096,7 +1129,7 @@ def _workspace() -> tuple[dict, Path]:
 
 def _path(raw: str, must_exist: bool = True) -> Path:
     from . import files
-    target = files.check(files.resolve(raw))
+    target = files.check(files.resolve(raw, base=files.blend_base()[0] if str(raw).startswith("//") else current()))
     if must_exist and not target.exists():
         raise ToolError(f"{target} does not exist.")
     return target
@@ -1110,12 +1143,14 @@ def shell(command: str, timeout: int | None = None, summary: str = "") -> ToolRe
         return ToolResult("Not run: inline Python in Windows shell commands can change the code. "
                           + INLINE_PYTHON_HELP, ok=False)
     session, ws = _workspace()
+    destination = Path(session["deliverable_folder"]) if session.get("deliverable_folder") else None
     env = shell_env(ws)
 
     def then(is_cancelled, on_main):
         number = _next_run(ws)
         log = _own(ws) / "tmp" / f"shell-{number:04d}.txt"
         label, left = command.strip().splitlines()[0][:80], []
+        before = files_state(ws)
         code, took, stopped = run_process(_shell_command(command), ws, env, seconds, log, is_cancelled,
                                          label=label, left_running=left.append)
         output = _read(log)
@@ -1127,6 +1162,7 @@ def shell(command: str, timeout: int | None = None, summary: str = "") -> ToolRe
         else:
             log.unlink(missing_ok=True)
         result = ToolResult(f"{head}\n{_clip(output.rstrip()) or '(no output)'}", ok=code == 0 and not stopped)
+        result.text += "\n" + "\n".join(_publish_outputs(session, ws, before, files_state(ws), destination, on_main))
         if left:  # Said to both: a 4K render left this way ran for 14 h while the user asked how far it was.
             what = summary.strip() or label
             tracked = track_left(left[0], what, session["id"], time.time() - took)
@@ -1138,7 +1174,8 @@ def shell(command: str, timeout: int | None = None, summary: str = "") -> ToolRe
 
 def run_blender(script: str, blend: str = SOURCE, args: list | None = None, timeout: int | None = None) -> ToolResult:
     seconds = _timeout(timeout, BLENDER_TIMEOUT)
-    _, ws = _workspace()
+    session, ws = _workspace()
+    destination = Path(session["deliverable_folder"]) if session.get("deliverable_folder") else None
     script_path = _path(script)
     if not script_path.is_file():
         raise ToolError(f"{script_path} is not a file.")
@@ -1150,7 +1187,7 @@ def run_blender(script: str, blend: str = SOURCE, args: list | None = None, time
     extra = [str(a) for a in args or ()]
     env = shell_env(ws)
     from . import render_offer
-    # source.blend is the live scene: a render of it times this scene's frames, keyed as the open .blend's.
+    # SOURCE is the live scene: a render of it times this scene's frames, keyed as the open .blend's.
     live = render_offer.live_path() if blend_path == (ws / SOURCE).resolve() else None
 
     def then(is_cancelled, on_main):
@@ -1171,9 +1208,11 @@ def run_blender(script: str, blend: str = SOURCE, args: list | None = None, time
         lines = [f"{script_path.name} on {on}: {_exit_text(code, took, stopped, seconds)}. "
                  f"Log: {LOGS}/{log.name} ({len(text.splitlines())} lines"
                  + (f", {noise} start-up and render progress lines not shown" if noise else "") + ")."]
-        wrote = written(ws, before, files_state(ws))
+        after = files_state(ws)
+        wrote = written(ws, before, after)
         if wrote:
             lines.append(wrote)
+        lines.extend(_publish_outputs(session, ws, before, after, destination, on_main))
         shown = _clip(tail)
         shown_lines = set(shown.splitlines())
         lines.extend(line for line in text.splitlines()

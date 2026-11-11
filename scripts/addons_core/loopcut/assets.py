@@ -262,10 +262,33 @@ def import_asset(source: str = "", id: str = "", pick=None, **arguments) -> tool
         extra = {"source": source} if module is indexed_assets else {}
         return tools.forward(getattr(module, import_), {**arguments, **extra, id_name: asset_id}, f"source {source}",
                              _properties("import_asset"), _imports())
+    before = _objects()
     result, note = _meant(source, id, pick, call)
     if note:
         result.text = f"{note}\n{result.text}"
+    if result.ok and before is not None:  # rel020-axe and rel020-pro: the import landed out of the user's view.
+        _show_added(before)
     return result
+
+
+def _objects() -> dict | None:
+    """The file's objects by identity, or None outside Blender."""
+    try:
+        import bpy
+        return {ob.as_pointer(): ob for ob in bpy.data.objects}
+    except Exception:
+        return None
+
+
+def _show_added(before: dict) -> None:
+    """The objects an import added come into the user's 3D view (view_follow.frame). Never fails the import."""
+    from . import view_follow
+    try:
+        added = [ob for key, ob in (_objects() or {}).items() if key not in before]
+        if added:
+            view_follow.frame(added)
+    except Exception as ex:
+        print(f"Loopcut: could not show the imported asset: {ex!r}")
 
 
 def fetch_asset(source: str = "", id: str = "", pick=None, **arguments) -> dict:  # noqa: A002 (the schema's word)

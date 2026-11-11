@@ -592,6 +592,7 @@ class AgentLoopTest(unittest.TestCase):
         # A record correction or a written-out call's retry too (review of the port): left last, it would ask
         # the model to run what the user stopped.
         for content in (agent.completion_guard.CONTINUE, agent.completion_guard.CORRECTION,
+                        "[Loopcut] The last model reply failed (stream_failed); continue from there.",
                         agent.UNMADE_PROMPT.format(calls="loopcut_cloud__motion_from_text", them="it"),
                         motion_claims.nudge({"names": ["Moon_1"], "move": "orbits", "frames": (1, 125)})):
             with self.subTest(content=content[:40]):
@@ -610,6 +611,80 @@ class AgentLoopTest(unittest.TestCase):
                 sent = [m.get("content") for m in SCRIPT.requests[0]["messages"]]
                 self.assertNotIn(content, sent)
                 self.assertEqual(self.session["messages"][1]["content"], "I'll now import a desk.")
+
+    def test_a_new_message_preserves_a_retry_note_followed_by_a_successful_reply(self):
+        note = {"role": "user", context.STEP_LIMIT: True,
+                "content": agent.RETRY_NOTE_HEAD + "model reply failed (stream_failed); continue from there."}
+        history = [{"role": "user", "content": "Build a room"}, note,
+                   {"role": "assistant", "content": "Done."}]
+        self.session["messages"] = list(history)
+        SCRIPT.replies.append(text_reply("Done."))
+        with mock.patch.object(agent, "_scene_context", return_value="<scene_context>\n</scene_context>"):
+            self.assertTrue(agent.send("Make it red"))
+            self.session["turn"].thread.join(5)
+        self.assertEqual(self.session["messages"][:3], history)
+        sent = [m for m in SCRIPT.requests[0]["messages"] if m["role"] != "system"]
+        self.assertEqual(sent[:3], [{"role": m["role"], "content": m["content"]} for m in history])
+
+    def test_a_new_message_replaces_a_plans_go_on_left_last_but_keeps_the_clicks_note(self):
+        """agent._finish_plan's message left last by a Stop or an error: the user's next message replaces it (it would
+        ask the model to go on with what they stopped), and the click's note it carried goes with that message."""
+        note = "since your last turn: the user pressed Turn it into 3D on the picture Frog; it ran: Imported Frog."
+        go_on = {"role": "user", context.STEP_LIMIT: True, agent.FINISH_NOTES: note,
+                 "content": note + "\n" + agent.FINISH_PLAN.format(rest="and optimize it (about 5 credits).")}
+        self.session["messages"] = [{"role": "user", "content": "Make a frog knight"},
+                                    {"role": "assistant", "content": "Shall I turn it into 3D?"}, dict(go_on)]
+        SCRIPT.replies.append(text_reply("Done."))
+        with mock.patch.object(agent, "_scene_context", lambda text, since=None: "<scene_context>\n</scene_context>"):
+            self.assertTrue(agent.send("Make it red"))
+            self.session["turn"].thread.join(5)
+        self.assertNotIn(go_on, self.session["messages"])
+        request = SCRIPT.requests[0]["messages"][-1]["content"]
+        self.assertIn(note + "\n</scene_context>\n\nMake it red", request)
+        self.assertNotIn("Finish the rest", request)
+
+    def test_a_render_request_hears_when_the_camera_leaves_out_what_the_chat_made_last(self):
+        """rel020-pro: "render it in the cloud" rendered the forest shot with the new typewriter a speck in it. The
+        request's scene context carries render_offer.made_line for the chat's made; other requests never measure."""
+        from loopcut import render_offer
+        self.session["made"] = ["Old Fasioned Type Writer"]
+        asked = []
+        def made_line(names):
+            asked.append(list(names))
+            return "render note: what this chat made last (Old Fasioned Type Writer) is tiny in the shot."
+        empty = lambda text, since=None: "<scene_context>\n</scene_context>"
+        for text, measured in (("Make the keys shinier", False), ("render it in the cloud", True)):
+            SCRIPT.replies.append(text_reply("Done."))
+            SCRIPT.requests.clear()
+            with mock.patch.object(agent, "_scene_context", empty), \
+                    mock.patch.object(render_offer, "made_line", made_line):
+                self.assertTrue(agent.send(text))
+                self.session["turn"].thread.join(5)
+            request = SCRIPT.requests[0]["messages"][-1]["content"]
+            self.assertEqual("render note:" in request, measured, request)
+        self.assertEqual(asked, [["Old Fasioned Type Writer"]])
+        self.assertIn("is tiny in the shot.\n</scene_context>\n\nrender it in the cloud", request)
+
+    def test_what_a_turn_or_click_adds_with_geometry_is_what_the_chat_made_last(self):
+        def snapshot(*objects):
+            return {"objects": {name: {"uid": uid, "type": kind, "parent": parent}
+                                for name, uid, kind, parent in objects}}
+        forest = ("Forest", 1, "MESH", None), ("Camera", 2, "CAMERA", None)
+        before = snapshot(*forest)
+        axe = snapshot(*forest, ("Barbarian Battle Axe", 3, "EMPTY", None),
+                       ("Axe_Head", 4, "MESH", "Barbarian Battle Axe"),
+                       ("Axe_Handle", 5, "MESH", "Barbarian Battle Axe"),
+                       ("Key light", 6, "LIGHT", None), ("Runes", 7, "CURVE", "Axe_Head"))
+        session = {"made": ["Typewriter"]}
+        agent._note_made(session, before, axe)
+        self.assertEqual(session["made"], ["Barbarian Battle Axe"], "a library asset by its root, not its parts")
+        agent._note_made(session, axe, snapshot(*forest, ("Barbarian Battle Axe", 3, "EMPTY", None),
+                                                ("Key light", 6, "LIGHT", None), ("Fill", 8, "LIGHT", None)))
+        self.assertEqual(session["made"], ["Barbarian Battle Axe"], "nothing with geometry added: kept")
+        agent._note_made(session, {}, snapshot(("Cube", 9, "MESH", None)))
+        self.assertEqual(session["made"], ["Barbarian Battle Axe"], "no snapshot before: nothing is known to be new")
+        agent._note_made(session, before, snapshot(*forest, ("Forest", 1, "MESH", None), ("Rock", 10, "MESH", None)))
+        self.assertEqual(session["made"], ["Rock"])
 
     def test_a_setup_card_request_sent_unedited_marks_its_turn_and_an_edited_one_does_not(self):
         scene = mock.patch.object(agent, "_scene_context", lambda text, since=None: "<scene_context>\n</scene_context>")
@@ -850,6 +925,187 @@ class AgentLoopTest(unittest.TestCase):
         followup = SCRIPT.requests[1]["messages"]
         self.assertEqual(followup[-1], {"role": "tool", "tool_call_id": "call_1", "content": "cube added"})
         self.assertEqual(followup[-2]["tool_calls"][0]["function"]["name"], "run_python")
+
+    def open_file_fixture(self):
+        from loopcut import files, open_file
+        target = Path(self.data_dir.name) / "other.blend"
+        target.write_bytes(b"BLENDER-fixture")
+        self.enterContext(mock.patch.object(files, "_temp_roots", return_value=()))
+        self.enterContext(mock.patch.object(files, "_forbidden_roots", return_value=()))
+        self.enterContext(mock.patch.object(open_file, "bpy", types.SimpleNamespace(
+            data=types.SimpleNamespace(filepath="", is_dirty=False, images=[]))))
+        return target
+
+    def test_open_file_invalid_target_fails_without_a_consent_card(self):
+        target = self.open_file_fixture()
+        target.unlink()
+        self.enterContext(mock.patch.object(agent, "_on_main", side_effect=lambda fn, **kw: fn()))
+        SCRIPT.replies += [tool_reply("open_file", {"path": str(target)}), text_reply("Stopped.")]
+        with mock.patch.object(agent, "_wait_for_approval", return_value=True) as wait:
+            turn = self.start("open the generated file")
+            turn.thread.join(5)
+        self.assertFalse(turn.thread.is_alive())
+        wait.assert_not_called()
+        self.assertEqual(self.ran, [])
+        card = next(i for i in self.session["items"] if i.get("name") == "open_file")
+        self.assertEqual(card["status"], "failed")
+        self.assertIn("existing .blend", card["output"])
+
+    def test_open_file_preflight_refusals_are_recorded_in_the_ledger(self):
+        target = self.open_file_fixture()
+        target.unlink()
+        self.enterContext(mock.patch.object(agent, "_on_main", side_effect=lambda fn, **kw: fn()))
+        call = ("open_file", {"path": str(target)})
+        SCRIPT.replies += [multi_tool_reply(call, call), tool_reply(*call), text_reply("Stopped.")]
+        with mock.patch.object(agent, "_wait_for_approval", return_value=True) as wait:
+            turn = self.start("open the generated file")
+            turn.thread.join(5)
+        self.assertFalse(turn.thread.is_alive())
+        self.assertEqual(self.ran, [])
+        wait.assert_not_called()
+        results = self.results()
+        self.assertIn("Same error as before", results[1])
+        self.assertIn("This error has now come up 3 times", results[2])
+        cards = [i for i in self.session["items"] if i.get("name") == "open_file"]
+        self.assertEqual([card["status"] for card in cards], ["failed"] * 3)
+        self.assertTrue(all("Already tried" not in card["output"] for card in cards))
+
+    def test_open_file_preflight_refusals_stop_unchanged_and_rotating_calls(self):
+        from loopcut import repeats
+        target = self.open_file_fixture()
+        self.enterContext(mock.patch.object(agent, "_on_main", side_effect=lambda fn, **kw: fn()))
+        for spec in (agent.SINGLE_SPEC, agent.ORCH_SPEC, agent.WORKSPACE_SPEC):
+            for rotating in (False, True):
+                with self.subTest(role=spec.role, rotating=rotating), \
+                        mock.patch.dict(os.environ, {"LOOPCUT_SERVICE_URLS": os.environ["LOOPCUT_BASE_URL"]}), \
+                        mock.patch.object(agent, "_route"), mock.patch.object(agent, "_workspace_turn"):
+                    self.session = state.reset()
+                    self.ran.clear()
+                    SCRIPT.requests.clear()
+                    count = repeats.REPEAT_REFUSALS if rotating else repeats.NO_PROGRESS_FAILURES
+                    calls = [("open_file", {"path": str(target.with_name(f"missing_{i if rotating else 0}.blend"))})
+                             for i in range(count)]
+                    SCRIPT.replies[:] = ([] if rotating else [tool_reply(*call) for call in calls[:-1]]) + [
+                                         multi_tool_reply(*(calls if rotating else calls[-1:]),
+                                                          ("run_python", {"code": "must_not_run()"})),
+                                         text_reply("Blocked.")]
+                    with mock.patch.object(agent, "_wait_for_approval", return_value=True) as wait:
+                        turn = self.start("open the generated file", spec=spec)
+                        turn.thread.join(10)
+                    self.assertFalse(turn.thread.is_alive())
+                    self.assertEqual(turn.outcome, "no_progress")
+                    self.assertEqual(self.ran, [])
+                    wait.assert_not_called()
+                    self.assertEqual(len(SCRIPT.requests), 2 if rotating else count + 1)
+                    if not rotating:
+                        self.assertIn(state.item_notice(agent.STUCK_NOTICE), self.session["items"])
+                    self.assertEqual(self.session["items"][-2], state.item_notice(agent.NO_PROGRESS_NOTICE))
+                    messages = SCRIPT.requests[-1]["messages"]
+                    self.assertTrue(any(m["role"] == "tool" and "stopped because no progress" in m["content"]
+                                        for m in messages))
+                    self.assertEqual(messages[-1]["content"], agent.NO_PROGRESS_PROMPT)
+
+    def test_open_file_approved_path_stays_fixed_after_save_as(self):
+        from loopcut import files
+        target = self.open_file_fixture().resolve()
+        moved = target.parent / "moved"
+        moved.mkdir(exist_ok=True)
+        (moved / target.name).write_bytes(b"BLENDER-other")
+        base = mock.Mock(return_value=(target.parent, ""))
+        self.enterContext(mock.patch.object(agent, "_on_main", side_effect=lambda fn, **kw: fn()))
+        SCRIPT.replies += [tool_reply("open_file", {"path": "//other.blend"}), text_reply("Stopped.")]
+        def approve(turn):
+            card = next(i for i in self.session["items"] if i.get("name") == "open_file")
+            self.assertIn(str(target), card["code"])
+            base.return_value = (moved, "")
+            return True
+        with mock.patch.object(files, "blend_base", base), mock.patch.object(agent, "_wait_for_approval", side_effect=approve):
+            turn = self.start("open the generated file")
+            turn.thread.join(5)
+        self.assertFalse(turn.thread.is_alive())
+        self.assertEqual(json.loads(self.ran[0][1]), {"path": str(target)})
+
+    def test_open_file_waits_for_consent_even_with_auto_run_and_can_be_rejected(self):
+        self.open_file_fixture()
+        self.enterContext(mock.patch.object(agent, "_on_main", side_effect=lambda fn, **kw: fn()))
+        SCRIPT.replies += [tool_reply("open_file", {"path": str(Path(self.data_dir.name) / "other.blend")}), text_reply("Skipped.")]
+        self.session["auto_run"] = True
+        turn = self.start("open another file")
+        self.wait_for(lambda: any(i.get("status") == "awaiting" for i in self.session["items"]), "open consent")
+        card = self.session["items"][-1]
+        self.assertTrue(card["always_ask"])
+        self.assertIn("other.blend", card["summary"])
+        self.assertEqual(self.ran, [])
+        agent.decide(False)
+        turn.thread.join(5)
+        self.assertFalse(turn.thread.is_alive())
+        self.assertEqual(self.ran, [])
+        self.assertEqual(card["status"], "rejected")
+
+    def test_helper_cannot_switch_the_open_file(self):
+        self.open_file_fixture()
+        self.enterContext(mock.patch.object(agent, "_on_main", side_effect=lambda fn, **kw: fn()))
+        SCRIPT.replies += [tool_reply("open_file", {"path": str(Path(self.data_dir.name) / "other.blend")}), text_reply("Skipped.")]
+        turn = self.start("inspect another file", spec=dataclasses.replace(agent.SINGLE_SPEC, asks=False))
+        turn.thread.join(5)
+        self.assertFalse(turn.thread.is_alive())
+        self.assertEqual(self.ran, [])
+        self.assertIn("helper cannot switch", SCRIPT.requests[1]["messages"][-1]["content"])
+
+    def test_approved_open_load_cancels_queued_calls_and_finishes_old_turn(self):
+        self.open_file_fixture()
+        self.enterContext(mock.patch.object(agent, "_on_main", side_effect=lambda fn, **kw: fn()))
+        SCRIPT.replies += [multi_tool_reply(("open_file", {"path": str(Path(self.data_dir.name) / "other.blend")}),
+                                            ("run_python", {"code": "must_not_run()"}))]
+        def switched(name, arguments):
+            self.ran.append((name, arguments))
+            agent.stop()  # lifecycle.switch_to stops the old turn as the load handler runs.
+            state.replace(state.new_session())
+            return tools.ToolResult("Opened the file.")
+        self.run_tool = switched
+        turn = self.start("open another file")
+        self.awaiting()
+        agent.decide(True)
+        turn.thread.join(5)
+        self.assertFalse(turn.thread.is_alive())
+        self.assertTrue(turn.cancel.is_set())
+        self.assertEqual([name for name, _ in self.ran], ["open_file"])
+        self.assertEqual(len(SCRIPT.requests), 1)
+
+    def test_model_drop_notice_reaches_the_next_request(self):
+        from loopcut import attachments
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "shape.glb"
+            path.write_bytes(b"synthetic model")
+            bpy = types.SimpleNamespace(ops=types.SimpleNamespace(ed=types.SimpleNamespace(undo_push=mock.Mock(return_value={"FINISHED"})),
+                import_scene=types.SimpleNamespace(gltf=mock.Mock(return_value={"FINISHED"}))))
+            with mock.patch.object(attachments, "bpy", bpy):
+                self.assertEqual(attachments.import_models(self.session, [str(path)]), [])
+        SCRIPT.replies.append(text_reply("Ready."))
+        with mock.patch.object(agent, "_scene_context", return_value="<scene_context>\n</scene_context>"), \
+                mock.patch.object(agent, "_configure"), mock.patch.object(agent, "_launch"), \
+                mock.patch.object(agent, "_extras_line", return_value=""):
+            self.assertTrue(agent.send("inspect the imported model"))
+        turn = self.start("inspect the imported model")
+        turn.thread.join(5)
+        self.assertFalse(turn.thread.is_alive())
+        self.assertIn("Imported shape.glb into the scene.", str(SCRIPT.requests[0]["messages"]))
+
+    def test_retry_image_notice_reaches_the_initiating_conversation(self):
+        from loopcut import image_budget
+
+        def dropped(**kwargs):
+            messages = [{"role": "user", "content": [{"type": "image_url", "image_url": {
+                "url": "data:image/png;base64,aW1hZ2U="}}]}]
+            self.assertTrue(image_budget.Sized(messages).tighten())
+            return llm.Completion(text="Continued.")
+
+        with mock.patch.object(llm, "stream_chat", side_effect=dropped):
+            turn = self.start("inspect the image")
+            turn.thread.join(5)
+        self.assertFalse(turn.thread.is_alive())
+        notices = [i["text"] for i in self.session["items"] if i["kind"] == "notice"]
+        self.assertTrue(any("without those images" in text for text in notices), notices)
 
     def test_rejection_is_reported_to_the_model_and_nothing_runs(self):
         SCRIPT.replies += [tool_reply("run_python", {"code": "rm()", "summary": "Delete all"}),
@@ -1898,6 +2154,17 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(turn.outcome, "cancelled")
         self.assertEqual(next(i for i in self.session["items"] if i["kind"] == "tool")["status"], "done")
 
+    def test_what_a_turn_added_with_geometry_becomes_what_the_chat_made_last(self):
+        from test_scene_diff import cube, scene
+        from unittest.mock import patch
+        before, after = scene(), scene({"Cube": cube(), "Sphere": cube(data="Sphere")})
+        self.run_tool = lambda name, arguments: types.SimpleNamespace(
+            text="sphere added", ok=True, image_path=None, scene_before=before, scene_after=after)
+        with patch.dict(os.environ, {"LOOPCUT_AUTO_LOOK": "false", "LOOPCUT_AUTO_RUN": "true"}):
+            SCRIPT.replies += [tool_reply("run_python", {"code": "add()", "summary": "Add"}), text_reply("Done.")]
+            self.start("add a sphere").thread.join(5)
+        self.assertEqual(self.session["made"], ["Sphere"])
+
     def test_cost_guard_switches_are_panel_notices_right_after_their_step(self):
         from unittest.mock import patch
         line = "Subsurf on Chair_Seat, est. 12M faces: viewport display off; lower the viewport level"
@@ -1980,8 +2247,9 @@ class AgentLoopTest(unittest.TestCase):
         results = [m["content"] for m in self.session["messages"] if m["role"] == "tool"]
         self.assertTrue(all(results[n].startswith(f"Traceback") and f"\n\n{refusal}\n\nScene changes" in results[n]
                             for n in range(3)), "the guard's report stays whole")
-        self.assertIn("(Same error as before.", results[1])
-        self.assertIn("This approach is not working", results[2])
+        self.assertIn("2 render attempts refused", results[1])
+        self.assertIn("3 render attempts refused", results[2])
+        self.assertIn("see_render(render=true)", results[2])
         items = self.session["items"]
         cards = [n for n, i in enumerate(items) if i["kind"] == "tool"]
         self.assertEqual([items[n + 1] for n in cards], [state.item_guard(refusal, [])] * 3, "and in the panel")
@@ -2834,6 +3102,148 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(conversations.image_path(self.session["id"], refs[-1]).read_bytes(), compared[0][1],
                          "the look compared is the look stored")
 
+    def detail_loop(self, steps: int, names=("Runes",), began_ago: float = 0.0) -> list[dict]:
+        """`steps` run_python tweaks, each changing `names` (scene_diff snapshots), then "Done."; the tool results the
+        model got. began_ago: how long before the loop the turn started."""
+        self.session["auto_run"] = True
+        tweaks = iter(range(1, 1000))
+
+        def run_tool(name, arguments):
+            n = next(tweaks)
+            before = {"objects": {name: {"type": "MESH", "verts": n} for name in names}}
+            after = {"objects": {name: {"type": "MESH", "verts": n + 1} for name in names}}
+            return types.SimpleNamespace(text="Tweaked.", ok=True, image_path=None, scene_before=before, scene_after=after)
+        SCRIPT.replies += [tool_reply("run_python", {"code": f"tweak({n})", "summary": "Tweak the runes"})
+                           for n in range(steps)] + [text_reply("Done.")]
+        turn = agent.Turn()
+        turn.began -= began_ago
+        self.session["items"].append(state.item_user("make the runes deeper"))
+        self.session["messages"].append({"role": "user", "content": "make the runes deeper"})
+        self.session["busy"], self.session["turn"] = True, turn
+        with mock.patch.object(agent, "_changes_item", lambda session, turn: None):  # Its snapshots are partial.
+            agent._run(self.session, turn, run_tool, self.ensure_checkpoint, lambda a, b: False)
+        self.assertEqual(turn.outcome, "completed")
+        cards = [i for i in self.session["items"] if i["kind"] == "tool"]
+        self.assertFalse(any("check in" in c["output"] for c in cards), "the model's copy only, never the card")
+        return [m["content"] for m in self.session["messages"] if m.get("role") == "tool"]
+
+    def test_a_long_loop_on_one_detail_gets_one_check_in_after_its_steps_and_not_before(self):
+        """rel020-axe (2026-10-26): 8+ minutes of colour and Boolean tries on the runes, no estimate, no word to
+        the user. At CHECK_IN_STEPS steps on one object the step's result asks the model to show the user and ask;
+        once a turn."""
+        results = self.detail_loop(agent.CHECK_IN_STEPS + 3)
+        self.assertEqual([n for n, text in enumerate(results) if "check in" in text], [agent.CHECK_IN_STEPS - 1])
+        self.assertTrue(results[agent.CHECK_IN_STEPS - 1].endswith(
+            f"\n\n(This turn has spent about 1 minute and {agent.CHECK_IN_STEPS} steps on Runes. Before another try, "
+            "check in: show the user what it looks like now, with a close look at that part, say what is left and "
+            "about how long it would take, and ask whether to go on.)"), results[agent.CHECK_IN_STEPS - 1])
+
+    def test_a_long_loop_checks_in_after_its_minutes_too(self):
+        results = self.detail_loop(3, began_ago=agent.CHECK_IN_SECONDS + 60)
+        self.assertEqual([n for n, text in enumerate(results) if "check in" in text], [0])
+        self.assertIn("(This turn has spent about 6 minutes and 1 step on Runes.", results[0])
+
+    def test_the_check_in_note_counts_steps_and_minutes_in_plain_words(self):
+        for steps, ago, said in ((1, 400, "about 7 minutes and 1 step"), (2, 400, "about 7 minutes and 2 steps"),
+                                 (agent.CHECK_IN_STEPS, 30, f"about 1 minute and {agent.CHECK_IN_STEPS} steps")):
+            with self.subTest(steps=steps, ago=ago):
+                turn = agent.Turn()
+                turn.tool_steps, turn.worked_on = steps, ["Runes"]
+                note = agent._check_in_note(turn, now=turn.began + ago)
+                self.assertIn(f"(This turn has spent {said} on Runes.", note)
+                self.assertNotIn("1 steps", note)
+                self.assertEqual(agent._check_in_note(turn, now=turn.began + ago), "", "once a turn")
+
+    def test_a_short_loop_or_a_build_of_many_objects_gets_no_check_in(self):
+        self.assertFalse(any("check in" in text for text in self.detail_loop(agent.CHECK_IN_STEPS - 1)))
+        SCRIPT.replies.clear()
+        self.session = state.reset()
+        many = [f"Prop{n}" for n in range(agent.CHECK_IN_OBJECTS + 1)]
+        self.assertFalse(any("check in" in text for text in self.detail_loop(agent.CHECK_IN_STEPS + 2, many)))
+
+    def note_loop(self, replies: list, notes: dict | None = None) -> list[str]:
+        """ar-beginner-5 (2026-10-26): the user types a note while a tool call runs ({call number: text}), as send()
+        queues one during a turn; every call changes the Runes. Returns the notices the turn showed."""
+        self.session["auto_run"] = True
+        ran = []
+
+        def run_tool(name, arguments):
+            ran.append(name)
+            if len(ran) in (notes or {}):
+                item = {**state.item_user(notes[len(ran)]), "queued": True}
+                self.session["items"].append(item)
+                turn.notes.append((notes[len(ran)], item))
+            before = {"objects": {"Runes": {"type": "MESH", "verts": len(ran)}}}
+            after = {"objects": {"Runes": {"type": "MESH", "verts": len(ran) + 1}}}
+            return types.SimpleNamespace(text="Tweaked.", ok=True, image_path=None, scene_before=before, scene_after=after)
+        SCRIPT.replies += replies
+        turn = agent.Turn()
+        self.session["items"].append(state.item_user("make the runes deeper"))
+        self.session["messages"].append({"role": "user", "content": "make the runes deeper"})
+        self.session["busy"], self.session["turn"] = True, turn
+        with mock.patch.object(agent, "_changes_item", lambda session, turn: None):  # Its snapshots are partial.
+            agent._run(self.session, turn, run_tool, self.ensure_checkpoint, lambda a, b: False)
+        self.assertEqual(turn.outcome, "completed")
+        return [i["text"] for i in self.session["items"] if i["kind"] == "notice"]
+
+    @staticmethod
+    def tweak(n: int, said: str = "") -> bytes:
+        """A step of the loop: run_python, after `said` in the same reply when given."""
+        arguments = json.dumps({"code": f"tweak({n})", "summary": "Tweak the runes"})
+        return sse(*([{"choices": [{"delta": {"content": said}}]}] if said else []),
+                   {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": f"call_{n}", "type": "function",
+                                                           "function": {"name": "run_python", "arguments": arguments}}]}}]},
+                   {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})
+
+    ASKED = {1: "is it almost done?"}
+    STATUS = "Still working on Runes: 1 step so far (under a minute), no finish estimate yet. Press Stop to end it here."
+
+    def test_a_note_during_a_tool_loop_reaches_the_model_as_the_users_message_at_the_next_step(self):
+        self.note_loop([self.tweak(1), self.tweak(2, "Nearly: one more pass on the strokes."), text_reply("Done.")],
+                       self.ASKED)
+        first, second = (r["messages"] for r in SCRIPT.requests[:2])
+        self.assertFalse(any("<steer>" in str(m.get("content")) for m in first if m["role"] != "system"))
+        notes = [m for m in second if m["role"] == "user" and str(m.get("content")).startswith("<steer>")]
+        self.assertEqual(len(notes), 1)
+        self.assertTrue(notes[0]["content"].startswith("<steer>is it almost done?</steer>"), notes[0]["content"])
+        self.assertEqual(second[-1], notes[0], "the newest message the model reads, after the step's result")
+        # The check-in goes with it at once, not only after CHECK_IN_STEPS steps or CHECK_IN_SECONDS.
+        self.assertIn("(This turn has spent about 1 minute and 1 step on Runes. Before another try, check in:",
+                      notes[0]["content"])
+
+    def test_a_model_that_only_calls_tools_after_a_note_still_answers_it_once(self):
+        """Its next reply is tool calls with no text, and so are the ones after: Loopcut's status line answers the
+        note, once, and the work goes on; the model's copy of that step says it was answered."""
+        notices = self.note_loop([self.tweak(n) for n in range(1, 5)] + [text_reply("Done.")], self.ASKED)
+        self.assertEqual(notices, [self.STATUS])
+        results = [m["content"] for m in self.session["messages"] if m.get("role") == "tool"]
+        self.assertEqual([n for n, text in enumerate(results) if "Loopcut answered the user's note" in text], [1])
+        self.assertTrue(results[1].endswith(f'(Loopcut answered the user\'s note for you: "{self.STATUS}")'))
+        self.assertEqual(self.session["items"][-1]["text"], "Done.", "the turn went on to its end")
+        items = self.session["items"]
+        note = next(i for i in items if i["kind"] == "user" and i["text"] == "is it almost done?")
+        self.assertLess(items.index(note), items.index(next(i for i in items if i["kind"] == "notice")))
+        self.assertNotIn("queued", note)
+
+    def test_one_answer_per_note_and_none_when_the_model_answers_in_words(self):
+        notices = self.note_loop([self.tweak(n) for n in range(1, 6)] + [text_reply("Done.")],
+                                 {1: "is it almost done?", 3: "and can it glow a bit?"})
+        self.assertEqual(len(notices), 2, notices)
+        self.assertTrue(notices[1].startswith("Still working on Runes: 3 steps so far"), notices[1])
+        SCRIPT.replies.clear()
+        SCRIPT.requests.clear()
+        self.session = state.reset()
+        notices = self.note_loop([self.tweak(1), self.tweak(2, "Almost: one more pass."), self.tweak(3),
+                                  text_reply("Done.")], self.ASKED)
+        self.assertEqual(notices, [], "the model answered in its own words")
+
+    def test_no_note_no_answer_and_no_change(self):
+        notices = self.note_loop([self.tweak(n) for n in range(1, 4)] + [text_reply("Done.")])
+        self.assertEqual(notices, [])
+        self.assertFalse(any("<steer>" in str(m.get("content")) or "Loopcut answered" in str(m.get("content"))
+                             or "check in" in str(m.get("content")) for r in SCRIPT.requests for m in r["messages"]
+                             if m["role"] != "system"))
+
     def test_many_looks_are_nudged_not_refused(self):
         self.session["auto_run"] = True
         shot = Path(self.data_dir.name) / "viewport.png"
@@ -3158,6 +3568,23 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual((card["status"], card["output"]), ("failed", "Not run. Disk full."))
         self.assertIn("NOT run", SCRIPT.requests[1]["messages"][-1]["content"])
 
+    def test_storage_refusal_allows_later_agent_steps_and_reports_that_choice(self):
+        checkpoints.begin_turn(self.session, state.item_user('Add a sphere'))
+        self.ensure_checkpoint = checkpoints.ensure_for_turn
+        SCRIPT.replies += [tool_reply('run_python', {'code': 'first()', 'summary': 'First edit'}),
+                           tool_reply('run_python', {'code': 'second()', 'summary': 'Later edit'}),
+                           text_reply('Later edit completed.')]
+        self.session['auto_run'] = True
+        with mock.patch.object(checkpoints, '_write_snapshot', side_effect=checkpoints.StorageFullError('Disk full')):
+            turn = self.start('Add a sphere')
+            turn.thread.join(5)
+        self.assertFalse(turn.thread.is_alive())
+        self.assertEqual([json.loads(args)['code'] for name, args in self.ran], ['second()'])
+        refusal = SCRIPT.requests[1]['messages'][-1]['content']
+        self.assertIn('without new checkpoints', refusal)
+        self.assertNotIn('do not retry', refusal)
+        self.assertEqual(sum(bool(i.get('storage')) for i in self.session['items']), 1)
+
     def test_two_captures_in_one_step_send_two_different_images(self):
         # capture_viewport always writes the same file; the second capture must not replace the first.
         shot = Path(self.data_dir.name) / "viewport.png"
@@ -3363,7 +3790,7 @@ class AgentLoopTest(unittest.TestCase):
         self.addCleanup(setattr, llm, "RETRY_DELAYS", saved)
         SCRIPT.replies += [(503, {"error": {"message": "Overloaded."}})] * 4
         self.start("hi").thread.join(5)
-        self.assertEqual(self.session["items"][-1], state.item_error("HTTP 503: Overloaded."))
+        self.assertEqual(self.session["items"][-1], state.item_error("HTTP 503: Overloaded.", retry=True))
 
     # What Loopcut's gateway says when it cannot get an answer from the model's vendor, in an HTTP error or mid-stream.
     GATEWAY_DOWN = "Loopcut's AI is having a problem right now; it's not your plan or your request."
@@ -3407,7 +3834,7 @@ class AgentLoopTest(unittest.TestCase):
         SCRIPT.replies += [(502, {"error": {"code": "upstream_error", "message": self.GATEWAY_DOWN}})] * 4
         with self.on_gateway(hosted=False):
             self.start("make a chair").thread.join(5)
-        self.assertEqual(self.session["items"][-1], state.item_error(f"HTTP 502: {self.GATEWAY_DOWN}"))
+        self.assertEqual(self.session["items"][-1], state.item_error(f"HTTP 502: {self.GATEWAY_DOWN}", retry=True))
         from loopcut import mainthread
 
         def immediate(fn):
@@ -3506,9 +3933,59 @@ class AgentLoopTest(unittest.TestCase):
             self.assertTrue(agent.resume())
             self.session["turn"].thread.join(5)
         self.assertEqual(failed[-1]["content"], "<steer>in oak</steer>")
-        self.assertEqual(SCRIPT.requests[-1]["messages"][1:], failed[1:], "the same request again, nothing to retype")
-        self.assertEqual(len(self.session["messages"]), before + 1, "only the reply was added")
+        retried = SCRIPT.requests[-1]["messages"]
+        self.assertEqual(retried[1:-1], failed[1:], "the original request and steering are retained")
+        self.assertIn("model reply after run_python failed (upstream_error)", retried[-1]["content"])
+        self.assertEqual(len(self.session["messages"]), before + 2, "one recovery note and the reply were added")
         self.assertEqual(self.session["items"][-1]["text"], "Done, in oak.")
+
+    def test_try_again_after_six_chatgpt_failures_dispatches_the_streamed_tool(self):
+        from loopcut import chatgpt_auth, chatgpt_responses
+        pending = [503] * 6 + [sse({"type": "response.completed", "response": {"status": "completed", "output": [
+            {"type": "function_call", "call_id": "cube_call", "name": "run_python", "status": "completed",
+             "arguments": json.dumps({"code": "add_cube()", "summary": "Add a cube"})}]}}),
+            sse({"type": "response.completed", "response": {"status": "completed", "output": [
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Done."}]}]}})]
+
+        def post(*args):
+            value = pending.pop(0)
+            if value == 503:
+                raise urllib.error.HTTPError("https://example.invalid", 503, "busy", {}, io.BytesIO(b"{}"))
+            response = io.BytesIO(value)
+            response.headers = {}
+            return response
+
+        spec = agent.LoopSpec(role="single", system=lambda s: "", schemas=lambda: [
+            {"type": "function", "function": {"name": "run_python", "parameters": {"type": "object"}}}],
+            save=conversations.save, asks=False, checkpoints=False, changes_card=False)
+
+        def configure(turn, session):
+            turn.config = config.Config("synthetic", "chatgpt-plan://", "synthetic", "low", False, False, 0, 24000)
+            turn.spec = spec
+
+        run = agent._run
+        with mock.patch.object(agent, "_configure", side_effect=configure), \
+                mock.patch.object(agent, "_scene_context", return_value="<scene_context>\n</scene_context>"), \
+                mock.patch.object(agent, "_run", side_effect=lambda session, turn: run(
+                    session, turn, self.run_tool, self.ensure_checkpoint)), \
+                mock.patch.object(agent, "_launch", wraps=agent._launch) as launched, \
+                mock.patch.object(chatgpt_auth, "access_token", return_value="synthetic"), \
+                mock.patch.object(chatgpt_responses, "_post", side_effect=post) as posted, \
+                mock.patch.object(llm, "_wait"):
+            self.assertTrue(agent.send("Add a cube"))
+            first = launched.call_args.args[1]
+            first.thread.join(5)
+            self.assertEqual((first.outcome, posted.call_count), ("error", 6))
+            self.assertTrue(state.can_resume(self.session))
+            frame = self.frame()
+            hit = next(h for h in frame["hits"] if h["action"][0] == "resume")
+            _, click = panel_input(frame)
+            click(self.session, hit["x"] + 1, hit["y"] + 1)
+            retry = launched.call_args.args[1]
+            self.assertIsNot(retry, first)
+            retry.thread.join(5)
+        self.assertEqual((retry.outcome, posted.call_count, len(self.ran), pending), ("completed", 8, 1, []))
+        self.assertEqual(self.ran[0][0], "run_python")
 
     def test_a_note_too_late_for_a_failed_request_still_goes_as_after_a_dropped_connection(self):
         resent = []
@@ -6321,7 +6798,7 @@ class PlanRetryTest(unittest.TestCase):
         prefix = f"item{session['items'].index(card)}.tool."
         text = {p["id"]: p["text"] for p in display["prims"] if p["t"] == "text"}
         self.assertEqual(text[prefix + "summary"], "Helper started" if recovered else
-                         "Adjusting the helper plan…" if working else "Helper plan needs adjustment")
+                         "Changing the plan…" if working else "The plan needs changes")
         self.assertEqual(text[prefix + "glyph"], "✓" if recovered else "…" if working else "✕")
         glyph = next(p for p in display["prims"] if p["id"] == prefix + "glyph")
         self.assertEqual(glyph["color"], theme.TEXT_MUTED if recovered or working else theme.ERROR)
@@ -6406,12 +6883,12 @@ class PlanRetryTest(unittest.TestCase):
                 mock.patch.dict(sys.modules, {"bpy": fake}), \
                 mock.patch.object(checkpoints, "_blocking_job", return_value=None), \
                 mock.patch.object(checkpoints, "in_place_supported", return_value=True):
-            def snapshot(store, kind, label, **extra):
+            def snapshot(store, kind, label, *, protect=(), **extra):
                 entry = {"id": f"{len(store.entries) + 1:032x}", "kind": kind, "label": label,
                          "source": fake.data.filepath, "in_place": True, "size": 1, "expired": False, **extra}
                 store.folder.mkdir(parents=True, exist_ok=True)
                 store.snapshot_path(entry["id"]).write_bytes(b"snapshot stand-in")
-                store.add(entry, 10_000)
+                store.add(entry, 10_000, protect=protect)
                 return entry
 
             with mock.patch.object(checkpoints, "_write_snapshot", side_effect=snapshot):
@@ -6638,11 +7115,11 @@ class ToolCardLabelTest(unittest.TestCase):
                           *({"wave": {"workers": crew}} for crew in ([], None, 5, "bad", [None]))):
             with self.subTest(arguments=arguments):
                 title, details = agent._describe(llm.ToolCall("1", "delegate", json.dumps(arguments)))
-                self.assertEqual(title, "Helper plan is empty or invalid")
+                self.assertEqual(title, "Planning helpers")
                 self.assertEqual(json.loads(details), arguments)
         for raw in ("[]", "null", "{broken"):
             self.assertEqual(agent._describe(llm.ToolCall("1", "delegate", raw)),
-                             ("Helper plan is empty or invalid", raw))
+                             ("Planning helpers", raw))
 
     def test_undescribed_tool_uses_registered_title(self):
         for name in ("get_scene_info", "inspect_api"):

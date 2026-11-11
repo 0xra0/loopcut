@@ -38,11 +38,13 @@ _ROLES = {"user", "assistant", "tool"}
 # missing here (as "cached" was) fails the first turn after a reopen. Older files without one load it as 0.
 _USAGE = ("input", "cached", "output", "context")
 _PERSISTED = ("id", "items", "messages", "input", "attachments", "references", "projects", "title", "created", "usage",
-              "mode", "codex_thread", "spend", "asset_picks", "between_turns", "cloud_jobs", "implied")
+              "mode", "codex_thread", "spend", "asset_picks", "between_turns", "cloud_jobs", "implied", "made")
 _lock = threading.Lock()  # Saves come from the agent thread and the main thread.
 # This Blender's mark ("turn_running") on a chat saved while its turn runs (save), left out by that turn's last save.
 # Another Blender's mark on load: the turn never reached its end (Blender quit, crashed or was killed mid-turn).
 _LAUNCH = os.urandom(16).hex()
+_SCENE = os.urandom(16).hex()
+_SCENE_PROP = "loopcut_untitled_scene"
 # Conversations kept somewhere other than root(): a worker's transcript and captures live in its
 # job folder (waves.py). Keyed by conversation id; set before the first save.
 FOLDERS: dict[str, Path] = {}
@@ -75,11 +77,31 @@ def project_key(filepath: str) -> str:
 
 def _write_atomic(path: Path, text: str) -> None:
     temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(text, encoding="utf-8")
-    os.replace(temporary, path)
+    try:
+        temporary.write_text(text, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def save(session: dict, *, running: bool = False) -> None:
+    try:
+        _save(session, running=running)
+    except OSError as ex:
+        if not (running or session.get("busy")):
+            raise
+        if not any(i.get("save_failed") for i in session["items"]):
+            session["items"].append({**state.item_notice(
+                f"Could not save this conversation: {ex}. It is still open in memory. "
+                "Free disk space; saving will be retried after the next step."), "save_failed": True})
+    else:
+        for item in session["items"]:
+            if item.get("save_failed"):
+                item["text"] = "Conversation saving recovered. Your chat is saved."
+                item.pop("save_failed")
+
+
+def _save(session: dict, *, running: bool = False) -> None:
     """Safe from any thread. A conversation nobody has written in is not worth a folder. Offer cards
     (state.item_offer) and cloud jobs' "finished while you were away" cards (state.item_cloud_back, built again from
     cloud_jobs when the chat opens) are left out: they belong to the moment, and older add-ons refuse unknown items.
@@ -95,7 +117,7 @@ def save(session: dict, *, running: bool = False) -> None:
             first = next((i["text"] for i in session["items"] if i["kind"] == "user"), "")
             session["title"] = " ".join(first.split())[:80]
         body = {key: session.get(key, "") if key in ("mode", "codex_thread") else session[key] for key in _PERSISTED
-                if key not in ("spend", "asset_picks", "cloud_jobs", "implied")}
+                if key not in ("spend", "asset_picks", "cloud_jobs", "implied", "made")}
         from . import asset_picks, cloud_restore, spending
         with spending.lock:
             body["spend"] = dict(spending.ledger(session))  # What this chat spent survives a reload (C47).
@@ -103,11 +125,17 @@ def save(session: dict, *, running: bool = False) -> None:
         body["cloud_jobs"] = cloud_restore.snapshot(session)  # Its long cloud jobs, picked up when it opens again.
         with spending.lock:
             body["implied"] = spending.implied_rows(session.get("implied"))  # Undone means no, after a reopen too.
+        body["made"] = list(session.get("made") or ())  # A chat made by an older add-on has none.
         body["items"] = items
+        body["launch"] = _LAUNCH
+        body["pid"] = os.getpid()
+        body["untitled_scene"] = session.setdefault("untitled_scene", _SCENE) if not session["projects"] else ""
         if running or session.get("busy"):  # Read under the lock: the turn's last save is written after any of these.
             body["turn_running"] = _LAUNCH
         meta = {"id": session["id"], "projects": session["projects"], "title": session["title"],
                 "created": session["created"], "updated": time.time(),
+                "untitled_scene": body["untitled_scene"], "turn_running": body.get("turn_running"), "launch": _LAUNCH,
+                "pid": body["pid"],
                 "turns": sum(1 for i in session["items"] if i["kind"] == "user")}
         _write_atomic(folder / "conversation.json", json.dumps(body))
         _write_atomic(folder / "meta.json", json.dumps(meta))
@@ -156,6 +184,15 @@ def _own_image_path(value) -> bool:
         return False
     except (OSError, RuntimeError, ValueError):
         return False
+
+
+def _marker_ok(value) -> bool:
+    """A private message marker is a plain value, or a flat dict of plain values (a stopped step's code, a reset
+    time). Anything nested is refused so a damaged file can't smuggle structure into a message."""
+    if isinstance(value, (str, int, bool)):
+        return True
+    return isinstance(value, dict) and all(
+        isinstance(key, str) and isinstance(item, (str, int, float, bool, type(None))) for key, item in value.items())
 
 
 def _validate_preview(item: dict) -> None:
@@ -229,6 +266,9 @@ def _validate(body) -> dict:
                 not isinstance(ref, dict) or ref.get("kind") not in ("file", "url")
                 or any(not isinstance(ref.get(key), str) for key in ("name", "target")) for ref in refs):
             raise ConversationError("malformed file references")
+        for key in ("saved_path", "recover_conversation"):
+            if key in item and not isinstance(item[key], str):
+                item.pop(key)
         _validate_preview(item)
         _validate_pictures(item)
         if "audio" in item and not _audio_card(item):
@@ -250,7 +290,7 @@ def _validate(body) -> dict:
     for message in messages:
         if not isinstance(message, dict) or message.get("role") not in _ROLES:
             raise ConversationError(f"unknown message: {str(message)[:80]}")
-        if any(k.startswith(PRIVATE_PREFIX) and not isinstance(v, (str, int, bool)) for k, v in message.items()):
+        if any(k.startswith(PRIVATE_PREFIX) and not _marker_ok(v) for k, v in message.items()):
             raise ConversationError(f"malformed message marker: {str(message)[:80]}")
     if not isinstance(body.get("codex_thread", ""), str):
         raise ConversationError("malformed codex_thread")
@@ -267,6 +307,8 @@ def _validate(body) -> dict:
         body["cloud_jobs"] = cloud_restore.restored(body["cloud_jobs"])  # Damaged records go, never the chat.
     if "implied" in body:
         body["implied"] = spending.implied_rows(body["implied"])  # Likewise.
+    if "made" in body and (not isinstance(body["made"], list) or any(not isinstance(n, str) for n in body["made"])):
+        body.pop("made")  # Likewise: only a render's note reads it.
     return body
 
 
@@ -280,6 +322,8 @@ def load(conversation_id: str) -> dict:
         raise ConversationError(f"{path} claims to be conversation {body['id']}")
     session = state.new_session()
     session.update({key: body[key] for key in _PERSISTED if key in body})
+    if body.get("untitled_scene"):
+        session["untitled_scene"] = body["untitled_scene"]
     if "asset_picks" not in body:  # Saved before pick numbers (its results read "3. <id>"), or damaged.
         from . import asset_picks
         session["asset_picks"] = asset_picks.resumed(session["messages"])
@@ -366,7 +410,7 @@ def close_open_tool_calls(messages: list, reason: str) -> bool:
     return closed
 
 
-def list_for(project: str) -> list[dict]:
+def list_for(project: str | None) -> list[dict]:
     """Newest first. Unreadable entries are skipped, never deleted."""
     found = []
     if not root().is_dir():
@@ -376,11 +420,118 @@ def list_for(project: str) -> list[dict]:
             continue
         try:
             meta = json.loads((folder / "meta.json").read_text(encoding="utf-8"))
+            if (folder / "meta.json").stat().st_mtime_ns < (folder / "conversation.json").stat().st_mtime_ns:
+                raise ValueError("metadata predates the conversation")
         except (OSError, ValueError):
-            continue
-        if isinstance(meta, dict) and meta.get("id") == folder.name and project in (meta.get("projects") or []):
+            try:
+                body = json.loads((folder / "conversation.json").read_text(encoding="utf-8"))
+                meta = {k: body.get(k) for k in ("id", "projects", "title", "created", "untitled_scene", "turn_running", "launch", "pid")}
+                meta.update(updated=(folder / "conversation.json").stat().st_mtime,
+                            turns=sum(i.get("kind") == "user" for i in body.get("items", [])))
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
+        if (isinstance(meta, dict) and meta.get("id") == folder.name
+                and (project is None or project in (meta.get("projects") or []))):
             found.append(meta)
     return sorted(found, key=lambda m: m.get("updated", 0), reverse=True)
+
+
+def bind_scene() -> None:
+    """Persist only an opaque scene link in native saves; conversation text stays outside the file. Main thread."""
+    try:
+        import bpy
+        scene = bpy.context.scene
+        if scene is not None:
+            scene[_SCENE_PROP] = _SCENE
+            # Blender clears driver_namespace on every file load, so this marks the link bound since the last load.
+            bpy.app.driver_namespace[_SCENE_PROP] = _SCENE
+    except (ImportError, AttributeError, ReferenceError):
+        pass
+
+
+def new_scene() -> str:
+    global _SCENE
+    try:
+        import bpy
+        # A file with a path (a saved project, or a recovered quit.blend/autosave in the temp folder) carries its
+        # own link. Without a path, keep only the link this Blender bound since the last file load, so reloading
+        # the add-on keeps the untitled chat. The startup file and File > New get a fresh one: a link saved into
+        # startup.blend would make every new scene share it.
+        value = bpy.context.scene.get(_SCENE_PROP)
+        if not bpy.data.filepath and value != bpy.app.driver_namespace.get(_SCENE_PROP):
+            value = None
+    except (ImportError, AttributeError, ReferenceError):
+        value = None
+    _SCENE = value if isinstance(value, str) and _ID.fullmatch(value) else os.urandom(16).hex()
+    bind_scene()
+    return _SCENE
+
+
+def attach_untitled(session: dict, filepath: str) -> None:
+    """Attach the chats made in this untitled scene when it receives its first path."""
+    project = project_key(filepath)
+    if not project:
+        return
+    scene = session.get("untitled_scene", _SCENE)
+    for meta in list_for(None):
+        if (meta.get("projects") or meta.get("untitled_scene") != scene or meta["id"] == session["id"]
+                or _foreign_owner(meta)):
+            continue
+        with _lock:
+            folder = _folder(meta["id"])
+            body = json.loads((folder / "conversation.json").read_text(encoding="utf-8"))
+            if _foreign_owner(body):
+                continue
+            body["projects"] = [project]
+            meta["projects"] = [project]
+            _write_atomic(folder / "conversation.json", json.dumps(body))
+            _write_atomic(folder / "meta.json", json.dumps(meta))
+    add_project(session, filepath)
+    save(session)
+
+
+def _foreign_owner(body: dict, *, unknown: bool = True) -> bool:
+    if body.get("launch") == _LAUNCH:
+        return False
+    pid = body.get("pid")
+    if type(pid) is not int or pid <= 0:
+        return unknown
+    if pid == os.getpid():
+        return False  # Another launch that had this process id has ended; the id was reused by this one.
+    from . import jobs
+    try:
+        return jobs._alive(pid)
+    except OSError:
+        return True  # An uncertain owner is not safe to adopt.
+
+
+def recovery_candidate(*, interrupted_only: bool = True, untitled_scene: str = "") -> dict | None:
+    """Explicit recovery requires a file's scene link. Never take over a live foreign launch's chat."""
+    if not interrupted_only and not untitled_scene:
+        return None
+    try:
+        rows = list_for(None)
+    except (OSError, AttributeError):
+        return None
+    legacy_checked = False
+    for meta in rows:
+        if not interrupted_only and (meta.get("projects") or meta.get("untitled_scene") != untitled_scene):
+            continue
+        if _foreign_owner(meta, unknown=not interrupted_only):
+            continue
+        marker = meta.get("turn_running") if interrupted_only else meta.get("launch")
+        field = "turn_running" if interrupted_only else "launch"
+        if field not in meta and not legacy_checked:
+            # Older metadata lacks the marker. Check just the most recent legacy chat.
+            legacy_checked = True
+            try:
+                body = json.loads((_folder(meta["id"]) / "conversation.json").read_text(encoding="utf-8"))
+                marker = body.get(field)
+            except (OSError, ValueError, AttributeError):
+                continue
+        if marker and (marker != _LAUNCH or not interrupted_only):
+            return meta
+    return None
 
 
 def resume_or_new(filepath: str) -> dict:

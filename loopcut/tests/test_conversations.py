@@ -207,6 +207,21 @@ class ConversationsTest(unittest.TestCase):
         self.assertEqual(cv.load(session["id"])["items"][-2]["status"], "rejected", "nothing runs it here now")
         self.assertEqual(state.new_session()["between_turns"], [])
 
+    def test_what_the_chat_made_last_survives_a_reopen_and_a_damaged_list_is_dropped(self):
+        """A render request after a reopen still hears when the camera leaves it out (render_offer.made_line)."""
+        session = self.session("/work/forest.blend", "model a typewriter")
+        session["made"] = ["Old Fasioned Type Writer"]
+        cv.save(session)
+        self.assertEqual(cv.load(session["id"])["made"], ["Old Fasioned Type Writer"])
+        path = cv._folder(session["id"]) / "conversation.json"
+        body = json.loads(path.read_text())
+        body["made"] = [{"name": "x"}]
+        path.write_text(json.dumps(body))
+        self.assertEqual(cv.load(session["id"])["made"], [], "the chat opens, with nothing made known")
+        del session["made"]  # A chat an older add-on made.
+        cv.save(session)
+        self.assertEqual(cv.load(session["id"])["made"], [])
+
     def test_a_picture_saved_turning_into_3d_is_ready_again_once_its_click_ended_with_blender(self):
         """Re-review F2, 2026-10-26: saved running at the click, a picture whose click ended with Blender (a quit or
         crash) stayed "Turning into 3D…" for good. Loaded with no click running it, it is ready."""
@@ -307,7 +322,9 @@ class ConversationsTest(unittest.TestCase):
         loaded["items"][-1]["expanded"] = True
         display = layout.build(loaded, 420, 700, 1.0, lambda f, s, t: len(t) * s * 0.5, "m", {}, {})
         texts = [p["text"] for p in display["prims"] if p["t"] == "text"]
-        self.assertIn("import_polyhaven", texts, "the expanded card names the tool that ran then")
+        self.assertIn("Added a library model", texts, "the expanded card says in plain words what ran then")
+        self.assertNotIn("import_polyhaven", texts, "never its id")
+        self.assertEqual(loaded["items"][-1]["name"], "import_polyhaven", "which the card keeps")
 
     def test_close_open_tool_calls_answers_only_the_unanswered_in_place(self):
         messages = [
@@ -487,6 +504,17 @@ class ConversationsTest(unittest.TestCase):
         cv.save(session)
         self.assertEqual(cv.load(session["id"])["references"], session["references"])
         session["references"] = [{"ref": "loopcut-image:../evil.png", "name": "x", "pinned": True}]
+        cv.save(session)
+        with self.assertRaises(cv.ConversationError):
+            cv.load(session["id"])
+
+    def test_a_stopped_turns_step_markers_survive_a_round_trip_and_a_nested_one_is_refused(self):
+        session = self.session("/work/desk.blend", "Add a cube")
+        session["messages"][-1].update({"loopcut_chatgpt_limit": {"resets_at": 1767225600},
+                                        "loopcut_failed_step": {"code": "chatgpt_limit", "step": "model reply"}})
+        cv.save(session)
+        self.assertEqual(cv.load(session["id"])["messages"], session["messages"])
+        session["messages"][-1]["loopcut_failed_step"] = {"code": {"nested": "x"}}
         cv.save(session)
         with self.assertRaises(cv.ConversationError):
             cv.load(session["id"])

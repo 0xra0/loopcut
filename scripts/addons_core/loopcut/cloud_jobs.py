@@ -453,11 +453,13 @@ def adopt(job_id, title, inputs=None, apply_args=None, references=None, *, clien
     return True
 
 
-def _remember(job, title, cancel, inputs=None, apply_args=None, references=None, *, client=None):
+def _remember(job, title, cancel, inputs=None, apply_args=None, references=None, *, client=None, files=None):
     """inputs: what the call asked for, kept for its result's names (_add_audio): a job does not carry it.
     apply_args: the call's client-only arguments for the apply handler (contract 0.7), never sent. A replay of a
     known job keeps the job and takes the replay's.
-    references: the scene references its files came from (a clip's name), for names only."""
+    references: the scene references its files came from (a clip's name), for names only.
+    files: the SHA-256 of each uploaded file by field, the job view leaves them out: an imported retopology
+    records its source high-poly's (files.model) for a later re-bake (shading.stamp)."""
     with _lock:
         if job["id"] in _registry:
             row = _registry[job['id']]
@@ -477,7 +479,7 @@ def _remember(job, title, cancel, inputs=None, apply_args=None, references=None,
             del _registry[key]
         _registry[job["id"]] = {"title": title, "job": copy.deepcopy(job), "cancel": cancel, "ready": False,
                                 "input": copy.deepcopy(inputs or {}), "apply_args": copy.deepcopy(apply_args or {}),
-                                "references": dict(references or {}), 'client': client,
+                                "references": dict(references or {}), 'client': client, "files": dict(files or {}),
                                 'final': job['status'] in TERMINAL and (job['status'] != 'failed' or bool(job.get('error')))}
     _redraw()
     return True
@@ -965,6 +967,12 @@ def run(descriptor: dict, arguments: dict, files: dict[str, Path], *, project: d
             if row.get("required"):
                 raise _input_error("Required tool file is missing", field)
             continue
+        if isinstance(files[field], blobs.Stored):  # Kept by the service already (a re-bake's high-poly): by hash.
+            try:
+                hashes[field] = blobs.digest(files[field])
+            except ValueError as ex:
+                raise _input_error("Tool file was not found", field) from ex
+            continue
         try:
             path = Path(files[field])
             size = path.stat().st_size
@@ -974,6 +982,8 @@ def run(descriptor: dict, arguments: dict, files: dict[str, Path], *, project: d
         mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         if path.suffix.lower() == ".glb":
             mime = "model/gltf-binary"
+        elif path.suffix.lower() == ".fbx":
+            mime = "model/vnd.fbx"
         if size <= 0 or size > row["max_mb"] * 1024 * 1024 or mime not in row["accept"]:
             raise _input_error("Tool file type or size is not accepted", field)
         selected.append({"path": path, "mime": mime, "sha256": hashes[field], "size": size})
@@ -1051,7 +1061,8 @@ def run(descriptor: dict, arguments: dict, files: dict[str, Path], *, project: d
                 _pause(cancel, pause)
         if not _remember(job, descriptor.get("title", descriptor["name"]), cancel, inputs,
                          {k: v for k, v in arguments.items() if k in local},
-                         {k: arguments[k] for k in file_fields if isinstance(arguments.get(k), str)}, client=client):
+                         {k: arguments[k] for k in file_fields if isinstance(arguments.get(k), str)}, client=client,
+                         files=hashes):
             if descriptor.get("latency") == "long":
                 if cancel.is_set():
                     cancel_job(job["id"])
@@ -1082,6 +1093,9 @@ def resolve_files(descriptor: dict, arguments: dict, out_dir: Path) -> dict[str,
         from . import autorig, tools
         with tools._editor_context('VIEW_3D'):
             return autorig.prepare(arguments, directory)
+    from . import rebake
+    if rebake.is_rebake(descriptor):  # The mesh as it is now, and its source high-poly by hash (rebake.py).
+        return rebake.prepare(arguments, directory)
     found = {}
     for n, row in enumerate(descriptor.get("file_inputs", [])):
         field, value = row["field"], arguments.get(row["field"])
@@ -1199,6 +1213,28 @@ def made_unseen(job) -> str:
     found = next((r for r in reversed(state.session().get("references") or ())
                   if job and isinstance(r.get("made"), dict) and r["made"].get("job") == job), None)
     return "" if found is None or found["made"].get("seen") else found["name"]
+
+
+def note_picture_seen(path) -> None:
+    """Main thread: remember the content of a whole image returned to the model, bounded to this chat."""
+    from . import state
+    digest = blobs.sha256(Path(path))
+    seen = state.session().setdefault('seen_pictures', [])
+    if digest not in seen:
+        seen.append(digest)
+        del seen[:-64]
+
+
+def picture_unseen(descriptor, arguments, files) -> bool:
+    """All image-to-3D sources require a model look; changed file bytes need a new look."""
+    from . import state
+    path = files.get(picture_field(descriptor))
+    if path and blobs.sha256(Path(path)) in state.session().get('seen_pictures', []):
+        return False
+    made = made_picture(descriptor, arguments)
+    return not (made and any(isinstance(row.get('made'), dict) and row['made'].get('job') == made['job']
+                            and row['made'].get('seen') is True
+                            for row in state.session().get('references', [])))
 
 
 def made_last() -> list[str]:
@@ -1343,11 +1379,44 @@ def _video_plan(descriptor, arguments, row, value):
     return {"path": path, "seconds": seconds, "trim": trim}
 
 
+def resolve_stored(files: dict, client, cancel=None, on_main=None) -> None:
+    """Agent thread, before the quote: each blobs.Stored file gets its SHA-256 (read from its job's files when
+    only the job is known: a retopology job's files.model, a re-bake's files.high, contract 0.11) and is checked
+    to still be stored. Refusals are plain words (invalid_input); found() records the hash (main thread)."""
+    from . import rebake
+    for field, value in files.items():
+        if not isinstance(value, blobs.Stored):
+            continue
+        if cancel is not None and cancel.is_set():
+            raise cloud_http.CloudError("Cloud call canceled before submission", "canceled")
+        if not value.sha256:
+            try:
+                job = fetch(client, value.job)
+            except cloud_http.CloudError as ex:
+                if ex.status in (403, 404) or ex.code in ("not_found", "job_not_found"):
+                    raise cloud_http.CloudError(rebake.SOURCE_JOB_GONE.format(job=value.job), "invalid_input",
+                                                extra={"field": f"files.{field}"}) from ex
+                raise
+            source = (job.get("files") or {}).get(BAKED_FROM.get(job.get("tool"), ""))
+            if not isinstance(source, str) or not _HASH.fullmatch(source):
+                raise cloud_http.CloudError(rebake.SOURCE_NOT_LISTED.format(job=value.job), "invalid_input",
+                                            extra={"field": f"files.{field}"})
+            value.sha256 = source
+            if callable(value.found) and on_main is not None:
+                on_main(lambda value=value: value.found(value.sha256))
+        if blobs.check([value.sha256], client=client):
+            raise cloud_http.CloudError(rebake.SOURCE_GONE, "invalid_input", extra={"field": f"files.{field}"})
+
+
 def prepare_inputs(descriptor: dict, arguments: dict, files: dict) -> dict:
     """Main thread, after resolve_files: the arguments the call actually sends and applies with. Adds a video's
     measured length (video_seconds) and a trimmed strip's start_s/end_s when the tool takes them, and resolves
     apply_motion's target_armature (contract 0.7 apply_args) now, so selection changes during the job don't matter."""
     out = dict(arguments)
+    from . import rebake
+    if rebake.is_rebake(descriptor):  # The object it sent, named for the apply's fallback and the card.
+        out["model"] = rebake.prepared_name(files) or out.get("model")
+        return {k: v for k, v in out.items() if v is not None}
     properties = (descriptor.get("input_schema") or {}).get("properties", {})
     for row in descriptor.get("file_inputs", []):
         if _accepts_video(row) and row["field"] in files and isinstance(arguments.get(row["field"]), str):
@@ -1447,7 +1516,8 @@ def result_summary(handler, job, names=(), reports=()):
         return safe_value('\n'.join(names))
     actions = {"add_image_reference": "Added image references", "import_model": "Imported and selected models",
                "add_audio_strip": "Added sound strips at the current frame", "load_frames": "Loaded frames in the sequencer",
-               "attach_report": "Attached reports", "none": "Saved outputs", "apply_motion": "Applied motion"}
+               "attach_report": "Attached reports", "none": "Saved outputs", "apply_motion": "Applied motion",
+               "rebake": "Re-baked in place"}
     line = f"{actions[handler]}: {', '.join(names) or 'no outputs'}. Job {job['id']}; provenance recorded."
     return safe_value(line + ("\n" + "\n".join(reports) if reports else ""))
 
@@ -1651,49 +1721,34 @@ def _model_geometry_bounds(objects):
 
 
 def _frame_model(objects):
-    """Best-effort Frame Selected in an existing viewport, without moving a locked camera."""
-    import bpy
+    """Best-effort Frame Selected on the imported meshes in an existing viewport (view_follow.frame): never a camera,
+    never while the user moves the view."""
+    from . import view_follow
+    return view_follow.frame(objects)
+
+
+def _job_files(job) -> dict:
+    """{field: sha256} of the files the job was submitted with, as far as this session knows them."""
+    with _lock:
+        kept = (_registry.get(job["id"]) or {}).get("files")
+    value = kept or job.get("files")
+    return {k: v for k, v in value.items() if isinstance(v, str) and _HASH.fullmatch(v)} if isinstance(value, dict) else {}
+
+
+# The tools whose result was baked from an uploaded high-poly, and that upload's field (shading.BAKED_FROM).
+BAKED_FROM = {"retopology": "model", "rebake": "high"}
+
+
+def _shading_after_import(job, objects) -> list:
+    """shading.after_import on what a model import made: the safe fix where it applies, each mesh's bake
+    recorded, the problems in plain words. Never fails the import."""
+    from . import shading
+    field = BAKED_FROM.get(job.get("tool", ""))
+    high = _job_files(job).get(field, "") if field else ""
     try:
-        if bpy.app.background or not any(ob.type == "MESH" for ob in objects):
-            return False
-        for window in bpy.context.window_manager.windows:
-            if window.scene != bpy.context.scene or window.view_layer != bpy.context.view_layer:
-                continue
-            for area in window.screen.areas:
-                try:
-                    if area.type != "VIEW_3D":
-                        continue
-                    region = next((r for r in area.regions if r.type == "WINDOW"), None)
-                    if region is None:
-                        continue
-                    space = area.spaces.active
-                    with bpy.context.temp_override(window=window, screen=window.screen, area=area, region=region):
-                        # Hidden geometry can make view_selected return FINISHED without moving the view.
-                        if not any(ob.type == "MESH" and ob.visible_get(view_layer=window.view_layer, viewport=space)
-                                   for ob in objects):
-                            continue
-                        if not bpy.ops.view3d.view_selected.poll():
-                            continue
-                        locked = space.lock_camera
-                        # An offset export can leave its root/armature origin far from the geometry.
-                        selection = [(ob, ob.select_get()) for ob in objects if ob.type != "MESH"]
-                        try:
-                            space.lock_camera = False
-                            for ob, _ in selection:
-                                ob.select_set(False)
-                            # EXEC_DEFAULT frames immediately, before camera lock is restored.
-                            result = bpy.ops.view3d.view_selected("EXEC_DEFAULT", use_all_regions=False)
-                        finally:
-                            for ob, selected in selection:
-                                ob.select_set(selected)
-                            space.lock_camera = locked
-                    if "FINISHED" in result:
-                        return True
-                except Exception as ex:  # A failed candidate must not prevent trying the next view.
-                    print(f"Loopcut: could not frame the imported model in this viewport: {ex!r}")
-    except Exception as ex:  # UI context can disappear while a cloud job is finishing.
-        print(f"Loopcut: could not frame the imported model: {ex!r}")
-    return False
+        return shading.after_import(objects, job["id"], job.get("tool", ""), high)
+    except Exception as ex:  # noqa: BLE001 - the import stands without its shading check.
+        return [f"Shading: not checked ({type(ex).__name__}: {ex})"[:200]]
 
 
 def _model_import(job):
@@ -1747,6 +1802,7 @@ def _model_import(job):
                 matrix = ob.matrix_world.copy()
                 ob.parent = root
                 ob.matrix_world = matrix
+        job.setdefault("shading", []).extend(_shading_after_import(job, objects))
         # Generated props fit a 2m box and rest on the cursor's Z, centred on its X/Y.
         # Assist tools keep source dimensions and placement.
         bpy.context.view_layer.update()
@@ -2231,12 +2287,17 @@ def apply_result(descriptor: dict, job: dict, *, details=None) -> str:
                 "none": lambda job: [o["path"] for o in job["outputs"]]}
     if handler not in handlers:
         raise cloud_http.CloudError(f"Result handler {handler!r} is not available in this build", "apply_not_available")
+    from . import rebake
+    in_place = handler == "import_model" and rebake.is_rebake(descriptor)
+    if in_place:  # New maps (and UVs) on the mesh it was sent from, not a second model (rebake.py).
+        handlers["import_model"] = rebake.apply
     before = datablock_snapshot(bpy.data)
     try:
         names = handlers[handler](job)
         if handler == "add_image_reference" and descriptor.get("name") in MADE_BY and details is not None:
             details["pictures"] = _made_rows(job, names)  # Their card's Turn it into 3D button (cloud.to_3d_offer).
         reports = _reports(job) if handler not in ("none", "apply_motion", "apply_rig") else []
+        reports = list(job.get("shading") or []) + reports  # Model imports: shading.after_import's words.
         if reports and details is not None:
             from .cloud import _display, safe_value
             label = _display(descriptor, "title") or descriptor.get("title") or descriptor.get("name") or "Cloud tool"
@@ -2261,4 +2322,4 @@ def apply_result(descriptor: dict, job: dict, *, details=None) -> str:
     finally:
         # Even a partial Blender import carries its source; existing scene IDs are never relabeled.
         stamp_provenance(created_datablocks(before, datablock_snapshot(bpy.data)), job["provenance"])
-    return result_summary(handler, job, names, reports)
+    return result_summary("rebake" if in_place and not job.get("imported") else handler, job, names, reports)

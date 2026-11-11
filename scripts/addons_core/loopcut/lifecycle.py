@@ -24,8 +24,10 @@ def switch_to(session: dict) -> None:
 
 
 def resume_for_open_file() -> None:
+    from . import files
     current = state.session()
-    project = conversations.project_key(bpy.data.filepath)
+    filepath = "" if files.is_untitled_recovery(bpy.data.filepath) else bpy.data.filepath
+    project = conversations.project_key(filepath)
     if current["items"] and project in current["projects"]:
         # Already showing a conversation for this file, e.g. after a hot reload, or opened from History while
         # another file was open: its cloud jobs for this file are followed now (cloud_restore.pickup, once each).
@@ -36,15 +38,50 @@ def resume_for_open_file() -> None:
             import traceback
             traceback.print_exc()
         return
-    switch_to(conversations.resume_or_new(bpy.data.filepath))
+    switch_to(conversations.resume_or_new(filepath))
 
 
 @persistent
-def _on_load_post(*_):
+def _on_load_post(*args):
     if state.restoring:  # checkpoints.restore loads a file too; that is not the user switching files.
         _on_undo_redo()  # But what it loaded may lack a cloud job's outputs, or have them back.
         return
-    resume_for_open_file()
+    from pathlib import Path
+    from . import files
+    loaded = next((a for a in args if isinstance(a, str) and a), "")
+    current_path = getattr(getattr(bpy, "data", None), "filepath", "")
+    # Blender retains the temp filename when an untitled recovery has no original path.
+    untitled_temp = bool(loaded and Path(loaded).resolve() == Path(current_path).resolve()
+                         and files.is_untitled_recovery(loaded))
+    recovered = untitled_temp or bool(loaded and Path(loaded).suffix.lower() == ".blend" and Path(loaded).name != "startup.blend"
+                     and conversations.project_key(loaded) != conversations.project_key(current_path))
+    try:
+        scene = conversations.new_scene()
+        if recovered:
+            # A saved project can only recover its own chat. Untitled recovery has no project key.
+            project_path = "" if untitled_temp else current_path
+            matches = conversations.list_for(conversations.project_key(project_path)) if project_path else []
+            previous = state.session()
+            if (not project_path and previous["items"] and not previous["projects"]
+                    and previous.get("untitled_scene") == scene):
+                recovered_chat = previous
+            else:
+                candidate = ((matches[0] if matches else None) if project_path else
+                             conversations.recovery_candidate(interrupted_only=False, untitled_scene=scene))
+                recovered_chat = conversations.load(candidate["id"]) if candidate else None
+            if recovered_chat is not None:
+                conversations.attach_untitled(recovered_chat, project_path)
+                conversations.add_project(recovered_chat, project_path)
+                conversations.save(recovered_chat)
+                switch_to(recovered_chat)
+            else:
+                resume_for_open_file()
+        else:
+            resume_for_open_file()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        resume_for_open_file()
     # File > Open, Open Recent, File > New: the file's own layout replaced the screen, usually without the panel.
     if not bpy.app.timers.is_registered(_dock_after_load):
         bpy.app.timers.register(_dock_after_load, first_interval=0.0)
@@ -68,6 +105,8 @@ _saving_from = ""  # The file's path as a save starts (_on_save_pre), for Save A
 def _on_save_pre(*_):
     global _saving_from
     _saving_from = bpy.data.filepath
+    if not _saving_from:
+        conversations.bind_scene()
 
 
 @persistent
@@ -77,6 +116,9 @@ def _on_save_post(*_):
     # Save As, or the first save of an untitled scene: the conversation follows the file, and so do its cloud jobs
     # whose outputs are not in it yet (cloud_restore.file_saved).
     session = state.session()
+    from . import files
+    if not _saving_from or files.is_untitled_recovery(_saving_from):
+        conversations.attach_untitled(session, bpy.data.filepath)
     conversations.add_project(session, bpy.data.filepath)
     from . import cloud_restore
     try:
@@ -112,13 +154,19 @@ def _dock_after_load():
 def _initial_resume():
     # From a timer: bpy.data is not readable while an add-on is still registering.
     # Saved System add-ons must have finished loading before repairing incidental prefs saves.
-    from . import bundled_addons
+    from . import bundled_addons, conversations
     try:
         bundled_addons.startup_cleanup()
     except (bundled_addons.BundledAddonError, OSError, ValueError):
         import traceback
         traceback.print_exc()  # Keep the journal, and leave the panel usable for recovery.
+    conversations.new_scene()
     resume_for_open_file()
+    try:
+        from . import checkpoints
+        checkpoints.schedule_cleanup()
+    except Exception as ex:
+        print(f"Loopcut: could not start storage cleanup: {ex}")
     _dock_if_missing()
     return None
 

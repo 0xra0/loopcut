@@ -369,8 +369,9 @@ class RefusalsAndTheStepBudgetTest(unittest.TestCase):
                     f"RuntimeError: {refusal}\n\n{refusal}\n\nScene changes: none. (Tracked: objects)")
             key = repeats.call_key("run_python", f'{{"code": "render({step})", "summary": "Render {step}"}}')
             notes.append(ledger.record(step, key, text, ok=False))
-        self.assertIn('Already tried: step 1 "Render 1"', notes[1])
-        self.assertIn("This approach is not working", notes[2])
+        self.assertIn('2 render attempts refused', notes[1])
+        self.assertIn('3 render attempts refused', notes[2])
+        self.assertIn('see_render(render=true)', notes[2])
 
 
 class TakeTest(unittest.TestCase):

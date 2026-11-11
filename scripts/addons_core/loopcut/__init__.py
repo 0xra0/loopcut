@@ -8,15 +8,19 @@ bl_info = {
     "name": "Loopcut",
     "description": "An AI agent that works inside Blender",
     "author": "Loopcut",
-    "version": (0, 2, 21),
+    "version": (0, 2, 22),
     "blender": (5, 2, 0),
     "location": "Editor Type > Loopcut",
     "category": "Interface",
 }
+__loopcut_version__ = bl_info["version"]
 
 
 def register() -> None:
     from . import version_guard
+    if not hasattr(version_guard, "allow_turn"):
+        import importlib
+        importlib.reload(version_guard)
     version_guard.register(__name__, os.path.dirname(__file__), bl_info["version"])  # First: before any lazy import.
     try:
         from . import session_logs
@@ -42,11 +46,6 @@ def register() -> None:
         telemetry.register()  # app_start a few seconds later, off the startup path; nothing when switched off.
     except Exception as ex:
         print(f"Loopcut: usage stats not set up: {type(ex).__name__}")
-    try:
-        from . import checkpoints
-        checkpoints.remove_stale_sessions()
-    except OSError as ex:
-        print(f"Loopcut: could not clean up old checkpoints: {ex}")
     try:
         from . import waves
         waves.reap()  # Workers and copies an earlier Blender left behind.
@@ -78,5 +77,4 @@ def unregister() -> None:
     mainthread.unregister()
     support.unregister()
     settings.unregister()
-    from . import version_guard
-    version_guard.unregister(__name__)
+    # Wind-down threads may still import children; keep their original version stamps.

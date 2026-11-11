@@ -32,6 +32,7 @@ import hashlib
 import os
 import tempfile
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 from . import context
@@ -68,6 +69,18 @@ _JPEG = b"\xff\xd8\xff"
 _CACHE_BYTES = 16_000_000  # Shrunk images kept for the next request, which sends the same ones again.
 _cache: dict[tuple, str] = {}
 _lock = threading.Lock()
+_notices = threading.local()
+
+
+@contextmanager
+def notifying(callback):
+    """Bind retry notices to the conversation making this request, on its own worker thread."""
+    previous = getattr(_notices, "callback", None)
+    _notices.callback = callback
+    try:
+        yield
+    finally:
+        _notices.callback = previous
 
 
 # ------------------------------------------------------------------ encoding
@@ -298,9 +311,15 @@ class Sized:
     def tighten(self) -> bool:
         """After the connection dropped as the request went up, or a 413. False when the next try would send
         the same: it sends no image already."""
-        sent = sum(map(len, _inline_urls(self.messages()).values()))
+        previous = _inline_urls(self.messages())
+        sent = sum(map(len, previous.values()))
         smaller = next((budget for budget in DROPPED_BUDGETS if budget < sent), None)
         if smaller is None:
             return False
         self.budget, self._fitted = smaller, None
+        omitted = len(previous) - len(_inline_urls(self.messages()))
+        callback = getattr(_notices, "callback", None)
+        if omitted and callback is not None:
+            callback(f"Retrying with {omitted} image(s) left out after an upload failed. The assistant continues "
+                     "without those images. Your stored images are kept; attach the needed image again if it is missed.")
         return True

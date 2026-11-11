@@ -89,15 +89,16 @@ def create_spec(output_dir: str | None, frames: list[int], budget_seconds: int, 
     if (output_dir is None) == (folder is None):
         raise jobs.JobError("Give output_dir (a new subfolder is made in it) or folder (the frames go straight "
                             "into it), not both." if folder is not None else "render_job start needs output_dir or folder.")
+    output_path = files.resolve if _allow_no_camera else files.deliverable_path
     if folder is not None:
-        output = files.check(files.resolve(folder))
+        output = files.check(output_path(folder))
         jobs.ensure_empty(output)
         busy = [row["id"] for row in jobs.list_jobs(checkpoints.data_root())
                 if row["state"] in jobs.ACTIVE and Path(row["output"]) == output]
         if busy:
             raise jobs.JobError(f"Job {busy[0]} is rendering into {output}; name another folder.")
     else:
-        output = files.check(files.resolve(output_dir)) / f"loopcut-{job_id}"
+        output = files.check(output_path(output_dir)) / f"loopcut-{job_id}"
     spec = {"version": 1, "id": job_id, "kind": "render", "created": time.time(),
             "session_id": state.session()["id"], "source": bpy.data.filepath, "scene": scene.name,
             "camera": selected.name if selected else "", "engine": _engine or r.engine, "frames": frames, "format": format,
@@ -211,15 +212,24 @@ def save_snapshot(spec: dict, path: Path) -> None:
     # The output holds only renders: the job knows its folder by identity, and its records stay in path.
     output = Path(spec["output"])
     jobs.ensure_empty(output)
+    try:
+        checkpoints.require_space(path, protect=(path,))
+    except checkpoints.CheckpointError as ex:
+        raise jobs.JobError(str(ex)) from ex
     path.mkdir(parents=True)
     output.mkdir(parents=True, exist_ok=True)  # An inspection's is inside path.
     snapshot = path / "scene.blend"
-    result = bpy.ops.wm.save_as_mainfile(filepath=str(snapshot), copy=True, compress=True, relative_remap=True)
-    if result != {"FINISHED"}:
-        raise jobs.JobError("Blender could not save the job's scene copy.")
-    spec.update(scene_revision=jobs.digest(snapshot), assets=assets, missing_assets=missing,
-                output_identity=jobs.identity(output))
-    jobs.atomic_json(path / "spec.json", spec)
+    try:
+        result = bpy.ops.wm.save_as_mainfile(filepath=str(snapshot), copy=True, compress=True, relative_remap=True)
+        if result != {"FINISHED"}:
+            raise jobs.JobError("Blender could not save the job's scene copy.")
+        spec.update(scene_revision=jobs.digest(snapshot), assets=assets, missing_assets=missing,
+                    output_identity=jobs.identity(output))
+        jobs.atomic_json(path / "spec.json", spec)
+    except (OSError, RuntimeError, jobs.JobError):
+        import shutil
+        shutil.rmtree(path)
+        raise
 
 
 def _summary(row):
@@ -435,6 +445,15 @@ def describe(name: str, arguments: dict):
 def refresh_ui():
     jobs.reap()
     state.ui["jobs"] = jobs.list_jobs(checkpoints.data_root())
+    from . import conversations, files
+    session = state.session()
+    for row in state.ui["jobs"]:
+        if (row.get("kind") == "render" and row.get("state") == "complete"
+                and row.get("session_id") == session["id"] and row.get("progress", {}).get("verified_complete")
+                and not any(i.get("job_delivery") == row["id"] for i in session["items"])):
+            files.saved_notice(Path(row["output"]), session)
+            session["items"][-1]["job_delivery"] = row["id"]
+            conversations.save(session)
 
 
 def ui_action(kind: str, job_id: str):

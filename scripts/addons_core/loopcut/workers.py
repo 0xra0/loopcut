@@ -164,6 +164,8 @@ def check_sentence(check: dict) -> str:
         text = f"file {c['path']} exists and is not empty"
     elif kind == "no_modifiers":
         text = f"{c['name']} has no unapplied modifiers"
+    elif kind == "shading":
+        text = f"{c['name']} shades as its shape asks (no flat custom normals on a curved surface, no stray or smeared hard edges)"
     elif kind == "flat_shaded":
         text = f"{c['name']} is flat shaded (at most {float(c.get('max_smooth', 0.05)):.0%} of faces smooth)"
     elif kind == "inside_bounds":

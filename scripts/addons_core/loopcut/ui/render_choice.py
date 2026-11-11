@@ -79,7 +79,9 @@ def card(f, n: int, item: dict, x, y, width) -> int:
     pad, size, small = f.px(T.CARD_PAD), f.px(T.FONT_SIZE), f.px(T.FONT_SIZE_SMALL)
     mark = len(f.prims)
     ix, iw, cursor = x + pad, width - 2 * pad, y + pad
-    cursor += f.paragraph(f"item{n}.choice.title", ix, cursor, iw, render_offer.title(data), size, T.TEXT)
+    title = render_offer.title(data)
+    src = f.copy_part(n, title, "tool")
+    cursor += f.paragraph(f"item{n}.choice.title", ix, cursor, iw, title, size, T.TEXT, src=src)
     cursor += f.paragraph(f"item{n}.choice.detail", ix, cursor, iw, render_offer.detail(data), small, T.TEXT_MUTED)
     cursor += f.px(10)
     balance = f.ui.get("credit_balance")  # The live balance, while the card waits; else the one it showed.

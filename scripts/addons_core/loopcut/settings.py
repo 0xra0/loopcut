@@ -409,6 +409,10 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
     checkpoint_budget_mb: bpy.props.IntProperty(
         name="Checkpoints (MB)", default=2048, min=1, max=1_000_000, update=_changed,
         description="Checkpoint storage per conversation. The oldest checkpoints expire first")
+    storage_budget_mb: bpy.props.IntProperty(
+        name="Total storage (MB)", default=10240, min=128, max=1_000_000,
+        description="Budget across conversations, checkpoints, workspaces and render job copies. "
+                    "Cleanup preserves conversations, active jobs and the latest undo of each restore")
     dock_on_startup: bpy.props.BoolProperty(
         name="Open Loopcut with every file", default=True,
         description="Dock Loopcut at the right of the 3D viewport when Blender starts or opens a file without it")
@@ -554,6 +558,22 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
         column.prop(self, "context_budget")
         column.prop(self, "run_timeout")
         column.prop(self, "checkpoint_budget_mb")
+        from . import checkpoints
+        storage = layout.box()
+        try:
+            size = checkpoints.cached_storage_size()
+        except (OSError, AttributeError):
+            storage.label(text="Loopcut storage size unavailable; use Clean up to retry", icon="ERROR")
+        else:
+            storage.label(text=(f"Loopcut storage: {size / 1024**2:.1f} MB" if size is not None
+                                else "Loopcut storage: calculating…" if checkpoints.storage_scan_running()
+                                else "Loopcut storage size unavailable; use Clean up to retry"), icon="DISK_DRIVE")
+        try:
+            storage.label(text=str(checkpoints.data_root()))
+        except (OSError, AttributeError):
+            storage.label(text="Loopcut storage folder is unavailable", icon="ERROR")
+        storage.prop(self, "storage_budget_mb")
+        storage.operator("loopcut.storage_cleanup", text="Clean up", icon="TRASH")
 
         box = layout.box()
         box.label(text="Asset Libraries", icon="ASSET_MANAGER")
@@ -1164,7 +1184,19 @@ class LOOPCUT_OT_clear_vendor_key(bpy.types.Operator):
         return {"FINISHED"}
 
 
-_CLASSES = (LoopcutPreferences, LOOPCUT_OT_fetch_models, LOOPCUT_OT_anthropic_get_key, LOOPCUT_OT_use_provider,
+class LOOPCUT_OT_storage_cleanup(bpy.types.Operator):
+    """Remove old scene copies within the storage budget, keeping conversations and active jobs."""
+    bl_idname = "loopcut.storage_cleanup"
+    bl_label = "Clean up Loopcut storage"
+
+    def execute(self, context):
+        from . import checkpoints
+        result = checkpoints.cleanup_storage(reclaim_bytes=checkpoints.FREE_RESERVE)
+        self.report({"INFO"}, f"Removed {result['removed'] / 1024**2:.1f} MB; {result['bytes'] / 1024**2:.1f} MB remain")
+        return {"FINISHED"}
+
+
+_CLASSES = (LoopcutPreferences, LOOPCUT_OT_storage_cleanup, LOOPCUT_OT_fetch_models, LOOPCUT_OT_anthropic_get_key, LOOPCUT_OT_use_provider,
             LOOPCUT_OT_pick_model,
             LOOPCUT_MT_models, LOOPCUT_OT_pick_tier, LOOPCUT_MT_tiers,
             LOOPCUT_OT_polypizza_get_key, LOOPCUT_OT_blenderkit_get_key, LOOPCUT_OT_clear_vendor_key)

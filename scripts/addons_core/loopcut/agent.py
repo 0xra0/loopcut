@@ -39,6 +39,7 @@ TypeError or "enum not found", look it up with inspect_api before retrying.
 Material previews use studio lighting; rendered viewport captures use EEVEE and approximate Cycles. \
 Do not rebuild materials or boost lights to compensate for an unverified preview problem. Use a real \
 camera render (see_render) when final lighting, glass or reflections need verification.
+- Never call bpy.ops.render.render in run_python; use see_render(render=true) or render_job.
 - inspect_scene returns a labeled contact sheet across named cameras and frames. Use geometry for \
 shape, materials for neutral studio lighting, final_lighting for the actual scene engine and lights. \
 It renders a copy with a bounded budget while the editor stays responsive; stale results are rejected. \
@@ -122,6 +123,22 @@ STEPS_LEFT_NOTE = ("\n\n({left} steps left in this turn. Finish what matters mos
 # read as licence to keep building, and the LOW barrel broke its lid there (analysis §5.6).
 WORKER_STEPS_LEFT_NOTE = ("\n\n(About {left} steps left in the budget. Stop improving now: "
                           "call check_brief, then report_back.)")
+# A long loop on one detail (rel020-axe, 2026-10-26: 8+ minutes of colour and Boolean tries on the axe's runes, with no
+# estimate and no word to the user): once a turn that has not delegated has taken CHECK_IN_STEPS steps or
+# CHECK_IN_SECONDS while its changes touched at most CHECK_IN_OBJECTS objects, the model is told once, on the step's
+# last result (its copy only), to show the user what it has and ask. Advisory: if it goes on, the turn goes on.
+CHECK_IN_STEPS = 12
+CHECK_IN_SECONDS = 300
+CHECK_IN_OBJECTS = 4
+CHECK_IN_NOTE = ("\n\n(This turn has spent {minutes} and {steps} on {names}. Before another try, check in: "
+                 "show the user what it looks like now, with a close look at that part, say what is left and about "
+                 "how long it would take, and ask whether to go on.)")
+# A note the user typed while the turn ran (send: turn.notes) goes in as their own message before the next request
+# (_fold_notes), with the check-in note when the turn has been on a few objects. If the model's next message is only
+# tool calls, the user is still answered: Loopcut's status line from what it knows (ar-beginner-5, 2026-10-26: "is it
+# almost done?" during a 16-minute fix loop got no answer while the steps went on). One per note; the work goes on.
+NOTE_STATUS = "Still working{on}: {steps} so far ({minutes}), no finish estimate yet. Press Stop to end it here."
+NOTE_TOLD = "\n\n(Loopcut answered the user's note for you: \"{status}\")"
 STEP_LIMIT_PROMPT = ("[Loopcut] This turn has used all {steps} of its steps, so tools are off now: any tool call "
                      "is ignored. Reply in plain text only, in three short parts: what is done, what is left, and "
                      "what you did not verify.")
@@ -160,6 +177,7 @@ UPSTREAM_MESSAGE = "Loopcut's AI is having a problem right now; it's not your pl
 BUSY_MESSAGE = "Loopcut's AI is busy right now; try again in a minute."
 # The stall clock stopped the turn (check_stall): nothing came back for its limit (stall_message). Try again.
 STALL_MESSAGE = "Loopcut stopped waiting: nothing came back for {limit}."
+RETRY_NOTE_HEAD = "[Loopcut] The last "
 WAKE_SECONDS = 60  # A gap this long between the pump's looks (a sleep) leaves the turn this long before it stalls.
 # A reply that wrote its calls out as text and called nothing (_unmade): what goes back as the turn's record
 # correction, what the panel says when it cannot go back, and what the stored reply says instead, for this and
@@ -179,6 +197,17 @@ STOPPED_LINE = ("last turn: the user pressed Stop before you finished. If this m
 # they chose. The balance and prices are the gateway's line (0.2.20+), not ours.
 EXTRAS_LINES = {"ASK": "Paid tools: ask the user before each one.",
                 "ONLY_ASKED": "Paid tools: only when the user asks for one by name."}
+# A Turn it into 3D click ran the 3D step of a plan the model stated, with steps after it (_finish_plan, owner
+# 2026-10-26: "Finishing a stated plan may run its remaining paid steps under Ask above. It never adds a step the
+# plan didn't state."): what the continuing turn is told, after the click's note. rel020-chain dropped "optimize for
+# game use (about 5)" silently: no model turn came after the button's step.
+FINISH_PLAN = ("[Loopcut] The user's Turn it into 3D button ran the 3D step of the plan you stated. Finish the rest of "
+               "that plan now, only the steps it stated: \"{rest}\" Add no other step. Run them without asking "
+               "again; Loopcut asks the user itself when a step's price needs it. Then tell the user in a sentence "
+               "or two what is done.")
+FINISH_NOTES = "loopcut_finish_notes"  # On FINISH_PLAN's message: the click's notes, back to between_turns if dropped.
+# The click's card when no turn goes on from it: its plan had no step after the 3D one, or none was stated.
+TO_3D_DONE = "Your 3D model is in the scene."
 
 REFERENCE_PROMPT = """You are writing a reference card for a 3D artist who must reproduce the attached image in \
 Blender as closely as possible. Be terse and concrete, numbers and names over prose, under 300 words:
@@ -218,6 +247,9 @@ class Turn:
         self.focus: list = []       # The focus of its last capture_viewport: what the automatic looks keep framing.
         self.shot: dict = {}        # Its camera and view_layer (a worker's production shot): kept the same way.
         self.touched: list = []     # Objects changed since the last look (scene_diff.touched): what the next frames.
+        self.worked_on: list = []   # Every object this turn's changes touched, first first: _check_in_note's feature.
+        self.began = time.monotonic()  # And its clock.
+        self.checked_in = False
         self.roots: tuple = ()      # Folders the file tools read unasked; files.project_roots, set by send().
         # scene_diff snapshots from before the first and after the last scene-changing step.
         self.config: config.Config | None = None  # Loaded on the main thread by send().
@@ -397,6 +429,8 @@ def _approval(name: str, arguments: str, roots, turn=None) -> str:
     from . import files, tools, workspace
     from . import orchestrator
     parsed = _arguments(arguments)
+    if name == "open_file":
+        return "open_file"
     from . import cloud
     if cloud.is_tool(name):
         return ""  # Cloud execution gates resolved file uploads and cost consent together.
@@ -420,6 +454,8 @@ def _asks(approval: str, name: str, session: dict, cfg) -> bool:
     """Whether the step waits for the user. "Always allow renders" waives only the render itself:
     code that renders is still code, so it also needs "Always allow" or auto-run."""
     from . import tools
+    if approval == "open_file":
+        return True
     if approval == "install":
         return True  # Neither auto-run nor any "Always allow" covers putting third-party code on their machine.
     if approval == "capped":
@@ -596,16 +632,19 @@ def _restore_input_on_main(text: str, session: dict | None = None) -> None:
     mainthread.run_on_main(restore)
 
 
-def _fold_notes(session: dict, turn: Turn) -> None:
+def _fold_notes(session: dict, turn: Turn) -> int:
     """What the user sent while the turn ran goes in before the next request, marked so the
-    model continues rather than starts over. The chat item drops its 'queued' tag."""
+    model continues rather than starts over. The chat item drops its 'queued' tag. Returns how many went in."""
+    folded = 0
     with turn.notes_lock:
         if turn.send_notes_on_stop:
-            return  # The cancelled turn hands these to the next turn after its helpers have stopped.
+            return 0  # The cancelled turn hands these to the next turn after its helpers have stopped.
         while turn.notes:
             text, item = turn.notes.pop(0)
             item.pop("queued", None)
             session["messages"].append({"role": "user", context.STEER: True, "content": f"<steer>{text}</steer>"})
+            folded += 1
+    return folded
 
 
 def _project_roots() -> tuple:
@@ -912,14 +951,42 @@ def _changes_item(session: dict, turn: Turn) -> dict | None:
     return state.item_changes(scene_diff.headline(changes), scene_diff.lines(changes), checkpoint)
 
 
+# Object types with geometry: what a turn or a click made, for the chat's "made" (_note_made).
+GEOMETRY = frozenset({"MESH", "CURVE", "SURFACE", "META", "FONT", "CURVES", "POINTCLOUD", "VOLUME", "GREASEPENCIL"})
+MAX_MADE = 8
+
+
+def _note_made(session: dict, before, after) -> None:
+    """What these scene snapshots (scene_diff.snapshot) show added with geometry becomes the chat's "made", by the
+    topmost new parent of each (a library asset's or a cloud model's root, whose children it includes); a turn or
+    click that added none keeps the last."""
+    def identity(name, entry):  # Its session_uid, which a rename keeps; its name in a snapshot without one.
+        return entry.get("uid") if entry.get("uid") is not None else name
+    old = {identity(*row) for row in ((before or {}).get("objects") or {}).items()}
+    new = {name: entry for name, entry in ((after or {}).get("objects") or {}).items()
+           if identity(name, entry) not in old}
+    made = []
+    for name, entry in new.items():
+        if entry.get("type") not in GEOMETRY:
+            continue
+        while new.get(entry.get("parent")) is not None and entry.get("parent") != name:
+            name, entry = entry["parent"], new[entry["parent"]]
+        if name not in made:
+            made.append(name)
+    if before and made:
+        session["made"] = made[:MAX_MADE]
+
+
 def _tool_schemas() -> list[dict]:
-    from . import assets, autorig, camera, cloud, contact, files, inspection, job_tools, studio, texture_tools, tools, uv_tools, video_attach
+    from . import (assets, autorig, camera, cloud, contact, detail_maps, engine_export, files, inspection, job_tools, shading, studio,
+                   texture_tools, tools, uv_tools, video_attach)
     remote = cloud.tool_schemas()
     # character_rig only beside the account's cloud auto_rig: without auto-rig access the model has no rig tools.
     rig = autorig.SCHEMAS if any(cloud.tool_name(s["function"]["name"]) == "auto_rig" for s in remote) else []
     return video_attach.with_clip_tools(
         tools.SCHEMAS + studio.SCHEMAS + contact.SCHEMAS + files.SCHEMAS + job_tools.SCHEMAS + inspection.SCHEMAS + assets.SCHEMAS
-        + camera.SCHEMAS + uv_tools.SCHEMAS + texture_tools.SCHEMAS + rig + remote)
+        + camera.SCHEMAS + uv_tools.SCHEMAS + texture_tools.SCHEMAS + shading.SCHEMAS + detail_maps.SCHEMAS + engine_export.SCHEMAS
+        + rig + remote)
 
 
 def _tool_title(name: str, schemas: Callable | None = None) -> str:
@@ -933,24 +1000,41 @@ def _tool_title(name: str, schemas: Callable | None = None) -> str:
     return " ".join(name.replace("_", " ").replace(".", " ").split()).capitalize()
 
 
+def _prepare_open_file(arguments: str) -> str:
+    """Freeze a checked file target before asking; relative paths cannot move during consent."""
+    from . import open_file
+    def prepare():
+        parsed = _arguments(arguments)
+        parsed["path"] = str(open_file.prepare(parsed.get("path")))
+        return json.dumps(parsed)
+    if threading.current_thread() is threading.main_thread():
+        return prepare()
+    return _on_main(prepare, name="check the file to open")
+
+
 def _describe(call: llm.ToolCall, schemas: Callable | None = None) -> tuple[str, str]:
     try:
         arguments = json.loads(call.arguments) if call.arguments.strip() else {}
     except ValueError:
         arguments = None
     if not isinstance(arguments, dict):
-        title = "Helper plan is empty or invalid" if call.name == "delegate" else _tool_title(call.name, schemas)
+        title = "Planning helpers" if call.name == "delegate" else _tool_title(call.name, schemas)
         return title, call.arguments
     if call.name == "inspect_scene":
         from . import inspection
         return inspection.describe(arguments)
     from . import assets, camera, cloud, contact, files, job_tools, tools
     name = call.name
+    if name == "open_file":
+        from . import open_file
+        if threading.current_thread() is threading.main_thread():
+            return open_file.describe(arguments)
+        return _on_main(lambda: open_file.describe(arguments), name="resolve the file-opening card")
     if tools.RENAMED.get(name, (name,))[0] != name:  # A saved call to a tool since merged.
         name, arguments = tools.current_call(name, arguments)
-    from . import autorig, orchestrator, paint_tools, texture_tools, uv_tools, workspace
+    from . import autorig, detail_maps, engine_export, orchestrator, paint_tools, texture_tools, uv_tools, workspace
     for module in (job_tools, files, assets, contact, camera, orchestrator, uv_tools, texture_tools, paint_tools,
-                   workspace, autorig, cloud):
+                   workspace, autorig, detail_maps, engine_export, cloud):
         described = module.describe(name, arguments)
         if described:
             return described
@@ -1536,6 +1620,9 @@ def turn_into_3d(index: int, which: int = 0, shown=None, drawn=None) -> bool:
     A conversion whose model was made but could not land (another file was open, cloud._apply_to_scene) loads that
     model on the next click, from the job this Blender kept: no new job and no new charge (cloud.apply_finished)."""
     session = state.session()
+    from . import version_guard
+    if not version_guard.allow_turn(session):
+        return False
     items = session["items"]
     if session.get("busy") or not 0 <= index < len(items) or (drawn is not None and drawn[0] != id(items[index])):
         return False
@@ -1556,10 +1643,13 @@ def turn_into_3d(index: int, which: int = 0, shown=None, drawn=None) -> bool:
     made = picture.get("unapplied")
     card = state.item_tool(name, f"{summary.split(' · ')[0]} · made already" if made else summary, "")
     card.update(started_at=time.time(), click=list(key))
+    if not made:  # Its line from the click on (ui.layout): how long it usually takes, then its job's progress.
+        card.update(usually=cloud.usually(name, arguments), progress={"pct": 0, "message": "Starting"})
     items.append(card)
     picture["state"] = "running"
     state.running_clicks[key] = image
     conversations.save(session)  # Reopened meanwhile, the chat shows it running.
+    clicked_at = session.get("turn_number", 0)  # A message sent since the click starts a turn and counts it.
     turn = Turn()
     try:
         turn.spending = config.spending()  # The user's Ask above for a quote over the button's price.
@@ -1570,7 +1660,7 @@ def turn_into_3d(index: int, which: int = 0, shown=None, drawn=None) -> bool:
 
     def done(result):
         try:
-            _click_ended(key, card, result, consent.charged)
+            _click_ended(key, card, result, consent.charged, clicked_at)
         finally:
             state.running_clicks.pop(key, None)
             _redraw()
@@ -1599,10 +1689,11 @@ def turn_into_3d(index: int, which: int = 0, shown=None, drawn=None) -> bool:
     return True
 
 
-def _click_ended(key: tuple, card: dict, result, charged) -> None:
+def _click_ended(key: tuple, card: dict, result, charged, clicked_at: int = 0) -> None:
     """Main thread: a Turn it into 3D click's call ended. Its chat gets the card's result, the charge and the model's
     note: the chat on screen when it is that one, reopened since or not, else that chat's file. Never the dict the
-    click began in once it is no longer the chat: saving it would drop what came after."""
+    click began in once it is no longer the chat: saving it would drop what came after. A model landed goes on with
+    the plan it was a step of (_finish_plan), or its card says it is done. clicked_at: the chat's turn_number then."""
     from . import spending
     conversation, made = key
     chat = state.session()
@@ -1638,11 +1729,61 @@ def _click_ended(key: tuple, card: dict, result, charged) -> None:
     if type(charged) in (int, float) and charged > 0:
         with spending.lock:
             spending.ledger(chat)["credits"] += charged
+    if result.ok:
+        _note_made(chat, getattr(result, "scene_before", None), getattr(result, "scene_after", None))
     first = next((line for line in result.text.splitlines() if line.strip()), "")[:300]
     chat.setdefault("between_turns", []).append(
         f"since your last turn: the user pressed Turn it into 3D on the picture {state.running_clicks.get(key, made)}; "
         + (f"it ran: {first}" if result.ok else f"it did not run: {first}"))
+    if result.ok and _finish_plan(chat, key, charged, clicked_at):
+        return  # Its turn saved the chat, running (_launch).
+    if result.ok and not own.get("outcome"):
+        own["outcome"] = TO_3D_DONE
     conversations.save(chat)
+
+
+_finished_plans: set = set()  # Click keys a turn went on from (_finish_plan): once per click, whatever comes after.
+
+
+def _message_text(message: dict) -> str:
+    content = message.get("content")
+    if isinstance(content, list):
+        return "\n".join(p.get("text") or "" for p in content if isinstance(p, dict) and p.get("type") == "text")
+    return content if isinstance(content, str) else ""
+
+
+def _finish_plan(chat: dict, key: tuple, charged, clicked_at: int) -> bool:
+    """Main thread: a Turn it into 3D click's model landed in the chat on screen. When the chat's last model turn
+    stated a plan with steps after its 3D step (completion_guard.plan_after), one turn goes on with them: the click's
+    notes and FINISH_PLAN, as resume() goes on (the turn's own message, its route and counts), each step under the
+    usual rules (Ask above, extras_mode, Stop). Never when the user has sent, typed or attached anything since the
+    click, the last turn did not complete (a Stop, an error, a limit), a turn runs, or this click went on already.
+    True when the turn started."""
+    messages = chat.get("messages") or []
+    outcome = chat.get("turn_outcome") or next(  # A chat reopened from History has its last tool card's.
+        (i["turn_outcome"] for i in reversed(chat["items"]) if i.get("turn_outcome")), None)
+    if (key in _finished_plans or chat is not state.session() or chat.get("busy") or outcome != "completed"
+            or chat.get("turn_number", 0) != clicked_at or (chat.get("input") or "").strip()
+            or chat.get("attachments") or not messages or messages[-1].get("role") != "assistant"):
+        return False
+    start = context.turn_start(messages)
+    replies = [_message_text(m) for m in messages[start + 1:] if m.get("role") == "assistant"]
+    rest = completion_guard.plan_after(replies, charged)
+    if not rest:
+        return False
+    turn = Turn()
+    try:
+        _configure(turn, chat)
+    except config.ConfigError as ex:
+        print(f"Loopcut: could not go on with the plan after Turn it into 3D: {ex}")
+        return False
+    _finished_plans.add(key)
+    notes = _between_notes(chat, exclude=key)
+    chat["messages"].append({"role": "user", context.STEP_LIMIT: True, FINISH_NOTES: "\n".join(notes),
+                             "content": "\n".join([*notes, FINISH_PLAN.format(rest=rest)])})
+    turn.roots = _project_roots()
+    _launch(chat, turn)
+    return True
 
 
 def _cloud_consent(turn, card, asks, details, *, files_allowed=False, session=None):
@@ -1702,6 +1843,32 @@ def _after_framing(turn: Turn, call_name: str, arguments: str, result) -> None:
             and "Not the scene camera" not in (getattr(result, "text", "") or "")):
         turn.angle = "camera"
         turn.shot.pop("camera", None)
+
+
+def _check_in_note(turn: Turn, now: float | None = None, asked: bool = False) -> str:
+    """CHECK_IN_NOTE once a turn whose own steps have stayed on a few objects for CHECK_IN_STEPS steps or
+    CHECK_IN_SECONDS, or at once when the user sent a note (asked); never for a turn that delegated (its waves have
+    their own caps), nor before it changed anything (nothing to show)."""
+    if (turn.checked_in or turn.delegations or not turn.worked_on or len(turn.worked_on) > CHECK_IN_OBJECTS):
+        return ""
+    elapsed = (time.monotonic() if now is None else now) - turn.began
+    if not asked and turn.tool_steps < CHECK_IN_STEPS and elapsed < CHECK_IN_SECONDS:
+        return ""
+    turn.checked_in = True
+    minutes = max(1, round(elapsed / 60))
+    steps = turn.tool_steps
+    return CHECK_IN_NOTE.format(minutes=f"about {minutes} minute{'s' if minutes != 1 else ''}",
+                                steps=f"{steps} step{'s' if steps != 1 else ''}", names=", ".join(turn.worked_on))
+
+
+def _note_status(turn: Turn, now: float | None = None) -> str:
+    """NOTE_STATUS from what the turn knows: its steps, its time and, when few, the objects it has been changing."""
+    minutes = round(((time.monotonic() if now is None else now) - turn.began) / 60)
+    names = turn.worked_on if len(turn.worked_on) <= CHECK_IN_OBJECTS else []
+    return NOTE_STATUS.format(on=f" on {', '.join(names)}" if names else "",
+                              steps=f"{turn.tool_steps} step{'' if turn.tool_steps == 1 else 's'}",
+                              minutes="under a minute" if minutes < 1 else
+                              f"about {minutes} minute{'' if minutes == 1 else 's'}")
 
 
 def _look_note(turn: Turn) -> str:
@@ -1912,9 +2079,10 @@ def _orchestrator_schemas() -> list[dict]:
 
 
 def _session_schemas(session: dict, spec: LoopSpec) -> list[dict]:
+    from . import orchestrator
     schemas = spec.schemas()
-    if session.get("workers_unavailable"):
-        from . import orchestrator, waves
+    if session.get("workers_unavailable") or orchestrator.planning_stopped(session):
+        from . import waves
         job = getattr(session.get("turn"), "job", None)
         collecting = job is not None and waves.pending(job)
         schemas = [orchestrator.WAIT_SCHEMA if s["function"]["name"] == "delegate" else s
@@ -1971,8 +2139,9 @@ def _orchestrator_edit_note(session: dict, name: str, result) -> str:
 
 def _orchestrator_final(session: dict, turn: Turn, completion) -> str | None:
     """A level-3 turn that delegated nothing is nudged once; then the finish gate."""
-    from . import router
-    nudge = None if session.get("workers_unavailable") else router.nudge(turn, completion)
+    from . import orchestrator, router
+    unavailable = session.get("workers_unavailable") or orchestrator.planning_stopped(session)
+    nudge = None if unavailable else router.nudge(turn, completion)
     return nudge or _finish_gate(session, turn, completion)
 
 
@@ -2235,16 +2404,21 @@ def _request(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SIN
              *conversations.wire_messages(session["id"], prepared, context.unpinned_refs(session), cfg.keep_context,
                                           full_refs=full_refs, reasoning_model=cfg.model if cfg.keep_reasoning else "")]
 
+    def on_image_drop(text: str) -> None:
+        items.append(state.item_notice(text))
+        _redraw()
+
     def call(messages: list[dict], effort: str) -> llm.Completion:
         try:
-            completion = llm.stream_chat(
-                base_url=cfg.base_url, api_key=cfg.api_key, model=cfg.model,
-                messages=messages, tools=schemas, reasoning_effort=effort,
-                on_text=on_text, is_cancelled=turn.cancel.is_set,
-                max_tokens=cfg.max_output_tokens, call_max_seconds=cfg.call_max_seconds,
-                headers=_correlation_headers(session, spec.role, turn), on_retry=on_retry,
-                prompt_id=hosted, on_progress=on_progress,
-            )
+            with image_budget.notifying(on_image_drop):
+                completion = llm.stream_chat(
+                    base_url=cfg.base_url, api_key=cfg.api_key, model=cfg.model,
+                    messages=messages, tools=schemas, reasoning_effort=effort,
+                    on_text=on_text, is_cancelled=turn.cancel.is_set,
+                    max_tokens=cfg.max_output_tokens, call_max_seconds=cfg.call_max_seconds,
+                    headers=_correlation_headers(session, spec.role, turn), on_retry=on_retry,
+                    prompt_id=hosted, on_progress=on_progress,
+                )
             return _normalize_tool_calls(completion)
         except llm.LLMError as ex:
             if config.on_service(cfg.base_url) and ex.code in state.HOSTED_LIMITS:
@@ -2611,6 +2785,7 @@ def _error_code(ex) -> str:
 
 def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_main,
              ensure_checkpoint=_ensure_checkpoint_on_main, alike=None) -> None:
+    from . import tools
     items, messages = session["items"], session["messages"]
     first_item = len(items)
     request = next((m for m in reversed(messages) if context.is_turn_start(m)), {})
@@ -2678,13 +2853,19 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 turn.ledger.scene_changed()  # What the user says mid-turn may come with edits of their own.
                 if no_progress:
                     no_progress.reset()
-            _fold_notes(session, turn)
+            folded = bool(_fold_notes(session, turn)) and spec.role != "worker"  # Notes are the user's, not a worker's.
+            if folded and isinstance(messages[-1].get("content"), str):
+                messages[-1]["content"] += _check_in_note(turn, asked=True)  # After the note: what to show them.
             shown = {id(item) for item in items}  # Not an index: a request may drop an earlier setup error.
             # Synthetic and model tool calls share cards, consent, checkpoints, results and saving below.
             completion = first if first is not None else _request(session, turn, cfg, spec)
             first = None
             _normalize_tool_calls(completion)  # Also covers externally supplied first completions.
             messages.append(completion.as_message(cfg.model if cfg.keep_reasoning else ""))
+            told = ""  # The note's answer when this reply, the first after it, only calls tools (NOTE_STATUS).
+            if folded and completion.tool_calls and not (completion.text or "").strip():
+                told = _note_status(turn)
+                items.append(state.item_notice(told))
             if carry and getattr(turn, "carry_steps", False):  # A failed request is made again by a resume:
                 request[STEPS_TAKEN] = step  # only a reply counts.
             if not completion.tool_calls:
@@ -2748,11 +2929,26 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 approval = _approval(call.name, call.arguments, turn.roots, turn)
                 # Unasked only because it can start nothing: held to that when it runs, whatever frees by then.
                 capped = spec.asks and approval == "capped" and _asks("gate", call.name, session, cfg)
-                summary, code = _describe(call, spec.schemas)
+                prepared, refused = call.arguments, ""
+                if approval == "open_file" and spec.asks:
+                    try:
+                        prepared = _prepare_open_file(call.arguments)
+                    except (tools.ToolError, OSError, ValueError) as ex:
+                        refused = str(ex)
+                summary, code = ((_tool_title(call.name, spec.schemas), "") if refused else
+                                 _describe(llm.ToolCall(call.id, call.name, prepared), spec.schemas))
                 card = state.item_tool(call.name, summary, code)
                 card["turn_id"] = plan_turn  # Keep correction status scoped to this turn, including folded notes.
                 items.append(card)
                 key = repeats.call_key(call.name, call.arguments)
+                if refused:
+                    card["status"], card["output"] = "failed", refused
+                    note = turn.ledger.record(step, key, refused, False, where=step_message)
+                    messages.append({"role": "tool", "tool_call_id": call.id, "content": refused + note})
+                    if no_progress and no_progress.refused(key):
+                        stalled = True
+                        break
+                    continue
                 read = _same_while_unchanged(call.name, call.arguments)
                 earlier = seen.get(key)
                 twice = earlier is not None and earlier[1] == turn.ledger.revision
@@ -2772,6 +2968,12 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                     card["status"] = "rejected"
                     messages.append({"role": "tool", "tool_call_id": call.id, "content": INSTALL_REFUSAL})
                     continue
+                if approval == "open_file" and not spec.asks:
+                    card["status"] = "rejected"
+                    messages.append({"role": "tool", "tool_call_id": call.id,
+                                     "content": "Opening a file needs the user's consent in the main conversation. "
+                                                "A helper cannot switch the open file."})
+                    continue
                 # A long render job's card is the choice: the cloud or this computer (render_offer.prepare_job).
                 offer = _job_offer(spec, call, turn, _asks(approval, call.name, session, cfg))
                 pick = _ask_choice(card, offer, turn) if offer else None
@@ -2785,7 +2987,7 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 if not offer and spec.asks and _asks(approval, call.name, session, cfg):
                     turn.decided.clear()
                     # heavy: asking because it renders, so the card's "always" allows renders.
-                    state.awaiting(card)
+                    state.awaiting(card, always_ask=approval == "open_file")
                     card["heavy"] = approval == "heavy" and not session["auto_heavy"]
                     card["install"] = approval == "install"
                     _redraw()
@@ -2797,7 +2999,7 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                                          "content": "The user rejected this action. Ask what they want instead."})
                         continue
                 card["status"], card["started_at"] = "running", time.time()  # The card shows its time (ui.layout).
-                name, arguments, note = call.name, call.arguments, ""
+                name, arguments, note = call.name, prepared, ""
                 if pick:  # The cloud: its render of the same frames runs on this card; here, the job as asked.
                     from . import render_offer
                     name, arguments = render_offer.job_call(pick, offer, call.arguments, card)
@@ -2820,9 +3022,12 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                         # No way back means no going forward: the step is not run.
                         card["status"] = "failed"
                         card["output"] = f"Not run. {ex}"
+                        recovery = ("New checkpoints are paused. Tell the user this step did not run; "
+                                    "later scene edits can run without new checkpoints."
+                                    if isinstance(ex, checkpoints.StorageFullError) else "Tell the user; do not retry.")
                         messages.append({"role": "tool", "tool_call_id": call.id, "content":
                                          f"This step was NOT run, because a checkpoint could not be saved "
-                                         f"first: {ex} Tell the user; do not retry."})
+                                         f"first: {ex} {recovery}"})
                         if no_progress and no_progress.skip(key):
                             stalled = True
                             break
@@ -2852,6 +3057,9 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                     from . import render_offer
                     render_offer.job_result(pick, offer, call.arguments, arguments, result)
                 turn.touch(state.MODEL_REPLY)
+                if name == "delegate":
+                    from . import orchestrator
+                    result = orchestrator.plan_result(session, result)
                 if spec.role != "worker":
                     _note_level(turn, call.name, call.arguments, delegations)
                 _after_framing(turn, call.name, call.arguments, result)
@@ -2888,7 +3096,9 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                     turn.changed, turn.idle_captures = True, 0
                     if getattr(result, "scene_before", None) is not None and getattr(result, "scene_after", None) is not None:
                         from . import scene_diff
-                        turn.touched += scene_diff.touched(result.scene_before, result.scene_after)
+                        touched = scene_diff.touched(result.scene_before, result.scene_after)
+                        turn.touched += touched
+                        turn.worked_on += [name for name in dict.fromkeys(touched) if name not in turn.worked_on]
                 if asked_look:  # After the change: run_python's own capture is taken after its code ran.
                     result.text += _look_note(turn)
                     turn.changed, turn.touched = False, []
@@ -2954,6 +3164,10 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
                 note = spec.steps_left_note.format(left=STEPS_LEFT_NOTICE)
                 last[0]["output"] += note
                 last[1]["content"] += note
+            if not stalled and spec.role != "worker":
+                last[1]["content"] += _check_in_note(turn)  # The model's copy only: the card is the user's.
+            if told:
+                last[1]["content"] += NOTE_TOLD.format(status=told)
             # Tool messages must directly follow the assistant message, so images go after them all.
             messages.extend(_image_message(reference, what, file_preview=file_preview)
                             for reference, what, file_preview in _fresh_images(images))
@@ -2993,6 +3207,9 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
         from . import nudges
         stopped = nudges.chatgpt_card(getattr(ex, "code", "")) if spec.role != "worker" else None
         if stopped is not None:
+            if ex.code == "subscription_sharing_usage_limit_exceeded":
+                reset = nudges.chatgpt_reset(ex.details)
+                request["loopcut_chatgpt_limit"] = {"resets_at": reset}
             items.append(stopped)  # The ChatGPT plan stopped: offer Loopcut's models for the same chat (M2).
         elif own_key_text := own_key.chat_text(ex, getattr(turn, "own_key", None),
                                                     getattr(turn.config, "model", "")):
@@ -3000,7 +3217,10 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
             items.append(state.item_error(own_key_text, retry=getattr(ex, "status", None) == 429))
         elif getattr(ex, "status", None) == 402:
             item = _limit_item(ex)
-            if config.on_service(cfg.base_url) and item["reason"] in state.HOSTED_LIMITS:
+            if (config.on_service(cfg.base_url) and item["reason"] == "insufficient_credits"
+                    and request.get("loopcut_chatgpt_limit")):
+                _on_main(lambda: nudges.combine_limits(session, request, item))
+            elif config.on_service(cfg.base_url) and item["reason"] in state.HOSTED_LIMITS:
                 _hosted_refusal(session, turn, item, ex.account)
                 handled_refusal = True
             else:
@@ -3011,7 +3231,8 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
         elif getattr(ex, "code", "") in UPSTREAM_CODES and config.on_service(cfg.base_url):
             items.append(state.item_error(_upstream_text(ex), retry=True))
         else:
-            retry = getattr(ex, "code", "") in (llm.CONNECTION_LOST, llm.EMPTY_REPLY, llm.STREAM_FAILED)
+            retry = (getattr(ex, "code", "") in (llm.CONNECTION_LOST, llm.EMPTY_REPLY, llm.STREAM_FAILED)
+                     or getattr(ex, "status", None) in llm.RETRY_STATUSES)
             items.append(state.item_error(str(ex), retry=retry))
         if getattr(ex, "account", None) and not handled_refusal:
             _hosted_reply(turn, cfg, ex.account, session=session)
@@ -3030,6 +3251,11 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
         else:
             items.append(state.item_error(f"Internal error: {ex!r}"))
     finally:
+        if turn.outcome == "error" and any(row.get("retry") for row in items[first_item:]):
+            previous = next((row.get("name") for row in reversed(_turn_items(session, request))
+                             if row.get("kind") == "tool"), None)
+            request["loopcut_failed_step"] = {"code": turn.error_code,
+                                              "step": f"model reply after {previous}" if previous else "model reply"}
         conversations.close_open_tool_calls(messages, "Cancelled before this ran.")
         _resume_playback(spec)
         end_failed = False
@@ -3046,6 +3272,8 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
         changed = _changes_item(session, turn) if spec.changes_card and not turn.returned_submission else None
         if changed:
             items.append(changed)
+        if spec.role != "worker" and not turn.returned_submission:
+            _note_made(session, turn.scene_before, turn.scene_after)
         if spec.role != "worker" and turn.outcome != "error" and not turn.cancel.is_set():
             from . import nudges
             nudges.flush(session)  # A waiting trial or low-credit card, after the reply, never during it.
@@ -3117,6 +3345,9 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
 def send(text: str, *, note_items: list[dict] | None = None) -> bool:
     """Send a new message, or reuse the original notes handed off by a completed turn."""
     session = state.session()
+    from . import version_guard
+    if not version_guard.allow_turn(session):
+        return False
     draft = text
     text = text.strip()
     attachments = list(session["attachments"])
@@ -3175,10 +3406,14 @@ def send(text: str, *, note_items: list[dict] | None = None) -> bool:
     last = str(messages[-1].get("content")) if messages and messages[-1].get(context.STEP_LIMIT) else ""
     from . import motion_claims
     if (last in (completion_guard.CONTINUE, completion_guard.CORRECTION) or last.startswith(UNMADE_PROMPT[:30])
-            or last.startswith(motion_claims.NUDGE_HEAD)):
+            or last.startswith((motion_claims.NUDGE_HEAD, RETRY_NOTE_HEAD))):
         # A nudge or record correction left last by a Stop or an error; resume() goes on from it, a new message
         # replaces it (it would ask the model to run what the user stopped).
         messages.pop()
+    elif messages and isinstance(messages[-1].get(FINISH_NOTES), str):
+        # Likewise _finish_plan's go-on with the plan, but the click's notes it carried still go with this message.
+        notes = [line for line in messages.pop()[FINISH_NOTES].split("\n") if line]
+        session["between_turns"] = [*notes, *session["between_turns"]]
     for message in messages:
         if message.pop(context.UNRUN, False):  # A reply sent back last turn: its claims are not read as work done.
             message["content"] = UNMADE_STORED
@@ -3209,13 +3444,13 @@ def send(text: str, *, note_items: list[dict] | None = None) -> bool:
     extras = _extras_line(turn.config)
     if extras:
         scene = scene.replace("\n</scene_context>", f"\n{extras}\n</scene_context>", 1)
+    from . import render_offer
+    made = render_offer.made_line(session.get("made")) if spending.asked_for("render", text) else ""
+    if made:  # "Render it" with the newest thing out of the camera's shot (rel020-pro): a fact, so the model asks.
+        scene = scene.replace("\n</scene_context>", f"\n{made}\n</scene_context>", 1)
     # What the user started from a card since the last turn (turn_into_3d), and a click still running: the model's
     # only. Taken after turn.submission keeps them for a first request the service refuses.
-    between = list(session.get("between_turns") or [])
-    session["between_turns"] = []
-    between += [f"running now: the user's Turn it into 3D on the picture {name}; its model is not in the scene yet."
-                for (chat, _), name in list(state.running_clicks.items()) if chat == session["id"]]
-    between += workspace.running_notes(session["id"])  # And what a shell command left running that still runs.
+    between = _between_notes(session)
     if between:
         scene = scene.replace("\n</scene_context>", "\n" + "\n".join(between) + "\n</scene_context>", 1)
     content = f"{scene}\n\n{text or 'See the attached images.'}"
@@ -3236,6 +3471,19 @@ def send(text: str, *, note_items: list[dict] | None = None) -> bool:
         session["messages"].append({"role": "user", "content": content})
     _launch(session, turn)
     return True
+
+
+def _between_notes(session: dict, exclude=None) -> list:
+    """The model's notes of what happened since its last turn, taken from the chat (between_turns: a Turn it into 3D
+    click's, a shell command's that ended), then what still runs: a click (but exclude, the one ending now) and a
+    shell command left running."""
+    from . import workspace
+    between = list(session.get("between_turns") or [])
+    session["between_turns"] = []
+    between += [f"running now: the user's Turn it into 3D on the picture {name}; its model is not in the scene yet."
+                for key, name in list(state.running_clicks.items()) if key[0] == session["id"] and key != exclude]
+    between += workspace.running_notes(session["id"])  # And what a shell command left running that still runs.
+    return between
 
 
 def _launch(session: dict, turn: Turn) -> None:
@@ -3263,9 +3511,12 @@ def _launch(session: dict, turn: Turn) -> None:
 
 def resume() -> bool:
     """Go on with the turn that stopped short: after a limit card, once the plan allows it, or
-    after any error the user wants retried. Nothing is added to the conversation; the request
-    is simply made again. False when a turn is running or the last one finished."""
+    after any error the user wants retried. A failed reply gets one short continuation instruction.
+    False when a turn is running or the last one finished."""
     session = state.session()
+    from . import version_guard
+    if not version_guard.allow_turn(session):
+        return False
     if not state.can_resume(session):
         return False
     turn = Turn()
@@ -3275,6 +3526,18 @@ def resume() -> bool:
         session["items"].append(state.item_error(str(ex)))
         return False
     turn.roots = _project_roots()
+    request = next((m for m in reversed(session["messages"]) if context.is_turn_start(m)), {})
+    failed = request.pop("loopcut_failed_step", None)
+    if isinstance(failed, dict):  # A damaged file can hold another shape; then resume without the note.
+        messages = session["messages"]
+        start = context.turn_start(messages) + 1
+        # Replace this turn's note while keeping the answered history's cached prefix intact.
+        messages[start:] = [m for m in messages[start:] if not (m.get(context.STEP_LIMIT)
+                            and str(m.get("content", "")).startswith(RETRY_NOTE_HEAD))]
+        messages.append({"role": "user", context.STEP_LIMIT: True,
+                         "content": f"{RETRY_NOTE_HEAD}{failed.get('step', 'the last step')} failed "
+                                    f"({failed.get('code', 'error')}); "
+                                    "continue from there."})
     _launch(session, turn)
     return True
 
@@ -3309,7 +3572,7 @@ def decide(approved: bool, always: bool = False, index: int | None = None, drawn
     turn = session["turn"]
     if turn is None:
         return False
-    if approved and always and not card.get("paid_approval") and not card.get("install"):
+    if approved and always and not card.get("paid_approval") and not card.get("install") and not card.get("always_ask"):
         session["auto_heavy" if card.get("heavy") else "auto_run"] = True
     turn.approved = approved
     turn.decided.set()

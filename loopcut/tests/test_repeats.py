@@ -20,6 +20,17 @@ def run_key(summary: str) -> tuple:
 
 
 class NormalisingTest(unittest.TestCase):
+    def test_render_refusals_share_a_count_across_changed_code(self):
+        ledger = repeats.Ledger()
+        refusal = "RuntimeError: Render refused by the cost guard: render.render in run_python holds Blender until it ends."
+        notes = [ledger.record(step, run_key(f"render {step}"), failed_run(refusal), ok=False)
+                 for step in (1, 2, 3)]
+        self.assertEqual(notes[0], "")
+        self.assertIn("2 render attempts refused", notes[1])
+        self.assertIn("see_render(render=true)", notes[1])
+        self.assertIn("3 render attempts refused", notes[2])
+        self.assertNotIn("inspect_api", notes[2])
+
     def test_trivially_different_errors_collide(self):
         a = repeats.normalised(repeats.error_line(failed_run(
             "AttributeError: 'NoneType' object has no attribute 'inputs'", line=3)))

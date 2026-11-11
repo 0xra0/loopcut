@@ -95,13 +95,13 @@ class TryItTest(unittest.TestCase):
                                  max_steps=4, context_budget=40000)
         self.session = state.reset()
 
-    def snapshot(self, store, kind, label, **extra):
+    def snapshot(self, store, kind, label, *, protect=(), **extra):
         self.events.append("checkpoint")
         entry = {"id": uuid.uuid4().hex, "kind": kind, "label": label, "created": 0,
                  "size": 1, "expired": False, "source": "", "in_place": True, **extra}
         store.folder.mkdir(parents=True, exist_ok=True)
         store.snapshot_path(entry["id"]).write_bytes(b"stand-in for Blender snapshot")
-        store.add(entry, 1024 * 1024)
+        store.add(entry, 1024 * 1024, protect=protect)
         return entry
 
     def apply(self, module, descriptor, job, scene):

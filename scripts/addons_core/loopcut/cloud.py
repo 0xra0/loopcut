@@ -219,6 +219,15 @@ def schema(descriptor):
     properties = parameters.setdefault("properties", {})
     required = parameters.setdefault("required", [])
     description = descriptor["description"]
+    if descriptor['name'] == 'image_to_3d':
+        properties['input_check'] = {"type": "object", "properties": {
+            key: {"type": "boolean", "description": text} for key, text in IMAGE_CHECK.items()},
+            "required": list(IMAGE_CHECK), "additionalProperties": False}
+        description += (" First view the input with look_at_reference or read_file, then confirm input_check: "
+                        "one subject, its whole body for a character (never a cropped portrait for a full-body model), "
+                        "front or three-quarter angle, and one view rather than a turnaround sheet. "
+                        "If a check fails, suggest a clean front view first; calling with false answers asks the "
+                        "user to approve the named concerns and price.")
     for field in descriptor.get("file_inputs", []):
         if descriptor.get('apply') == 'apply_rig':
             continue  # Generated from selected originals, never arbitrary paths supplied by the model.
@@ -246,6 +255,9 @@ def schema(descriptor):
                 "description": "Optional quote from a previous call with the same inputs. The client obtains a quote and asks for approval before submission."}
     if _packs_scene(descriptor):  # The model cannot build a bundle; the contract's bundle field is filled per call.
         description += " Loopcut packs and uploads the current scene as its bundle itself."
+    from . import rebake
+    if rebake.is_rebake(descriptor):  # Loopcut sends the mesh and finds its source itself (rebake.py).
+        description = rebake.client_schema(description, properties, required)
     if descriptor.get('apply') == 'apply_rig':
         # The quote obtains consent for both rig tiers. This is a client-owned
         # capability flag, not something the model may accidentally omit.
@@ -374,6 +386,9 @@ class Runtime:
         self.manifest = _empty_manifest()
         self.etag, self.message, self.supported = "", "", True
         self.refreshed_at = 0
+        # Counted, not timed: Windows' monotonic clock ticks every ~15 ms, so two refreshes can read the same time.
+        self.successful_refreshes = 0
+        self.charge_sequence, self.refreshed_charge_sequence = 0, -1
         self.prompts_stale = False
         self.prompt_updates = 0
         self.skills = []
@@ -391,6 +406,7 @@ class Runtime:
         self.quotes = {}  # Session-only amounts for the approval card, never vendor input.
         self.quote_requests = {}
         self.lock, self.refresh_lock = threading.RLock(), threading.Lock()
+        self.paid_consent_lock = threading.Lock()
         self.load_cache()
 
     def load_cache(self):
@@ -471,6 +487,7 @@ class Runtime:
                 if wait and not self.prompts_stale:
                     return True  # A concurrent index user already refreshed while we waited.
                 prompt_updates = self.prompt_updates
+                charge_sequence = self.charge_sequence
                 headers = {"If-None-Match": self.etag} if self.etag else {}
                 if self.signed_in and self.model_source in MODEL_SOURCES:
                     headers[MODEL_SOURCE_HEADER] = self.model_source
@@ -482,6 +499,8 @@ class Runtime:
                 self.supported, self.message = True, ""
                 self.prompts_stale = self.prompt_updates != prompt_updates
                 self.refreshed_at = time.monotonic()
+                self.successful_refreshes += 1
+                self.refreshed_charge_sequence = charge_sequence
                 self._save()
             self._load_skills(fetch=True)
             self._observe()
@@ -872,11 +891,10 @@ def unregister():
 
 
 def locked_tools(runtime=None):
-    """Live tools the user could unlock (M1): their route is missing only for want of a sign-in, credits or
-    a plan. Anything No generation, Private mode, the region or an off switch blocks is never listed, and
-    nothing is while the server does not sell (config.billing_open). [{name, title, why, credits, own_key}]."""
+    """Live tools needing a sign-in, credits, a plan or a newer client. Policy blocks are not offered.
+    Purchase offers require billing_open; client updates do not. Returns card and model-note fields."""
     runtime = runtime or _runtime
-    if runtime is None or not runtime.supported or not config.billing_open():
+    if runtime is None or not runtime.supported:
         return []
     available = {d["name"] for d in runtime.descriptors()}
     no_generation, private = runtime.no_generation(), runtime.private_mode()
@@ -891,6 +909,9 @@ def locked_tools(runtime=None):
         if not isinstance(d, dict) or d.get("name") in available or d.get("name") == OFFER:
             continue
         reason = d.get("unavailable_reason")
+        version_locked = reason == "client_version"
+        if not config.billing_open() and not version_locked:
+            continue
         if (d.get("status") not in ("live", "beta") or (no_generation and d.get("kind") == "gen")
                 or d.get("apply") in {"import_material", "apply_shape_keys"}
                 or reason in ("no_generation", "private_mode", "disabled", "region")
@@ -898,8 +919,10 @@ def locked_tools(runtime=None):
             continue
         cost = (d.get("cost") or {}).get("credits_estimate")
         rows.append({"name": d["name"], "title": _display(d, "title") or d.get("title") or d["name"],
-                     "why": "sign_in" if not signed_in else "plan" if reason == "plan" else "credits",
-                     "credits": cost if type(cost) is int else None, "own_key": d["name"] in local})
+                     "why": "client_version" if version_locked else
+                            "sign_in" if not signed_in else "plan" if reason == "plan" else "credits",
+                     "credits": cost if type(cost) is int else None, "own_key": d["name"] in local,
+                     **({"min_app_version": d.get("min_app_version")} if version_locked else {})})
     return rows
 
 
@@ -912,7 +935,7 @@ def _offered(runtime, names):
     if runtime is None or not runtime.supported:
         return {}
     live = {d["name"]: d for d in runtime.descriptors()}
-    locked = {row["name"]: row for row in locked_tools(runtime)}
+    locked = {row["name"]: row for row in locked_tools(runtime) if row["why"] != "client_version"}
     prices = {}
     for name in names:
         if name in live:
@@ -942,6 +965,15 @@ TO_3D_LINE = ("The picture's card has a Turn it into 3D button for the user. Bef
 LOOK_FIRST = ("Not run: you haven't looked at the picture {name} yet. Look at it with look_at_reference (name "
               "\"{name}\"). If it shows one whole object on a plain background, as the user wants it, call image_to_3d "
               "again; if not, make it again with image_generate. Nothing was charged.")
+
+IMAGE_CHECK = {"single_subject": "Exactly one subject.",
+               "whole_subject": "The whole subject is visible; characters need the whole body, not a cropped portrait.",
+               "front_or_three_quarter": "The subject faces front or three-quarter, not away from the camera.",
+               "single_view": "One view, without a multi-view or turnaround sheet."}
+CHECK_FIRST = ("Not run: view the entire input with look_at_reference (attached image or datablock) or read_file "
+               "(file path), then set input_check: single_subject, whole_subject, front_or_three_quarter, "
+               "single_view as booleans. If a check fails, suggest a clean front view first; false answers "
+               "require the user's approval of the concerns and price. Nothing was charged.")
 
 
 def to_3d_offer(pictures, runtime=None):
@@ -1029,9 +1061,38 @@ def _offer(arguments):
     return tools.ToolResult(nudges.offer_locked(state.session(), tool, balance if tool["why"] == "credits" else None))
 
 
+CREDITS_SCHEMA = {"type": "function", "function": {"name": PREFIX + "credits", "title": "Checking credits",
+    "description": "Free: check the Loopcut credit balance and current tool prices before a paid call. "
+                   "Estimates describe default inputs; a call's quote gives its actual price. Own vendor keys "
+                   "bill the vendor account separately.",
+    "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}}
+
+
+def _credits(runtime):
+    from . import tools
+    fresh = _refresh_now(runtime)
+    with runtime.lock:
+        fresh = fresh and runtime.refreshed_charge_sequence == runtime.charge_sequence
+        prices = {d['name']: d for d in runtime.manifest.get('tools', [])
+                  if _descriptor(d) and d.get('status') in ('live', 'beta')}
+        prices.update({d['name']: d for d in runtime.descriptors()})
+        rows = [{"tool": name, "backend": d.get('backend', 'managed'),
+                 "credits_estimate": (d.get('cost') or {}).get('credits_estimate')
+                    if d.get('backend') != 'byok' else None,
+                 "quote_required": cloud_account.quoted(d) if d.get('backend') != 'byok' else False}
+                for name, d in sorted(prices.items())]
+        data = {"balance": cloud_account.balance(runtime.manifest) if runtime.signed_in else None,
+                "fresh": fresh, "prices": rows,
+                "note": "Prices are estimates for default inputs; quotes price the actual call. "
+                        "Own-key charges are paid to the vendor." + (" Using cached data; refresh failed." if not fresh else "")}
+    return tools.ToolResult(json.dumps(data, allow_nan=False))
+
+
 def tool_schemas():
     descriptors = _runtime.descriptors() if _runtime else []
     schemas = [schema(d) for d in descriptors]
+    if _runtime and _runtime.supported and (_runtime.signed_in or descriptors):
+        schemas.append(deepcopy(CREDITS_SCHEMA))
     locked = locked_tools()
     if locked:
         schemas.append(offer_schema(locked))
@@ -1183,7 +1244,7 @@ def approval(name, arguments=None, roots=(), *, files_only=False):
 
 def changes_scene(name):
     # job_status may apply finished outputs; checkpoint before either call. offer_tool only draws a card.
-    return is_tool(name) and tool_name(name) != OFFER
+    return is_tool(name) and tool_name(name) not in (OFFER, 'credits')
 
 
 def describe(name, arguments):
@@ -1193,6 +1254,8 @@ def describe(name, arguments):
     descriptor = next((d for d in (_runtime.descriptors() if _runtime else []) if d["name"] == bare), None)
     if bare == "job_status":
         return f"Cloud job {arguments.get('job_id', '')}", ""
+    if bare == 'credits':
+        return 'Checking credits · Free', ''
     if bare == OFFER:
         row = next((r for r in locked_tools() if r["name"] == (arguments or {}).get("tool")), None)
         return f"How to unlock {row['title'] if row else 'a cloud tool'}", ""
@@ -1237,12 +1300,14 @@ def _recheck_credits(runtime, name, arguments, locked, rig, fresh, is_cancelled,
 def _refresh_now(runtime, timeout=10.0):
     """Off the UI thread: the manifest as the server says it now, this refresh's or the one already running (waited
     for). False when neither happened."""
-    if runtime.refresh():
-        return True
-    if runtime.refresh_lock.acquire(timeout=timeout):
+    with runtime.lock:
+        before = runtime.successful_refreshes
+    refreshed = runtime.refresh()
+    if not refreshed and runtime.refresh_lock.acquire(timeout=timeout):
         runtime.refresh_lock.release()
-        return True
-    return False
+    with runtime.lock:
+        return (runtime.successful_refreshes > before
+                and runtime.refreshed_charge_sequence == runtime.charge_sequence)
 
 
 BALANCE_WATCH = (10.0, 600.0)  # After Add credits: refresh every 10 s, for up to 10 minutes, until the balance rises.
@@ -1395,9 +1460,34 @@ class _Cancel(threading.Event):
         self.heard = None  # Its turn is over: no stall clock to keep, and never a later turn's.
 
 
+# How long a call usually runs, for its card while it runs (rel020-chain: "Turning into 3D…" for about 2 minutes, with
+# no estimate): production's averages over 2026-10-21's jobs (try_samples), image_to_3d final 149 s and draft 33 s.
+USUALLY = {"image_to_3d": {"final": "usually about 2–3 minutes", "draft": "usually under a minute"}}
+
+
+def usually(name, arguments) -> str:
+    """The call's "usually about 2–3 minutes", or "" for a tool with no known time."""
+    times = USUALLY.get(tool_name(name or "") or name)
+    if not times:
+        return ""
+    quality = arguments.get("quality") if isinstance(arguments, dict) else None
+    return times.get(quality) or times["final"]
+
+
+def _usually_on_card(name, usual):
+    """Main thread: the running call's card says how long it usually takes (ui.layout's progress line)."""
+    from . import state
+    card = next((i for i in reversed(state.session()["items"])
+                 if i.get("name") == name and i.get("status") == "running"), None)
+    if card is not None:
+        card.setdefault("usually", usual)
+
+
 def _card_progress(card, progress):
     card['output'] = safe_value(f"{progress.get('pct', 0)}% · {progress.get('message', 'Working…')}"
                                if isinstance(progress, dict) else str(progress))
+    if isinstance(progress, dict) and type(progress.get('pct')) is int:  # The running card's line (ui.layout).
+        card['progress'] = safe_value({'pct': progress['pct'], 'message': str(progress.get('message') or '')})
     if tool_name(card.get('name', '')) == 'auto_rig':
         card['rig_stage'] = safe_value(progress.get('message', 'Rigging your character…')
                                       if isinstance(progress, dict) else str(progress))
@@ -1518,7 +1608,8 @@ def _validate_arguments(descriptor, arguments):
     json.dumps(arguments, allow_nan=False)
     parameters = schema(descriptor)["function"]["parameters"]
     properties = parameters.get("properties", {})
-    file_fields = ({} if descriptor.get('apply') == 'apply_rig' else
+    from . import rebake
+    file_fields = ({} if descriptor.get('apply') == 'apply_rig' or rebake.is_rebake(descriptor) else
                    {f["field"]: f for f in descriptor.get("file_inputs", [])})
     required = set(parameters.get("required", [])) | {
         field for field, spec in file_fields.items() if spec["required"]}
@@ -1613,6 +1704,11 @@ def execute(name, arguments, *, fresh=False):
         return _job_status(arguments)
     if tool_name(name) == OFFER:
         return _offer(arguments)
+    if tool_name(name) == "credits":
+        if _runtime is None:
+            return tools.ToolResult("Sign in to Loopcut to check credits.", ok=False)
+        runtime = _runtime
+        return tools.ToolResult("Checking credits…", then=lambda is_cancelled, on_main: _credits(runtime))
     runtime = _runtime
     descriptor = next((d for d in (runtime.descriptors() if runtime else []) if d["name"] == tool_name(name)), None)
     if descriptor is None:
@@ -1653,7 +1749,7 @@ def execute(name, arguments, *, fresh=False):
     if any(not callable(getattr(module, fn, None)) for fn in ("resolve_files", "run", "apply_result")):
         return tools.ToolResult("Cloud tools are not available in this build (cloud_jobs is incomplete).", ok=False)
     out_dir, session, bundle_checkpoint, replayed = None, None, None, None
-    rig_notice, rig_notice_first = '', False
+    rig_notice, rig_notice_first, input_warning = '', False, ''
     if _packs_scene(descriptor):
         arguments = {k: v for k, v in arguments.items() if k != "bundle"}  # Only the scene packed here is sent.
     offer = None
@@ -1684,6 +1780,9 @@ def execute(name, arguments, *, fresh=False):
         unseen = getattr(module, "made_unseen", lambda job: "")(made.get("job")) if made and not clicked else ""
         if unseen:  # The user's click needs no look.
             raise _InputMistake(LOOK_FIRST.format(name=unseen))
+        check = arguments.get('input_check')
+        if descriptor['name'] == 'image_to_3d':
+            arguments = {key: value for key, value in arguments.items() if key != 'input_check'}
         if descriptor.get('apply') == 'apply_rig':
             from . import autorig
             rig_notice, rig_notice_first = autorig.quote_notice(out_dir)
@@ -1695,10 +1794,21 @@ def execute(name, arguments, *, fresh=False):
         if sample is not None:  # A setup Try it card: its shipped result, not a job (try_samples).
             _discard_preparation(out_dir)
             return _sample_call(name, descriptor, module, arguments, sample, origin_scene)
+        if descriptor['name'] == 'image_to_3d' and files and not clicked:
+            if (module.picture_unseen(descriptor, arguments, files)
+                    or not isinstance(check, dict) or set(check) != set(IMAGE_CHECK)
+                    or not all(type(value) is bool for value in check.values())):
+                raise _InputMistake(CHECK_FIRST)
+            failed = [text for key, text in IMAGE_CHECK.items() if not check[key]]
+            if failed:
+                input_warning = ("Image requirements not met: " + " ".join(failed) +
+                                 " A clean front view may work better. Approve to use this image anyway.")
         # Exports are ours. Unresolved local paths require their own gate before hashing or upload,
         # including tools invoked outside agent.run_loop and workers that cannot ask the user.
         from . import files as local_files
-        external = [str(path) for path in files.values() if not Path(path).is_relative_to(out_dir)]
+        from . import blobs
+        external = [str(path) for path in files.values()
+                    if not isinstance(path, blobs.Stored) and not Path(path).is_relative_to(out_dir)]
         file_consent = bool(external and any(not local_files.inside(Path(path), local_files.project_roots())
                                             for path in external))
         from . import credentials
@@ -1758,9 +1868,15 @@ def execute(name, arguments, *, fresh=False):
                 if descriptor.get("apply") in UNDONE_APPLY and callable(getattr(consent, "asked_for", None)) else ""
             if undone:  # Before any quote: nothing ran and no card asks.
                 return tools.ToolResult(undone, ok=False, input_mistake=True)
+            usual = usually(name, arguments)
+            if usual:
+                on_main(lambda: _usually_on_card(name, usual))
             if file_consent:
                 cloud_account.confirm({'required': True, 'text': 'Upload local files: ' + ', '.join(external),
                                        'credits': None, 'file_access': True})
+            stored = getattr(module, "resolve_stored", None)
+            if callable(stored) and snapshot.client is not None:  # Files the service keeps, sent by hash (rebake).
+                stored(files, snapshot.client, cancel, on_main)
             call_arguments = arguments
             if bundle_checkpoint:  # Packed once: the quote, its card and an Approve retry all send this hash.
                 call_arguments = {**arguments, "bundle": _upload_bundle(session, bundle_checkpoint, out_dir / "bundle",
@@ -1774,7 +1890,7 @@ def execute(name, arguments, *, fresh=False):
                 project={"id": "local", "no_generation": snapshot.policy["no_generation"]},
                 cancel=cancel, client=snapshot.client, notice=rig_notice, notice_first=rig_notice_first,
                 on_progress=progress if descriptor.get('apply') == 'apply_rig' else None,  # Quote stages: a rig's only.
-                offer=offer)
+                offer=offer, input_warning=input_warning)
             on_main(lambda: cloud_account.recheck(runtime, descriptor, snapshot))
             authorized = True
         except cloud_http.CloudError as ex:
@@ -1892,11 +2008,20 @@ def _charged(job):
     return charged if type(charged) in (int, float) and math.isfinite(charged) and charged >= 0 else None
 
 
+def _note_charge(job):
+    """Invalidate balance snapshots on charge reports, even before outputs can be applied."""
+    runtime = _runtime
+    if (_charged(job) or 0) > 0 and runtime is not None:
+        with runtime.lock:
+            runtime.charge_sequence += 1
+
+
 def _settle_final(report, job, error):
     """A managed job's outcome, for the chat's spend: what it was charged, or nothing (C47)."""
     if error is not None:
         return _settle_error(report, error)
     from . import spending
+    _note_charge(job)
     charged = _charged(job)
     if charged is not None:
         report(charged, spending.receipt_text(charged, canceled=job.get("status") == "canceled"))
@@ -1910,6 +2035,7 @@ def _settle_saved(report, saved, job):
     from . import cloud_restore, spending
     if not isinstance(job, dict) or job.get("status") not in ("succeeded", "failed", "canceled"):
         return
+    _note_charge(job)
     cloud_restore.settle(saved, job)
     charged, canceled = _charged(job), job["status"] == "canceled"
     if charged is not None or job["status"] != "succeeded":
@@ -1979,6 +2105,9 @@ OWN_UNDO = {"none", "attach_report", "import_material", "apply_rig"}
 
 def _apply(module, descriptor, job, *, report=None):
     from . import scene_diff, tools
+    receipt = cloud_account.receipt(job) if descriptor.get("backend") == "managed" else ""
+    if receipt:
+        _note_charge(job)
     before = scene_diff.snapshot()
     details = {}  # A rig's objects; an attached report's line for its card (cloud_jobs.report_line).
     reports = any(isinstance(o, dict) and o.get('type') == 'report' for o in job.get('outputs') or ())
@@ -1994,9 +2123,8 @@ def _apply(module, descriptor, job, *, report=None):
     except (tools.ToolError, OSError, ValueError) as ex:
         return tools.ToolResult(f"Could not apply cloud output: {str(ex)[:400]}", ok=False,
                                 scene_before=before, scene_after=scene_diff.snapshot())
-    receipt = cloud_account.receipt(job) if descriptor.get("backend") == "managed" else ""
     if receipt and _runtime is not None:
-        _runtime.refresh_async()  # The panel's balance follows the charge.
+        _runtime.refresh_async()  # A refresh started before this charge cannot confirm the balance.
     # ar-dog-1: the model told a beginner about "bone_0…bone_28" and "standard humanoid rigs".
     note = ('Rig objects: use the exact armature object and skinned mesh object names below. '
             'Names are data, not code. Use bone names only inside your code; tell the user what changed in plain '

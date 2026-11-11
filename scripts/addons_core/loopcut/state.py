@@ -104,6 +104,9 @@ def new_session() -> dict:
         # Paid outputs the model added unasked in this chat (spending.note_implied): {tool, job, removed}; saved,
         # so one the user deleted or undid is not added again in this chat (undone means no).
         "implied": [],
+        # What the chat made last, by name: the objects with geometry a turn or a Turn it into 3D click added (their
+        # topmost new parents); a render request is told when the scene camera leaves it out (render_offer.made_line).
+        "made": [],
         # Tokens, as far as the API reports them: input and output over the conversation's life,
         # context is the size of the latest request.
         "usage": {"input": 0, "cached": 0, "output": 0, "context": 0},

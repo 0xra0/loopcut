@@ -16,7 +16,7 @@ from typing import Callable
 
 import bpy
 
-from . import result_store, scratch, studio
+from . import open_file, result_store, scratch, studio
 
 MAX_OUTPUT_CHARS = 8000
 CAPTURE_WIDTH = 640  # Image tokens scale with pixels; 640 still shows shape, placement and contact.
@@ -73,11 +73,12 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
         "name": "run_python",
         "title": "Updating the scene",
         "description": (
-            "Run Python in the live Blender session, a new namespace each call (`bpy`, `math`, `bmesh`, "
-            "`mathutils`, `Vector`, `Matrix` preloaded; reuse code via a Text block); "
-            "bpy.ops have a 3D viewport context (or another editor's, see `editor`). "
-            "Prefer the data API over bpy.ops. Returns prints, any traceback and the measured `Scene changes`. "
-            "One undo step per call."),
+            "Run Python in Blender's live session; a new namespace each call (`bpy`, `math`, `bmesh`, "
+            "`mathutils`, `Vector`, `Matrix` preloaded; reuse a Text block). "
+            "bpy.ops use 3D viewport context or `editor`. Prefer the data API. "
+            "Returns prints, tracebacks and `Scene changes`. "
+            "Never call bpy.ops.render.render in run_python; use see_render(render=true) or render_job. "
+            "One undo."),
         "parameters": {"type": "object", "properties": {
             "code": {"type": "string", "description": "Python source to execute"},
             "summary": {"type": "string", "description": "A few words for the user on what this does, in the language "
@@ -200,6 +201,7 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
         }, "required": ["mode"]},
     }},
     result_store.SCHEMA,  # Answered by the loop from its conversation's store (agent._read_result), in every loop.
+    open_file.SCHEMA,
 ]
 
 # Tools that can change the scene. A checkpoint is taken before the first one in a turn, and they
@@ -209,9 +211,12 @@ SCHEMAS = [  # Sent with every request: every word here is paid for on every ste
 # moves what a merge kept aside into it; uv_unwrap writes UV maps and transfer_textures bakes images and
 # repoints materials (uv_tools.py); bake_paint_masks makes images and stylize_material rebuilds a material
 # (paint_tools.py, offered to workers only). clip_background puts an attached clip behind a camera.
+# export_for_engine writes a file (files.WRITE_TOOLS asks for it) and may run shading's safe fix on what
+# it exports (engine_export.py), so it takes a checkpoint first.
 CHANGES_SCENE = {"run_python", "import_asset", "frame_camera", "delegate", "accept_quarantine", "uv_unwrap",
                  "transfer_textures", "bake_paint_masks", "stylize_material", "apply_build",
-                 "clip_background", "character_rig", "studio_action"}  # A camera background and the scene's frame rate (video_attach.py).
+                 "clip_background", "character_rig", "studio_action",  # A camera background and the scene's frame rate (video_attach.py).
+                 "export_for_engine", "add_detail_normal"}  # add_detail_normal: material nodes (detail_maps.py).
 NEEDS_APPROVAL = CHANGES_SCENE
 # Tools since merged into one with a `source` or an `action`: old name -> (current name, the
 # arguments the old name implied, the old name of its `id` argument). Saved conversations still
@@ -238,7 +243,7 @@ RENAMED = {
 # UV and pixel edits are not in scene_diff, but they come from run_python or uv_unwrap, and any call
 # to a scene-changing tool starts the reads over (agent.run_loop).
 SAME_WHILE_UNCHANGED = {"get_scene_info", "get_object_info", "inspect_api", "look_at_reference", "search_assets",
-                        "check_contact", "inspect_uv", "inspect_texture", "studio_guide", result_store.TOOL}
+                        "check_contact", "inspect_uv", "inspect_texture", "check_shading", "studio_guide", result_store.TOOL}
 # Code that renders, bakes or simulates can hold Blender for minutes. Such a step waits for the
 # user unless they said "Always allow renders": "Always allow" and auto-run do not cover it.
 # Not render.render: the cost guard refuses it in the code whatever the user allows
@@ -626,8 +631,9 @@ def run_python(code: str, summary: str = "", capture: str = "", editor: str = ""
             # The deadline cannot stop one long native call, such as evaluating subdivision level 6;
             # the cost guard checks before each bpy.ops call evaluates the scene.
             # live_file: a save elsewhere is a copy, so the user's open file and their next save stay theirs.
+            from . import files
             with (contextlib.redirect_stdout(stdout), cost_guard.watching_ops(), op_notes.watching_ops(),
-                  live_file.watching_ops()):
+                  live_file.watching_ops(), files.watching_deliverables()):
                 exec(compiled, _python_namespace())
         except _RunTimeout:
             ok, timed_out = False, deadline.seconds
@@ -954,6 +960,32 @@ def _framing_targets(objects) -> list:
     return list(targets.values())
 
 
+# A look asked to show a detail together with the object it is on framed the whole object: rel020-axe (2026-10-26)
+# framed the runes with the axe head, read the strokes as "subtle", and the user zoomed in and found none. A focus
+# object inside another's box (its centre within it) and at most DETAIL_SHARE of that one's size across is framed
+# alone; the object it is on stays in view around it.
+DETAIL_SHARE = 0.5
+
+
+def detail_names(boxes: dict) -> list[str]:
+    """Of focus objects' world boxes (name -> (low, high)), the details, in their order."""
+    def across(box):
+        return math.dist(box[0], box[1])
+    details = []
+    for name, box in boxes.items():
+        centre = [(a + b) / 2 for a, b in zip(*box)]
+        if any(other != name and all(low <= c <= high for c, low, high in zip(centre, *host))
+               and across(box) <= DETAIL_SHARE * across(host) for other, host in boxes.items()):
+            details.append(name)
+    return details
+
+
+def _box_of(obj) -> tuple:
+    from mathutils import Vector
+    corners = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+    return tuple(min(c[i] for c in corners) for i in range(3)), tuple(max(c[i] for c in corners) for i in range(3))
+
+
 def _bounding_sphere(objects) -> tuple["Vector", float]:
     from mathutils import Vector
     targets = _framing_targets(objects)
@@ -1111,11 +1143,17 @@ def _capture_viewport(focus: list[str] | None, angle: str, style: str, labels: b
     framed = angle in _VIEW_EULERS or angle == "sheet"
 
     visible = [o for o in scene.objects if o.visible_get() and _has_geometry_bounds(o)]
+    hosts = []
     if focus and framed:
         missing = [name for name in focus if name not in bpy.data.objects]
         if missing:
             raise ToolError(f"No such object(s): {', '.join(missing)}")
         targets = _framing_targets(bpy.data.objects[name] for name in focus)
+        # A detail and what it is on: the detail, framed close (DETAIL_SHARE); a sheet, for placement, shows both.
+        details = detail_names({o.name: _box_of(o) for o in targets}) if angle != "sheet" and len(targets) > 1 else []
+        if details:
+            hosts = [o for o in targets if o.name not in details]
+            targets = [o for o in targets if o.name in details]
     else:
         targets = visible
     if framed and not targets:
@@ -1199,6 +1237,9 @@ def _capture_viewport(focus: list[str] | None, angle: str, style: str, labels: b
         what = f"four views of {', '.join(o.name for o in targets[:12])}: three quarter, front (top row), side, top (bottom row)"
     else:
         what = f"{angle} view of {', '.join(o.name for o in targets[:12])}"
+        if hosts:
+            on = ", ".join(o.name for o in hosts[:6])
+            what += f", framed close as a detail on {on} (focus {on} alone for the whole)"
     if labels:
         what += "; objects are labelled with their names"
     if angle != "user":
@@ -1222,24 +1263,38 @@ CROP_MAX_SIDE = 1024   # A crop is a look at a detail; a whole stored reference 
 COMPARE_GAP = 8        # Pixels between the two halves of a comparison.
 
 
-def _reference(name: str) -> tuple[dict, Path]:
-    from . import conversations, state
+def _reference(name: str, *, export: bool = True) -> tuple[dict, Path | None]:
+    from . import cloud_http, cloud_jobs, conversations, state
     session = state.session()
     references = session.get("references") or []
     wanted = name.strip().lower()
     found = next((r for r in references if r["name"].lower() == wanted), None) or \
         next((r for r in references if wanted and wanted in r["name"].lower()), None)
+    image = getattr(getattr(bpy, 'data', None), 'images', {}).get(found['name'] if found else name)
+    if image is not None:
+        if not export:
+            return found or {'name': image.name}, None
+        descriptor = {'file_inputs': [{'field': 'image', 'required': True}]}
+        try:
+            exported = cloud_jobs.resolve_files(descriptor, {'image': image.name}, scratch.folder() / 'reference-input')
+            return found or {'name': image.name}, exported['image']
+        except (cloud_http.CloudError, RuntimeError, OSError) as ex:
+            if found is None:
+                raise ToolError(f"The image {image.name} could not be viewed: {ex}") from ex
     if found is None:
         names = ", ".join(r["name"] for r in references) or "none"
         raise ToolError(f"No attached image called {name!r}. Attached: {names}.")
-    path = conversations.image_path(session["id"], found.get("full") or found["ref"])
+    path = cloud_jobs.attached_image(found['name']) or \
+        conversations.image_path(session["id"], found.get("full") or found["ref"])
     if not path.is_file():
         raise ToolError(f"The image {found['name']} is no longer on disk.")
     return found, path
 
 
-def _seen(found: dict) -> None:
-    """A picture Loopcut made was shown to the model: its image_to_3d may run (cloud_jobs.made_unseen)."""
+def _seen(found: dict, path: Path) -> None:
+    """Record the exact whole-image input shown for image-to-3D checks."""
+    from . import cloud_jobs
+    cloud_jobs.note_picture_seen(path)
     if isinstance(found.get("made"), dict):
         found["made"]["seen"] = True
 
@@ -1323,7 +1378,8 @@ def look_at_reference(name: str, region: list | None = None, frame: int | None =
     out = scratch.folder() / "reference.png"
     out.parent.mkdir(exist_ok=True)
     shown = _save_pixels(pixels, out, CROP_MAX_SIDE)
-    _seen(found)
+    if region is None and frame is None:
+        _seen(found, path)
     return ToolResult(f"Image attached: {title}, {what}, {shown[0]}x{shown[1]} px "
                       f"(the full image is {width}x{height}).", image_path=out)
 
@@ -1333,7 +1389,7 @@ def compare_with_reference_tool(name: str, focus: list[str] | None = None, angle
                                 labels: bool = False) -> ToolResult:
     """The compare_with_reference tool; its capture waits for shaders like capture_viewport_tool."""
     from . import shaders
-    found, _ = _reference(name)  # An unknown reference fails before any shader work.
+    found, _ = _reference(name, export=False)  # Resolve the pixels once, after shader preparation.
     if frame is not None:
         from . import video_attach
         video_attach.frame_for(found, frame)  # So does a clip frame that is not there.
@@ -1370,7 +1426,8 @@ def compare_with_reference(name: str, focus: list[str] | None = None, angle: str
     canvas[:, left.shape[1] + COMPARE_GAP:] = right
     out = scratch.folder() / "compare.png"
     _save_pixels(canvas, out)
-    _seen(found)
+    if frame is None:
+        _seen(found, path)
     return ToolResult(f"Image attached: {title} on the left, {shot.text[len('Image attached: '):]}"
                       f" on the right, at the same height.", image_path=out)
 
@@ -1402,6 +1459,7 @@ def set_extras(mode: str) -> ToolResult:
 
 
 _DISPATCH = {
+    "open_file": open_file.open_file,
     "run_python": run_python,
     "get_scene_info": get_scene_info,
     "get_object_info": get_object_info,
@@ -1467,11 +1525,11 @@ def execute(name: str, arguments_json: str) -> ToolResult:
         if not isinstance(arguments, dict):
             return ToolResult("Invalid cloud tool arguments: use a JSON object.", ok=False, input_mistake=True)
         return cloud.execute(name, arguments)
-    from . import (assets, autorig, camera, contact, files, inspection, job_tools, orchestrator, paint_tools, texture_tools,
-                   uv_tools, video_attach, workspace)
+    from . import (assets, autorig, camera, contact, detail_maps, engine_export, files, inspection, job_tools, orchestrator, paint_tools,
+                   shading, texture_tools, uv_tools, video_attach, workspace)
     tables = (_DISPATCH, contact.DISPATCH, files.DISPATCH, job_tools.DISPATCH, inspection.DISPATCH, assets.DISPATCH,
               camera.DISPATCH, orchestrator.DISPATCH, uv_tools.DISPATCH, texture_tools.DISPATCH, paint_tools.DISPATCH,
-              workspace.DISPATCH, video_attach.DISPATCH, autorig.DISPATCH)
+              workspace.DISPATCH, video_attach.DISPATCH, autorig.DISPATCH, shading.DISPATCH, detail_maps.DISPATCH, engine_export.DISPATCH)
     fn = next((table[name] for table in tables if name in table), None)
     if fn is None:
         return ToolResult(f"Unknown tool {name!r}. Available: {', '.join(n for table in tables for n in table)}", ok=False,

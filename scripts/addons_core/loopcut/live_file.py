@@ -58,17 +58,18 @@ def _elsewhere(kwargs: dict) -> bool:
 
 def refusal(idname: str) -> str:
     return (f"Refused: {idname} in run_python would put another file in place of the user's open file, so "
-            f"their next save would go somewhere else. Nothing was changed. To use another .blend, bring what "
-            f"you need in with bpy.data.libraries.load, or work on it in a background Blender (run_blender) "
-            f"where you have one. To save the scene to a file, use bpy.ops.wm.save_as_mainfile(filepath=..., "
+            f"their next save would go somewhere else. Nothing was changed. To switch to another .blend, use "
+            f"open_file, which asks for consent and saves current changes first. To bring in data without "
+            f"switching files, use bpy.data.libraries.load or run_blender in a background workspace. "
+            f"Background workers should open files there, never in the live window. To save a copy, use bpy.ops.wm.save_as_mainfile(filepath=..., "
             f"copy=True).")
 
 
 def _note(path: str) -> None:
     current = _current()
     where = current if current else "unsaved, as it was"
-    _notices.append(f"{NOTICE_PREFIX} saved {os.path.basename(str(path))} as a copy; the user's open file is "
-                    f"still {where}.")
+    _notices.append(f"{NOTICE_PREFIX} saved {_absolute(str(path))} as a copy; the user's open file is "
+                    f"still {where}. Give the full saved path in your reply.")
 
 
 class _KeptOp:

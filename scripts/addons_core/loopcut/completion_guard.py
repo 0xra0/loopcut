@@ -137,8 +137,8 @@ def imitates_records(text: str, tool_names) -> bool:
 
 # --- Announced steps -------------------------------------------------------------------------------------
 # "I will next import ...", "I'll now search ...", "Let's try ...": first person, about to act, with a verb
-# for something the tools do. English only, and narrow on purpose: a missed nudge costs the user one
-# "go on"; a false one makes Loopcut talk over a question it asked.
+# for something the tools do. Each language needs an immediate, first-person action; questions
+# and work deferred to the user must still end the turn.
 _STEP_VERBS = (r"import(?:ing)?|search(?:ing)?|look(?:ing)?|browse|find(?:ing)?|fetch(?:ing)?|download(?:ing)?|"
                r"grab(?:bing)?|bring(?:ing)?|load(?:ing)?|add(?:ing)?|create|creating|make|making|build(?:ing)?|"
                r"model(?:l?ing)?|place|placing|put(?:ting)?|position(?:ing)?|move|moving|rotate|rotating|scale|"
@@ -194,6 +194,49 @@ _INTERIM_DONE = re.compile(
     re.I | re.M)
 _LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
 
+# Inflected first-person verbs, or an explicit future cue paired with a tool action.
+_LOCAL_INTENTS = tuple(re.compile(pattern, re.I) for pattern in (
+    r"^(?:(?:сейчас|теперь|затем|далее|сначала|после этого)[,\s]+)?(?:я\s+)?"
+    r"(?:добавлю|создам|проверю|найду|импортирую|загружу|построю|изменю|исправлю|"
+    r"применю|настрою|перемещу|поверну|удалю|продолжу|сделаю)\b",
+    r"^(?:(?:次に|まず|これから|続いて|今から|では)[、\s]*)?.*?"
+    r"(?:追加|作成|確認|配置|検索|読み込み|調整|修正|適用|移動|削除|生成|レンダリング)"
+    r"(?:します|していきます|しましょう)(?:[。！!]|$)",
+    r"\b(?:voy\s+a\s+(?:crear|añadir|agregar|buscar|importar|comprobar|revisar|ajustar|"
+    r"aplicar|mover|eliminar|generar|renderizar)|"
+    r"crearé|añadiré|agregaré|buscaré|importaré|comprobaré|revisaré|ajustaré|aplicaré|moveré|"
+    r"eliminaré|generaré|renderizaré)\b",
+    r"\b(?:سأضيف|سأنشئ|سأفحص|سأبحث|سأستورد|سأضبط|سأطبق|سأحرك|سأحذف|سأولد)\b",
+    r"\b(?:nu\s+|derefter\s+|først\s+)?(?:vil\s+jeg|jeg\s+vil)\s+(?:nu\s+)?"
+    r"(?:tilføje|oprette|bygge|importere|søge|kontrollere|justere|anvende|flytte|slette|generere|rendere)\b",
+))
+# Each wait pattern belongs to the intent pattern at the same index. A material name or
+# an earlier completed step must not turn an immediate action into a hand-off.
+_LOCAL_WAITS = tuple(re.compile(pattern, re.I) for pattern in (
+    r"\b(?:если|когда|выберите|подтвердите|скажите|жду|завтра|позже|в следующий раз|дайте знать|"
+    r"какой|какую|какие|хотите|вашего подтверждения|по запросу|при необходимости|по желанию|"
+    r"на (?:ваш|твой) вкус|как вам нравится|по мере необходимости)\b",
+    r"(?:ください|必要なら|必要に応じて|お好み|好みに合わせて|れば|たら|であれば|ご希望|場合|選んで|教えて|お知らせ|待ちます|明日|後で|次回|ですか|ますか)",
+    r"\b(?:si|cuando|elige|dime|confirma|avísame|quieres|prefieres|prefieras|mañana|más tarde|"
+    r"próximo mensaje|lo que\s+(?:quieras|prefieras|necesites|elijas)|a (?:tu|su) gusto|según (?:lo )?necesites)\b",
+    r"\b(?:إذا|إن أردت|عندما|اختر|أخبرني|أكد|تأكيدك|هل|ما اللون|غدا|لاحقا|سأنتظر|لن|عند طلبك|كما تريد|حسب (?:رغبتك|الحاجة|ذوقك))\b",
+    r"\b(?:hvis|når|vælg|bekræft|fortæl|sig til|vil du|skal jeg|hvilken|hvilket|senere|i morgen|efter dine ønsker|"
+    r"efter behov|som du ønsker)\b",
+))
+_LOCAL_FINISHED = tuple(re.compile(pattern, re.I) for pattern in (
+    r"^готово\b", r"^(?:完了しました|終わりました)", r"^(?:listo|terminado)\b",
+    r"^انتهيت\b", r"^færdig\b",
+))
+# An explicit finished deliverable ends the reply, as English's "is ready" does. A
+# completed-step prefix ("Done: ... Next ...") can still introduce immediate work.
+_LOCAL_READY = tuple(re.compile(pattern, re.I) for pattern in (
+    r"^(?:\w+\s+){1,4}(?:готов|сделан)[аоы]?\s*[.!]?$",
+    r"^.{1,40}[はが](?:完成しました|準備ができました|できました)[。！!]?$",
+    r"^(?:(?:el|la|los|las)\s+)?(?:\w+\s+){1,4}(?:est[áa]n?\s+)?list[oa]s?\s*[.!]?$",
+    r"^(?:\w+\s+){1,4}جاهز[ة]?\s*[.!]?$",
+    r"^(?:\w+\s+){1,4}er\s+(?:klar|færdig)\s*[.!]?$",
+))
+
 
 def nudges_left(request: dict) -> int:
     """What is left of the user turn's MAX_CONTINUES: the announced-step nudges sent (CONTINUED), the one
@@ -233,7 +276,7 @@ def announces_step(text: str) -> bool:
     if not isinstance(text, str):
         return False
     prose = re.sub(r"(?:```|~~~).*?(?:```|~~~|\Z)", "\n\n", text.replace("’", "'"), flags=re.S)
-    if _HANDOFF.search(prose):
+    if re.search(r"[?¿？؟]", prose):
         return False
     paragraphs = [p for p in re.split(r"\n\s*\n", prose) if p.strip()]
     if not paragraphs:
@@ -241,12 +284,96 @@ def announces_step(text: str) -> bool:
     lines = [line for line in paragraphs[-1].splitlines() if line.strip()]
     if _LIST_ITEM.match(lines[-1]):
         return False
-    sentences = [s.strip() for line in lines for s in re.split(r"(?<=[.!])\s+", _plain(line)) if s.strip()]
-    has_intent = any(_INTENT.search(s) and not _DEFERRED.search(s) and not s.rstrip(" .!*_").endswith(":")
-                     for s in sentences[-2:])
-    if not has_intent:
+    sentences = [s.strip() for line in lines for s in re.split(r"(?<=[.!])\s+|(?<=[。！？؟])\s*", _plain(line))
+                 if s.strip()]
+    tail = " ".join(sentences[-2:])
+    first = re.split(r"(?<=[.!])\s+|(?<=[。！？؟])\s*", _plain(paragraphs[0]))[0].strip()
+    if any(ready.search(first) for ready in _LOCAL_READY):
         return False
-    if _INTERIM_DONE.search(sentences[-1]) and not _INTENT.search(sentences[-1]):
-        return False
-    return True
+    # Local: an interim "X is done/ready" closing sentence ends the reply unless it also announces a step.
+    interim_done = bool(_INTERIM_DONE.search(sentences[-1]) and not _INTENT.search(sentences[-1]))
+    for sentence in sentences[-2:]:
+        if sentence.rstrip(" .!*_").endswith((":", "：")):
+            continue
+        if (_INTENT.search(sentence) and not _DEFERRED.search(sentence) and not _HANDOFF.search(prose)
+                and not interim_done):
+            return True
+        if any(intent.search(sentence) and not wait.search(tail)
+               and not (finished.search(sentences[-1]) and not intent.search(sentences[-1]))
+               for intent, wait, finished in zip(_LOCAL_INTENTS, _LOCAL_WAITS, _LOCAL_FINISHED)):
+            return True
+    return False
 
+
+# The rest of a plan the model stated after its 3D step (agent._finish_plan: a Turn it into 3D click ran that step).
+# A priced step reads "(6 credits)", "(about 5 credits)", "(~80 credits, $0.80)".
+_PRICED = re.compile(r"\((?:about|around|roughly|~)?\s*\d[\d,]*(?:\.\d+)?\s+credits?\b[^)]*\)", re.I)
+_TO_3D = re.compile(r"\b(?:3[ -]?d|three-dimensional)\b", re.I)
+_PLAN_VERBS = (_STEP_VERBS + r"|optimi[sz]e|retopologi[sz]e|clean|decimate|reduce|simplify|export|prepare|convert|"
+               r"bake|paint")
+# In the 3D step's own sentence: what follows it is a step when it is priced, sequenced or "and <does something>".
+_THEN = re.compile(r"\b(?:then|after\s+that|afterwards|next|finally|lastly)\b", re.I)
+_AND_DOES = re.compile(r"^\W*(?:and|plus)\s+(?:(?:i'll|i\s+will)\s+)?(?:also\s+)?(?:" + _PLAN_VERBS + r")\b", re.I)
+# A later sentence is a step of the same plan when it is a list item, priced, or leads with a sequence word.
+_LEADS = re.compile(r"^\W*(?:(?:and\s+)?then|after\s+that|afterwards|next|finally|lastly)\b|"
+                    r"^\W*i(?:'ll|\s+will)\s+then\b", re.I)
+_OWN_PRICE_GAP = re.compile(r"[,;:]|\b(?:then|and|after|next|before|or)\b", re.I)
+MAX_PLAN_REST = 300
+
+
+def _plan_units(text: str) -> list:
+    """(sentence, is a list item) in order; None between paragraphs, where a plan's steps stop."""
+    units = []
+    for line in text.replace("’", "'").replace("**", "").replace("`", "").splitlines():
+        if not line.strip():
+            units.append(None)
+            continue
+        item = bool(_LIST_ITEM.match(line))
+        for k, sentence in enumerate(s for s in re.split(r"(?<=[.!?])\s+", _plain(line)) if s.strip()):
+            units.append((sentence, item and k == 0))
+    return units
+
+
+def _after_3d_step(sentence: str, credits) -> int | None:
+    """Where the 3D step ends in this sentence, its own price included: the first 3D mention priced right after it
+    ("a textured 3D model (80 credits)"), else the last 3D mention, else the price the click was charged."""
+    last = None
+    for found in _TO_3D.finditer(sentence):
+        own = _PRICED.search(sentence, found.end())
+        if own and not _OWN_PRICE_GAP.search(sentence[found.end():own.start()]):
+            return own.end()
+        last = found.end()
+    if last is not None:
+        return last
+    for price in _PRICED.finditer(sentence) if type(credits) in (int, float) and credits > 0 else ():
+        if re.search(rf"(?<![\d.,]){credits:g}(?![\d.,]*\d)", price.group().replace(",", "")):
+            return price.end()
+    return None
+
+
+def plan_after(replies, credits=None) -> str:
+    """The rest of the plan a turn's replies stated after its 3D step, in the model's words ("and optimize it for
+    game use (about 5 credits)."), or "" when none states a step after it. The 3D step is found as _after_3d_step
+    says; its rest is what follows it in that sentence and the sentences or list items right after it that are
+    steps themselves. It is a step when priced, sequenced (then, next, after that, finally) or "and" with what it
+    does; anything else after the 3D step ("so you can approve the design") is not."""
+    for text in replies:
+        if not isinstance(text, str):
+            continue
+        units = _plan_units(text)
+        for i, unit in enumerate(units):
+            if unit is None:
+                continue
+            end = _after_3d_step(unit[0], credits)
+            if end is None:
+                continue
+            head = unit[0][end:].strip()
+            rest = [head] if (_PRICED.search(head) or _THEN.search(head) or _AND_DOES.match(head)) else []
+            for later in units[i + 1:]:
+                if later is None or not (later[1] or _PRICED.search(later[0]) or _LEADS.match(later[0])):
+                    break
+                rest.append(later[0])
+            rest = " ".join(part.strip(" ,;:") for part in rest if part.strip(" ,;:.!?"))
+            if rest:
+                return rest[:MAX_PLAN_REST]
+    return ""
