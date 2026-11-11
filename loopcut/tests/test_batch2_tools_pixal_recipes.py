@@ -152,6 +152,14 @@ class Batch2ToolsPixalRecipesTest(unittest.TestCase):
                 self.assertEqual(report["final_diagnostics"]["islands"], 1)
                 self.assertGreaterEqual(report["final_diagnostics"]["min_thickness"], 0.005)
 
+    def test_pixal3d_honest_remesh_labeling(self):
+        """When native quad remesher is unavailable, remesh stage is honestly labeled voxel_remesh."""
+        from loopcut.studio_vendor.handlers import pixal3d
+        obj = types.SimpleNamespace(modifiers=types.SimpleNamespace(new=lambda **kw: types.SimpleNamespace()))
+        stages = pixal3d._apply_refinement_stages(obj, target_symmetry=False, min_thickness=0.0, quad_target=1000)
+        self.assertIn("voxel_remesh", stages)
+        self.assertNotIn("quad_remesh", stages)
+
     # -------------------------------------------------------------------------
     # Item 7: Verified Recipes for Installed Add-ons
     # -------------------------------------------------------------------------

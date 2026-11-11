@@ -16,8 +16,6 @@ from typing import Callable
 
 import bpy
 
-from . import open_file, result_store, scratch, studio
-
 MAX_OUTPUT_CHARS = 8000
 CAPTURE_WIDTH = 640  # Image tokens scale with pixels; 640 still shows shape, placement and contact.
 NAMES_LIMIT = 400    # Names get_scene_info lists when rows do not fit; past this, narrow the question.
@@ -66,6 +64,9 @@ class ToolResult:
     converted: str = ""  # image_to_3d done on a picture Loopcut made: the job that made it (agent._turned_into_3d).
     unapplied: str = ""  # A finished job whose outputs did not land (another file open): its id (cloud.apply_finished).
     input_mistake: bool = False  # Refused for the model's arguments (InputMistake): a plain card, the text behind its toggle.
+
+
+from . import open_file, result_store, scratch
 
 
 SCHEMAS = [  # Sent with every request: every word here is paid for on every step.
@@ -1457,6 +1458,8 @@ def set_extras(mode: str) -> ToolResult:
         turn.spending = dataclasses.replace(turn.spending, extras=value)
     return ToolResult(f'Saved: paid extras "{label}". The user can change it in Preferences.')
 
+
+from . import studio
 
 _DISPATCH = {
     "open_file": open_file.open_file,

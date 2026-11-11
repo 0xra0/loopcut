@@ -154,3 +154,78 @@ CHECK GREEN
 ```
 CHECK GREEN
 ```
+
+
+---
+
+# Batch 4 Report: Live Swift Checkpoint, Vision Answer Verification, Genuine Pixal3D Geometry Metrics, and Real GPU Coordination
+
+## Summary of Changes
+
+### Item 1: Test the Real Swift Checkpoint
+- **Files Changed**:
+  - `loopcut/tests/test_swift_compatibility.py`
+- **Caller that runs the code**:
+  - `llm.stream_chat`, `agent._normalize_tool_calls`, `agent.py` streaming event loop
+- **Test that proves it**:
+  - `RealSwiftCheckpointLiveTest.test_live_swift_tool_call_stream`
+  - `RealSwiftCheckpointLiveTest.test_live_swift_stream_cancellation`
+- **Observable Check**:
+  - Live Swift checkpoint running on Strata port 8099 generates OpenAI-compatible tool calls (`call.name == "inspect_api"`, arguments `{"query": "bmesh"}`) via stream.
+  - Stream cancellation mid-generation cleanly interrupts inference and raises `llm.Cancelled`.
+
+### Item 2: Make Vision Verification Check the Answer
+- **Files Changed**:
+  - `scripts/addons_core/loopcut/strata.py`
+  - `loopcut/tests/test_swift_compatibility.py`
+- **Caller that runs the code**:
+  - `strata.verify_strata_vision`, `LOOPCUT_OT_strata_verify_vision.execute`
+- **Test that proves it**:
+  - `SwiftCompatibilityTest.test_verify_vision_capability_with_test_image`
+  - `SwiftCompatibilityTest.test_verify_vision_capability_rejects_wrong_answer`
+  - `RealSwiftCheckpointLiveTest.test_live_swift_vision_answer_verification`
+- **Observable Check**:
+  - Sends a 16x16 test PNG containing a distinct red square asking for the shape's color.
+  - Verifies that the model's reply actually contains the expected subject ("red"); rejects wrong answers with `vision_verified: False`.
+  - Live Swift test against port 8099 passes with `vision_verified: True` and reply `"Red"`.
+
+### Item 3: Make Pixal3D Measurements Real
+- **Files Changed**:
+  - `scripts/addons_core/loopcut/studio_vendor/handlers/pixal3d.py`
+  - `loopcut/tests/test_batch2_tools_pixal_recipes.py`
+- **Caller that runs the code**:
+  - `pixal3d._measure_pixal3d_flaws`, `pixal3d._apply_refinement_stages`, `pixal3d.pixal3d_refine`
+- **Test that proves it**:
+  - `Batch2ToolsPixalRecipesTest.test_pixal3d_honest_remesh_labeling`
+  - `Batch2ToolsPixalRecipesTest.test_pixal3d_refine_staged_repair_and_acceptance`
+- **Observable Check**:
+  - Non-manifold edges are accurately counted using BMesh (`not getattr(e, "is_manifold", True)`), detecting open boundaries and non-manifold junctions rather than loose wire edges.
+  - Shell thickness is raycast along inward vertex normals using `mathutils.bvhtree.BVHTree.FromPolygons` to measure true distance to opposite interior surfaces.
+  - Remeshing checks for native quad remeshers; when only voxel remeshing is available, it is labeled honestly as `"voxel_remesh"` rather than claiming `"quad_remesh"`.
+
+### Item 4: Wire GPU Coordination into Actual Jobs
+- **Files Changed**:
+  - `scripts/addons_core/loopcut/gpu_coordinator.py`
+  - `scripts/addons_core/loopcut/agent.py`
+  - `scripts/addons_core/loopcut/studio_vendor/handlers/pixal3d.py`
+  - `scripts/addons_core/loopcut/studio_vendor/handlers/uv_bake.py`
+  - `scripts/addons_core/loopcut/render_offer.py`
+  - `scripts/addons_core/loopcut/job_tools.py`
+  - `scripts/addons_core/loopcut/jobs.py`
+  - `loopcut/tests/test_batch3_memory_gpu_evals.py`
+- **Caller that runs the code**:
+  - `agent.py:call` (Strata inference)
+  - `pixal3d.pixal3d_generate` & `pixal3d._run` (ComfyUI generation)
+  - `uv_bake.bake_maps` (Texture baking)
+  - `render_offer._start`, `job_tools.start_render_job`, `jobs.cancel` (Rendering)
+- **Test that proves it**:
+  - `Batch3MemoryGpuEvalsTest.test_gpu_coordinator_rejects_insufficient_vram`
+  - `Batch3MemoryGpuEvalsTest.test_gpu_coordinator_vram_and_queue`
+- **Observable Check**:
+  - `acquire_gpu_stage` strictly enforces VRAM headroom: when `free_mib < required_vram_mib`, it rejects immediate acquisition with `Insufficient VRAM headroom` and queues the job.
+  - Strata inference, ComfyUI generation, texture baking, and local rendering acquire their leases before running and release them in `finally` blocks upon completion or error.
+
+## `./check.sh main` Last Line
+```
+CHECK GREEN
+```

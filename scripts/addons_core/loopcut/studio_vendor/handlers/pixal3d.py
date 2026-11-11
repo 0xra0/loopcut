@@ -87,6 +87,11 @@ def _run(job, args, cwd, env, max_seconds):
         job["error"] = str(exc)
     finally:
         job["finished"] = time.time()
+        try:
+            from loopcut import gpu_coordinator
+            gpu_coordinator.release_gpu_stage(job["id"])
+        except (ImportError, AttributeError):
+            pass
 
 
 @command("pixal3d_generate", "reference")
@@ -139,6 +144,11 @@ def pixal3d_generate(name, description, image_path=None, seed=None, tries=1, sep
     job = {"id": uuid.uuid4().hex[:8], "name": name, "state": "running", "started": time.time(),
            "log": os.path.join(bpy.app.tempdir or "/tmp", f"pixal3d_{name}_{int(time.time())}.log")}
     _jobs[job["id"]] = job
+    try:
+        from loopcut import gpu_coordinator
+        gpu_coordinator.acquire_gpu_stage(job["id"], "pixal3d_comfy", required_vram_mib=4096)
+    except (ImportError, AttributeError):
+        pass
     threading.Thread(target=_run, args=(job, args, str(root), env, int(max_minutes) * 60), daemon=True).start()
     return {"job_id": job["id"], "log": job["log"],
             "note": "A full run takes about 30-90 minutes on a 16 GB GPU. Poll pixal3d_status every few "
@@ -206,15 +216,54 @@ def _measure_pixal3d_flaws(obj) -> dict:
         islands = len({find(i) for i in range(n_verts)})
 
     non_manifold = 0
-    if hasattr(data, "edges"):
-        non_manifold = sum(1 for e in data.edges if getattr(e, "is_loose", False))
+    try:
+        import bmesh
+        bm = bmesh.new()
+        bm.from_mesh(data)
+        bm.edges.ensure_lookup_table()
+        non_manifold = sum(1 for e in bm.edges if not getattr(e, "is_manifold", True))
+        bm.free()
+    except (ImportError, AttributeError, ValueError, RuntimeError):
+        if hasattr(data, "edges"):
+            non_manifold = sum(1 for e in data.edges if getattr(e, "is_loose", False))
 
     refl_co = co.copy()
     refl_co[:, 0] = -refl_co[:, 0]
     sample_idx = np.linspace(0, n_verts - 1, min(100, n_verts), dtype=int)
     diffs = np.linalg.norm(co[sample_idx, None, :] - refl_co[None, sample_idx, :], axis=-1)
     symmetry_residual = float(np.mean(np.min(diffs, axis=1))) if len(sample_idx) > 0 else 0.0
-    min_thickness = max(0.001, float(min(dims) * 0.05))
+
+    min_thickness = 0.0
+    try:
+        from mathutils.bvhtree import BVHTree
+        import mathutils
+        polys = getattr(data, "polygons", [])
+        if len(polys) > 0 and n_verts > 0:
+            poly_verts = [list(p.vertices) for p in polys]
+            bvh = BVHTree.FromPolygons(co, poly_verts)
+            normals = np.empty(n_verts * 3, dtype=np.float32)
+            data.vertices.foreach_get("normal", normals)
+            normals = normals.reshape(-1, 3)
+            step = max(1, n_verts // 100)
+            hits = []
+            for idx in range(0, n_verts, step):
+                v_norm = mathutils.Vector(normals[idx])
+                if v_norm.length_squared < 1e-6:
+                    continue
+                v_norm.normalize()
+                v_co = mathutils.Vector(co[idx])
+                origin = v_co - v_norm * 1e-4
+                direction = -v_norm
+                loc, hit_norm, hit_idx, dist = bvh.ray_cast(origin, direction)
+                if loc is not None and dist is not None and dist > 1e-4:
+                    hits.append(dist)
+            if hits:
+                min_thickness = float(np.percentile(hits, 5))
+    except (ImportError, AttributeError, ValueError, RuntimeError):
+        pass
+
+    if min_thickness <= 0.0:
+        min_thickness = max(0.001, float(min(dims) * 0.05)) if dims else 0.001
 
     return {
         "islands": int(islands),
@@ -278,14 +327,28 @@ def _apply_refinement_stages(obj, target_symmetry: bool, min_thickness: float, q
                 pass
 
     if quad_target > 0:
+        applied_quad = False
         try:
-            if hasattr(obj, "modifiers"):
-                mod = obj.modifiers.new(name="Pixal3D_Remesh", type='REMESH')
-                mod.mode = 'VOXEL'
-                mod.voxel_size = 0.02
+            if hasattr(bpy.ops.mesh, "quad_remesh"):
+                bpy.ops.mesh.quad_remesh(target_faces=int(quad_target))
                 stages.append("quad_remesh")
+                applied_quad = True
+            elif hasattr(bpy.ops, "qremesher") and hasattr(bpy.ops.qremesher, "remesh"):
+                bpy.ops.qremesher.remesh()
+                stages.append("quad_remesh")
+                applied_quad = True
         except (RuntimeError, AttributeError):
             pass
+
+        if not applied_quad:
+            try:
+                if hasattr(obj, "modifiers"):
+                    mod = obj.modifiers.new(name="Pixal3D_Remesh", type='REMESH')
+                    mod.mode = 'VOXEL'
+                    mod.voxel_size = 0.02
+                    stages.append("voxel_remesh")
+            except (RuntimeError, AttributeError):
+                pass
 
     return stages
 

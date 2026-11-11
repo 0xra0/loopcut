@@ -2469,6 +2469,15 @@ def _request(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SIN
         _redraw()
 
     def call(messages: list[dict], effort: str) -> llm.Completion:
+        is_strata = False
+        gpu_job_id = f"strata_{id(turn)}_{int(time.time() * 1000)}"
+        try:
+            from . import strata as strata_mod, gpu_coordinator
+            if strata_mod.is_strata_provider(cfg.base_url):
+                is_strata = True
+                gpu_coordinator.acquire_gpu_stage(gpu_job_id, "strata_inference", required_vram_mib=1024)
+        except (ImportError, AttributeError):
+            pass
         try:
             with image_budget.notifying(on_image_drop):
                 completion = llm.stream_chat(
@@ -2488,6 +2497,13 @@ def _request(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SIN
                 reply["text"] = ""  # Its card's Try again asks for this reply afresh: no fragment of it above the card.
                 _drop_empty(items, reply)
             raise
+        finally:
+            if is_strata:
+                try:
+                    from . import gpu_coordinator
+                    gpu_coordinator.release_gpu_stage(gpu_job_id)
+                except (ImportError, AttributeError):
+                    pass
 
     def record(completion: llm.Completion) -> None:
         _hosted_reply(turn, cfg, completion.account, success=True, session=session)

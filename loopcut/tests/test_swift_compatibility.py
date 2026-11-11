@@ -249,9 +249,9 @@ class SwiftCompatibilityTest(unittest.TestCase):
     # -------------------------------------------------------------------------
 
     def test_verify_vision_capability_with_test_image(self):
-        """Active image test sends payload to /chat/completions and reports real interpretation."""
+        """Active image test sends payload to /chat/completions and validates correct subject detection."""
         chat_reply = json.dumps({
-            "choices": [{"message": {"role": "assistant", "content": "Pixel"}}],
+            "choices": [{"message": {"role": "assistant", "content": "Red"}}],
         }).encode("utf-8")
 
         def fake_vision_urlopen(req, timeout=None):
@@ -264,7 +264,25 @@ class SwiftCompatibilityTest(unittest.TestCase):
             with mock.patch("urllib.request.urlopen", side_effect=fake_vision_urlopen):
                 res = strata.verify_strata_vision("http://127.0.0.1:8099/v1", model="swift-test")
                 self.assertTrue(res["vision_verified"])
-                self.assertIn("Pixel", res["reply"])
+                self.assertIn("Red", res["reply"])
+
+    def test_verify_vision_capability_rejects_wrong_answer(self):
+        """Vision verification fails when server does not identify the expected subject."""
+        chat_reply = json.dumps({
+            "choices": [{"message": {"role": "assistant", "content": "Blue circle"}}],
+        }).encode("utf-8")
+
+        def fake_vision_urlopen(req, timeout=None):
+            resp = mock.MagicMock()
+            resp.read.return_value = chat_reply
+            resp.__enter__.return_value = resp
+            return resp
+
+        with mock.patch("socket.create_connection", return_value=mock.MagicMock()):
+            with mock.patch("urllib.request.urlopen", side_effect=fake_vision_urlopen):
+                res = strata.verify_strata_vision("http://127.0.0.1:8099/v1", model="swift-test")
+                self.assertFalse(res["vision_verified"])
+                self.assertIn("Vision check failed", res["details"])
 
     def test_verify_vision_capability_handles_server_refusal(self):
         """Vision verification cleanly handles server without vision support."""
@@ -282,6 +300,75 @@ class SwiftCompatibilityTest(unittest.TestCase):
                 res = strata.verify_strata_vision("http://127.0.0.1:8099/v1")
                 self.assertFalse(res["vision_verified"])
                 self.assertIn("vision", res["error"])
+
+
+class RealSwiftCheckpointLiveTest(unittest.TestCase):
+    """End-to-end tests against the live running Swift checkpoint on Strata."""
+
+    def setUp(self):
+        self.patch = mock.patch.dict(sys.modules, {"bpy": fake_bpy()})
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+        if not strata.is_port_open("127.0.0.1", 8099, timeout=0.5):
+            raise unittest.SkipTest("Strata server not running on port 8099")
+
+    def test_live_swift_tool_call_stream(self):
+        """Live checkpoint correctly generates streamed tool calls with structured JSON."""
+        tools_schema = [{
+            "type": "function",
+            "function": {
+                "name": "inspect_api",
+                "description": "Inspect Blender Python API",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            },
+        }]
+        completion = llm.stream_chat(
+            base_url="http://127.0.0.1:8099/v1",
+            api_key="test",
+            model="swift-1.5-abliterated-iq2_xs",
+            messages=[{"role": "user", "content": "Please inspect the bmesh API."}],
+            tools=tools_schema,
+            reasoning_effort="medium",
+            on_text=lambda t: None,
+            is_cancelled=lambda: False,
+            max_tokens=200,
+        )
+        self.assertGreater(len(completion.tool_calls), 0)
+        call = completion.tool_calls[0]
+        self.assertEqual(call.name, "inspect_api")
+        args = json.loads(call.arguments)
+        self.assertEqual(args.get("query"), "bmesh")
+
+    def test_live_swift_stream_cancellation(self):
+        """Live stream cancellation interrupts inference cleanly and raises llm.Cancelled."""
+        cancelled = [False]
+
+        def on_text(t):
+            cancelled[0] = True
+
+        with self.assertRaises(llm.Cancelled):
+            llm.stream_chat(
+                base_url="http://127.0.0.1:8099/v1",
+                api_key="test",
+                model="swift-1.5-abliterated-iq2_xs",
+                messages=[{"role": "user", "content": "Count from 1 to 100 in words."}],
+                tools=[],
+                reasoning_effort="medium",
+                on_text=on_text,
+                is_cancelled=lambda: cancelled[0],
+                max_tokens=200,
+            )
+
+    def test_live_swift_vision_answer_verification(self):
+        """Live checkpoint interprets the red square test image and correctly identifies 'red'."""
+        res = strata.verify_strata_vision("http://127.0.0.1:8099/v1", model="swift-1.5-abliterated-iq2_xs", timeout=25.0)
+        self.assertTrue(res["ok"])
+        self.assertTrue(res["vision_verified"])
+        self.assertIn("red", res["reply"].lower())
 
 
 if __name__ == "__main__":

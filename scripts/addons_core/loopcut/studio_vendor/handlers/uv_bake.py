@@ -254,6 +254,12 @@ def bake_maps(low, high=None, maps=("NORMAL",), size=1024, cage_extrusion=0.05, 
     for h, _, _ in hidden:
         h.hide_set(False)
         h.hide_render = False
+    bake_job_id = f"bake_{lo.name}_{int(time.time() * 1000)}"
+    try:
+        from loopcut import gpu_coordinator
+        gpu_coordinator.acquire_gpu_stage(bake_job_id, "texture_bake", required_vram_mib=2048)
+    except (ImportError, AttributeError):
+        pass
     results = []
     try:
         scene.render.engine = "CYCLES"
@@ -304,4 +310,9 @@ def bake_maps(low, high=None, maps=("NORMAL",), size=1024, cage_extrusion=0.05, 
         for h, was_hidden, was_render_hidden in hidden:
             h.hide_set(was_hidden)
             h.hide_render = was_render_hidden
+        try:
+            from loopcut import gpu_coordinator
+            gpu_coordinator.release_gpu_stage(bake_job_id)
+        except (ImportError, AttributeError):
+            pass
     return {"low": lo.name, "high": [h.name for h in highs], "maps": results}

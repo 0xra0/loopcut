@@ -108,6 +108,20 @@ class Batch3MemoryGpuEvalsTest(unittest.TestCase):
             gpu_coordinator.release_gpu_stage("job_comfy_1")
             self.assertIsNone(gpu_coordinator.get_vram_status()["active_job"])
 
+    def test_gpu_coordinator_rejects_insufficient_vram(self):
+        """GPU coordinator rejects immediate lease when headroom is inadequate and queues the request."""
+        mock_low_vram = {"total_mib": 16384, "used_mib": 15500, "free_mib": 884, "backend": "test"}
+        with mock.patch("loopcut.gpu_coordinator.get_rocm_vram_info", return_value=mock_low_vram):
+            gpu_coordinator._active_heavy_job = None
+            gpu_coordinator._job_queue = []
+
+            ok, msg = gpu_coordinator.acquire_gpu_stage("heavy_bake", "texture_bake", required_vram_mib=2048)
+            self.assertFalse(ok)
+            self.assertIn("Insufficient VRAM headroom", msg)
+            self.assertIn("Queued at position 1", msg)
+            self.assertIsNone(gpu_coordinator.get_vram_status()["active_job"])
+            self.assertEqual(len(gpu_coordinator.get_vram_status()["queued_jobs"]), 1)
+
     # -------------------------------------------------------------------------
     # Item 10: Local Evals Pixal3D Cases and Quality Report
     # -------------------------------------------------------------------------

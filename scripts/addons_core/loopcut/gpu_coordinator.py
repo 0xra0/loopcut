@@ -90,6 +90,13 @@ def acquire_gpu_stage(job_id: str, kind: str, required_vram_mib: int = 2048) -> 
         return False, f"Queued (position {pos}) behind active GPU stage {_active_heavy_job.get('kind')} ({_active_heavy_job.get('job_id')}). Free VRAM: {free} MiB."
 
     ok, headroom_msg = check_vram_headroom_for_heavy_op(required_vram_mib)
+    if not ok:
+        entry = {"job_id": job_id, "kind": kind, "required_mib": required_vram_mib, "queued_at": time.time()}
+        if not any(j.get("job_id") == job_id for j in _job_queue):
+            _job_queue.append(entry)
+        pos = len(_job_queue)
+        return False, f"Insufficient VRAM headroom for {kind}: {headroom_msg} Queued at position {pos}."
+
     _active_heavy_job = {"job_id": job_id, "kind": kind, "required_mib": required_vram_mib, "started_at": time.time()}
     _job_queue = [j for j in _job_queue if j.get("job_id") != job_id]
     return True, f"Acquired GPU stage for {kind} with {free} MiB free. ({headroom_msg})"

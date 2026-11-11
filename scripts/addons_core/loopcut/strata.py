@@ -35,8 +35,24 @@ COMMON_RUN_SCRIPTS = [
     Path("/opt/Strata/run.sh"),
 ]
 
-# 1x1 test PNG for active vision capability verification
-TEST_PNG_DATA_URL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+# 16x16 test PNG containing a distinct red square for vision verification
+TEST_PNG_DATA_URL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAHElEQVR4nGP4TyJgGOwaGBiwo1EN9NVABBiEGgCoAH2fxYWAGQAAAABJRU5ErkJggg=="
+EXPECTED_VISION_SUBJECT = "red"
+
+
+def is_strata_provider(base_url: str = "") -> bool:
+    """Return True if base_url points to a local or configured Strata endpoint."""
+    if not base_url:
+        return False
+    try:
+        parsed = urlparse(base_url)
+        host = parsed.hostname or ""
+        port = parsed.port
+        if host in ("127.0.0.1", "localhost", "0.0.0.0") and port in (STRATA_DEFAULT_PORT, STRATA_FALLBACK_PORT):
+            return True
+        return "strata" in base_url.lower()
+    except (ValueError, AttributeError):
+        return False
 
 
 def get_strata_config_path(custom_path: str = "") -> Path | None:
@@ -228,7 +244,7 @@ def test_strata_connection(base_url: str = config.STRATA_BASE_URL, timeout: floa
     return status
 
 
-def verify_strata_vision(base_url: str = config.STRATA_BASE_URL, model: str = "", timeout: float = 8.0) -> dict:
+def verify_strata_vision(base_url: str = config.STRATA_BASE_URL, model: str = "", timeout: float = 20.0) -> dict:
     """Actively send a test image to the Strata server to verify real interpretation capability."""
     parsed = urlparse(base_url)
     host = parsed.hostname or "127.0.0.1"
@@ -255,12 +271,12 @@ def verify_strata_vision(base_url: str = config.STRATA_BASE_URL, model: str = ""
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "Describe this image in one word."},
+                    {"type": "text", "text": "What color is the shape in this image? Reply with just the color name."},
                     {"type": "image_url", "image_url": {"url": TEST_PNG_DATA_URL}},
                 ],
             }
         ],
-        "max_tokens": 10,
+        "max_tokens": 100,
         "stream": False,
     }
     body = json.dumps(payload).encode("utf-8")
@@ -277,11 +293,15 @@ def verify_strata_vision(base_url: str = config.STRATA_BASE_URL, model: str = ""
             choices = data.get("choices") or []
             if choices and isinstance(choices[0], dict):
                 msg = choices[0].get("message") or {}
-                content = msg.get("content") or ""
+                content = (msg.get("content") or "").strip()
                 result["ok"] = True
-                result["vision_verified"] = True
-                result["reply"] = content.strip()
-                result["details"] = f"Vision verified: server interpreted test image with reply: {content.strip()!r}"
+                result["reply"] = content
+                if EXPECTED_VISION_SUBJECT.lower() in content.lower():
+                    result["vision_verified"] = True
+                    result["details"] = f"Vision verified: server correctly identified '{EXPECTED_VISION_SUBJECT}' (reply: {content!r})"
+                else:
+                    result["vision_verified"] = False
+                    result["details"] = f"Vision check failed: expected '{EXPECTED_VISION_SUBJECT}', got {content!r}"
             else:
                 result["details"] = "Vision request completed but returned no choices."
     except urllib.error.HTTPError as err:
