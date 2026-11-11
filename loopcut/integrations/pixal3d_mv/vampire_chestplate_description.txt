@@ -1,0 +1,55 @@
+A highly detailed, visually striking dark fantasy MALE BREASTPLATE inspired by the gothic armor aesthetics of The Witcher 3. A luxurious ancient vampire lord's ceremonial battle chestplate, combining necromancy, satanic occult symbolism, and sinister aristocratic craftsmanship. This is ONLY the front torso armor, not a complete armor set.
+
+DESIGN AND SILHOUETTE:
+
+A powerful masculine breastplate with broad pectoral proportions, angular sternum ridges, a tapered armored waist, and a strong inverted-triangle torso silhouette. Designed for an adult male warrior with a broad chest and athletic build. Masculine anatomical shaping without exaggerated muscle imitation.
+
+The armor begins beneath the collarbone and extends to the natural waist. It includes a slightly raised integrated gothic neckline, articulated lower chest segments, and strong beveled side contours. No separate pauldrons, shoulder armor, sleeves, arm guards, helmet, belt, or backplate.
+
+The outer structure is made from large forged-metal plates with realistic thickness. Symmetrical angular sections and overlapping lower rib plates create a visually sophisticated but physically believable piece of medieval armor.
+
+CENTRAL NECROMANTIC EMBLEM:
+
+At the center of the chest is a prominent, precisely formed inverted five-pointed pentagram engraved into a raised circular blackened-steel medallion built directly into the armor.
+
+The central emblem is surrounded by a thick sculpted silver bezel, subtle ancient necromantic runes, and restrained ritual engraving. The pentagram has five clearly recognizable points, accurate geometric proportions, clean metallic edges, and unobstructed visibility.
+
+A small deep-crimson gemstone sits immediately below the central emblem in a heavy claw-shaped metal setting.
+
+GOTHIC VAMPIRE ORNAMENTATION:
+
+Two symmetrical bat-wing reliefs extend outward from the central ornament across the upper pectoral plates. Their forms are sharply sculpted, with clear wing membranes represented by shallow metal grooves rather than delicate unsupported structures.
+
+Elegant thorned gothic scrollwork frames the lower chest. Two small stylized skull reliefs sit on opposite sides beneath the central circle, with clearly defined eye sockets, nasal openings, and sculpted jaws.
+
+Elongated gothic rib patterns and pointed silver borders emphasize a predatory, aristocratic appearance.
+
+All decorations follow the structure of the armor. Distinct major ornaments, carefully controlled relief depths, and clean negative spaces. No randomly tangled details.
+
+MATERIALS AND COLOR:
+
+Aged blackened steel, dark oxidized iron, worn silver edge trim, subtle crimson enamel, and polished dark-red gemstone accents. A rich combination of matte black metal, brushed dark steel, and carefully highlighted silver bevels.
+
+Realistic forged-steel roughness, restrained scratches, slight patina, dark recessed engravings, subtle tool marks, and crisp metallic surface transitions. Highly detailed sculptural ornamentation without excessive fine surface noise.
+
+PIXAL3D MULTIVIEW RECONSTRUCTION REQUIREMENTS:
+
+AAA-quality stylized game asset with an elaborate gothic visual design but a deliberately clean and understandable 3D structure.
+
+Strong primary silhouette, sophisticated secondary armor forms, and selected high-quality tertiary details.
+
+Physically meaningful depth, clear separation of raised and recessed surfaces, broad readable engraving channels, consistent plate thickness, smooth continuous surfaces, and crisp hard-surface bevels.
+
+Large ornaments are represented by distinct solid relief shapes rather than chaotic microgeometry. The principal details must remain recognizable when reconstructed into a 3D mesh.
+
+The breastplate is one coherent armor assembly with an open rear. It is not a solid block, not a complete enclosed torso, and not a wearable mannequin.
+
+PRESENTATION:
+
+Strict orthographic front view of the complete chestplate, perfectly upright, centered, vertically aligned, and bilaterally symmetrical.
+
+The entire armor piece occupies approximately 85 percent of the image height with generous neutral margins. Both sides and the lower edge remain fully visible.
+
+Uniform matte light-gray background, bright soft studio lighting, sharp focus, neutral reflections, minimal shadows, high-quality 3D game-asset concept render.
+
+Single standalone male chestplate only. No person, mannequin, arms, shoulders, cape, environment, pedestal, labels, text, or watermark.

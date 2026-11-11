@@ -1,0 +1,36 @@
+{
+  "large": [
+    "elongated tapered gothic medallion ending in one sharp lower tip, about 4 cm thick at the rim",
+    "one top bail with two necklace chain strands leaving toward the upper left and upper right",
+    "large circular raised bezel in the upper two thirds of the medallion"
+  ],
+  "medium": [
+    "a six-pointed star made of two interlocking equilateral triangles inside the bezel, raised 3 mm",
+    "four small symmetrical skull reliefs around the bezel at 2, 4, 8 and 10 o'clock",
+    "a beveled silver rim around the whole outline"
+  ],
+  "small": [
+    "a thin ring of rune engravings between the bezel and the rim",
+    "a dark red gem set in the centre of the star",
+    "fine scratches and oxidation on the flat iron surfaces"
+  ],
+  "materials": [
+    "blackened forged iron body",
+    "worn aged silver rim, bezel and star",
+    "small oval iron chain links"
+  ],
+  "views": {
+    "back": [
+      "a flat backing plate with the same outline as the front",
+      "a deeply engraved circular sigil in the centre of the backing plate, NOT the front star repeated",
+      "a raised silver rim around the backing plate"
+    ],
+    "left": ["a thin side profile showing the rim, the raised bezel and the star standing proud of the body"],
+    "right": ["a thin side profile, the mirror image of the left side"]
+  },
+  "avoid": [
+    "keyring",
+    "front design repeated on the back",
+    "fused chain links"
+  ]
+}

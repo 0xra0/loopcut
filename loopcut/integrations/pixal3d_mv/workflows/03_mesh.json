@@ -1,0 +1,21 @@
+{
+ "1": {"class_type": "Trellis2LoadImageWithTransparency", "inputs": {"image": "pa_views/front.png"}},
+ "2": {"class_type": "Trellis2LoadImageWithTransparency", "inputs": {"image": "pa_views/left.png"}},
+ "3": {"class_type": "Trellis2LoadImageWithTransparency", "inputs": {"image": "pa_views/back.png"}},
+ "4": {"class_type": "Trellis2LoadImageWithTransparency", "inputs": {"image": "pa_views/right.png"}},
+ "5": {"class_type": "Trellis2LoadPixal3DMV_GGUF", "inputs": {"model_format": "GGUF Q8_0", "backend": "sdpa", "device": "cuda", "low_vram": true, "keep_models_loaded": false}},
+ "6": {"class_type": "Trellis2MeshWithVoxelMultiViewGenerator_GGUF", "inputs": {"pipeline": ["5",0],
+   "front_image": ["1",2], "left_image": ["2",2], "back_image": ["3",2], "right_image": ["4",2],
+   "seed": 1234, "pipeline_type": "1536_cascade",
+   "sparse_structure_steps": 12, "sparse_structure_guidance_strength": 7.5, "sparse_structure_guidance_rescale": 0.7, "sparse_structure_rescale_t": 5.0,
+   "shape_steps": 12, "shape_guidance_strength": 7.5, "shape_guidance_rescale": 0.5, "shape_rescale_t": 3.0,
+   "texture_steps": 12, "texture_guidance_strength": 1.0, "texture_guidance_rescale": 0.0, "texture_rescale_t": 3.0,
+   "max_num_tokens": 49152, "sparse_structure_resolution": 32, "generate_texture_slat": true,
+   "sparse_structure_guidance_interval_start": 0.6, "sparse_structure_guidance_interval_end": 1.0,
+   "shape_guidance_interval_start": 0.6, "shape_guidance_interval_end": 1.0,
+   "texture_guidance_interval_start": 0.6, "texture_guidance_interval_end": 0.9,
+   "use_tiled_decoder": true, "front_axis": "z", "blend_temperature": 1.0,
+   "sparse_structure_sampler": "euler", "shape_sampler": "euler", "texture_sampler": "euler"}},
+ "7": {"class_type": "Trellis2PostProcessAndUnWrapAndRasterizer_GGUF", "inputs": {"mesh": ["6",0], "bvh": ["6",1], "mesh_cluster_threshold_cone_half_angle_rad": 60, "mesh_cluster_refine_iterations": 0, "mesh_cluster_global_iterations": 1, "mesh_cluster_smooth_strength": 1, "texture_size": 2048, "remesh": true, "remesh_band": 1, "remesh_project": 0, "target_face_num": 300000, "simplify_method": "Cumesh", "fill_holes": true, "texture_alpha_mode": "OPAQUE", "dual_contouring_resolution": "1024", "double_side_material": false, "remove_floaters": true, "bake_on_vertices": true, "use_custom_normals": false, "uv_unwrap_method": "Xatlas", "remove_inner_faces": true}},
+ "8": {"class_type": "Trellis2ExportMesh", "inputs": {"trimesh": ["7",0], "filename_prefix": "3D/KnightSword_PA_MV", "file_format": "glb"}}
+}

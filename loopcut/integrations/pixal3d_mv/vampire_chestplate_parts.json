@@ -1,0 +1,8 @@
+{
+ "parts": [
+  {"name": "medallion", "prompt": "round medallion with a pentagram", "kind": "round", "max": 1},
+  {"name": "bat_wings", "prompt": "bat wing ornament", "kind": "ornament", "max": 2},
+  {"name": "skull", "prompt": "skull", "kind": "ornament", "max": 2},
+  {"name": "gem", "prompt": "red gemstone", "kind": "gem", "max": 1}
+ ]
+}

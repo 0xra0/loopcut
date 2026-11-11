@@ -1,0 +1,16 @@
+# Ruff config for this pipeline. The scripts use a deliberately dense one-liner style
+# (import a, b; semicolon chains; short loop names), so the cosmetic pycodestyle rules
+# are silenced here while the semantic ones (F* undefined/unused, E9* bare-except)
+# stay on. line-length covers the longest pre-existing usage/docstring line.
+
+[tool.ruff]
+line-length = 140
+
+[tool.ruff.lint]
+select = ["E", "F"]
+ignore = ["E401", "E701", "E702", "E703", "E741"]
+
+[tool.ruff.lint.per-file-ignores]
+# Probe script: import order is the point (sys.path first, moderngl last so a GL failure
+# cannot hide the sparse-attention result).
+"ultratex/selftest.py" = ["E402"]

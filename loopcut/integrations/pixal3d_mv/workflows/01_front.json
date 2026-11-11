@@ -1,0 +1,102 @@
+{
+ "1": {
+  "class_type": "UnetLoaderGGUF",
+  "inputs": {
+   "unet_name": "qwen-image-2.1-Q8_0.gguf"
+  }
+ },
+ "2": {
+  "class_type": "QwenImage21Cache",
+  "inputs": {
+   "model": [
+    "1",
+    0
+   ],
+   "device": "auto",
+   "dtype": "default"
+  }
+ },
+ "3": {
+  "class_type": "CLIPLoaderGGUF",
+  "inputs": {
+   "clip_name": "Qwen3-VL-8B-Instruct-Q8_0.gguf",
+   "type": "qwen_image"
+  }
+ },
+ "4": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "qwen_image_2.1_vae_bf16.safetensors"
+  }
+ },
+ "5": {
+  "class_type": "TextEncodeQwenImage21",
+  "inputs": {
+   "clip": [
+    "3",
+    0
+   ],
+   "resolution": 1024,
+   "negative_prompt": "",
+   "prompt": "A single medieval knight's longsword, hero prop for a 3D game, standing perfectly vertical with the point straight up and the pommel at the bottom. Long straight double-edged polished steel blade with a central fuller groove, simple straight steel crossguard with slightly flared ends, grip wrapped in dark brown leather with thin twisted wire, round wheel-shaped steel pommel. Front view looking at the flat face of the blade, orthographic, eye-level, centered, the sword fills 90% of the frame height, nothing cropped. Soft, even studio lighting, no harsh shadows, no reflections of the environment. Realistic 3D game asset render, clean readable shapes, high-detail textures. No hands, no scabbard, no stand, no floating parts, no text. Plain white background."
+  }
+ },
+ "6": {
+  "class_type": "EmptyLatentImage",
+  "inputs": {
+   "width": 1024,
+   "height": 1024,
+   "batch_size": 1
+  }
+ },
+ "7": {
+  "class_type": "KSampler",
+  "inputs": {
+   "model": [
+    "2",
+    0
+   ],
+   "positive": [
+    "5",
+    0
+   ],
+   "negative": [
+    "5",
+    1
+   ],
+   "latent_image": [
+    "6",
+    0
+   ],
+   "seed": 447606998181262,
+   "steps": 25,
+   "cfg": 1,
+   "sampler_name": "euler",
+   "scheduler": "simple",
+   "denoise": 1
+  }
+ },
+ "8": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "7",
+    0
+   ],
+   "vae": [
+    "4",
+    0
+   ]
+  }
+ },
+ "9": {
+  "class_type": "SaveImage",
+  "inputs": {
+   "images": [
+    "8",
+    0
+   ],
+   "filename_prefix": "PixelArtistry/01_front_sword"
+  }
+ }
+}

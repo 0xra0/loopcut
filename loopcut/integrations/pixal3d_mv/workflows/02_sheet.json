@@ -1,0 +1,116 @@
+{
+ "1": {
+  "class_type": "UnetLoaderGGUF",
+  "inputs": {
+   "unet_name": "qwen-image-2.1-Q8_0.gguf"
+  }
+ },
+ "2": {
+  "class_type": "QwenImage21Cache",
+  "inputs": {
+   "model": [
+    "1",
+    0
+   ],
+   "device": "auto",
+   "dtype": "default"
+  }
+ },
+ "3": {
+  "class_type": "CLIPLoaderGGUF",
+  "inputs": {
+   "clip_name": "Qwen3-VL-8B-Instruct-Q8_0.gguf",
+   "type": "qwen_image"
+  }
+ },
+ "4": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "qwen_image_2.1_vae_bf16.safetensors"
+  }
+ },
+ "10": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "pa_front_sword.png"
+  }
+ },
+ "5": {
+  "class_type": "TextEncodeQwenImage21",
+  "inputs": {
+   "clip": [
+    "3",
+    0
+   ],
+   "vae": [
+    "4",
+    0
+   ],
+   "resolution": 1024,
+   "negative_prompt": "",
+   "images.image_1": [
+    "10",
+    0
+   ],
+   "prompt": "Turn the sword in <image1> into an orthographic 3D modeling reference sheet: a single horizontal row of four equal-width tall panels, evenly spaced. From left to right: 1) front view, identical to <image1>, the flat face of the blade facing the camera. 2) left side view, an exact 90\u00b0 profile: the blade is seen edge-on as a very thin vertical line, the crossguard is seen end-on as a short thin bar, the grip and the round pommel are seen from the side so the pommel looks like a thin disc. 3) back view, exactly 180\u00b0: the other flat face of the blade, identical in outline to the front view. 4) right side view, an exact 90\u00b0 profile, mirror of view 2, the blade edge-on. The camera orbits a completely static sword at the same height: the sword stays perfectly vertical with the point up and never turns toward the camera. Identical shapes, colors, materials and scale in all views, each sword centered in its panel, point and pommel at the same heights in every panel, no overlap between views. Flat, even lighting, plain white background, no text, no labels."
+  }
+ },
+ "6": {
+  "class_type": "EmptyLatentImage",
+  "inputs": {
+   "width": 2048,
+   "height": 1024,
+   "batch_size": 1
+  }
+ },
+ "7": {
+  "class_type": "KSampler",
+  "inputs": {
+   "model": [
+    "2",
+    0
+   ],
+   "positive": [
+    "5",
+    0
+   ],
+   "negative": [
+    "5",
+    1
+   ],
+   "latent_image": [
+    "6",
+    0
+   ],
+   "seed": 1001,
+   "steps": 25,
+   "cfg": 1,
+   "sampler_name": "euler",
+   "scheduler": "simple",
+   "denoise": 1
+  }
+ },
+ "8": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "7",
+    0
+   ],
+   "vae": [
+    "4",
+    0
+   ]
+  }
+ },
+ "9": {
+  "class_type": "SaveImage",
+  "inputs": {
+   "images": [
+    "8",
+    0
+   ],
+   "filename_prefix": "PixelArtistry/02_sheet_sword"
+  }
+ }
+}

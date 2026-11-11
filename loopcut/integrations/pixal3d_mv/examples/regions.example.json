@@ -1,0 +1,11 @@
+{
+  "regions": [
+    {
+      "name": "surface_region_adjust_bounds_for_your_model",
+      "bounds": [[0, 0, 0], [1, 0.55, 1]],
+      "smooth_iterations": 3,
+      "smooth_factor": 0.15,
+      "force": false
+    }
+  ]
+}

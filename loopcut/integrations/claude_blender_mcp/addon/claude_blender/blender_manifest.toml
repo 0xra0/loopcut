@@ -1,0 +1,19 @@
+schema_version = "1.0.0"
+
+id = "claude_blender"
+version = "0.1.0"
+name = "Claude Blender Integration"
+tagline = "Bridge that lets Claude drive Blender through MCP"
+maintainer = "Rotem Babani"
+type = "add-on"
+website = "https://github.com/rotembab/claude-blender-integration"
+
+tags = ["Development", "Pipeline"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:MIT"]
+
+[permissions]
+network = "Runs a local TCP server (127.0.0.1 only) for the MCP bridge"
+files = "Saves checkpoint copies of the open .blend file to a temp folder"

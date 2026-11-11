@@ -1,0 +1,19 @@
+{
+  "1":   {"class_type": "LoadImage", "inputs": {"image": "SET_BY_PA_PY.png"}},
+  "2":   {"class_type": "UltraTexLoadMesh", "inputs": {"glb_path": "SET_BY_PA_PY.glb", "only_vertices_and_faces": false}},
+  "3":   {"class_type": "LoadBackgroundRemovalModel", "inputs": {"bg_removal_name": "birefnet.safetensors"}},
+  "4":   {"class_type": "RemoveBackground", "inputs": {"bg_removal_model": ["3", 0], "image": ["1", 0]}},
+  "6":   {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": "flux-2-klein-base-9b-Q8_0.gguf"}},
+  "7":   {"class_type": "CLIPLoaderGGUF", "inputs": {"clip_name": "Qwen3-8B-Q8_0.gguf", "type": "flux2"}},
+  "8":   {"class_type": "VAELoader", "inputs": {"vae_name": "flux2-vae.safetensors"}},
+  "9":   {"class_type": "UltraTexForegroundDecoder", "inputs": {"vae": ["8", 0], "decoder_name": "ultratex_flux2_decoder.pt"}},
+  "10":  {"class_type": "UltraTexLoraLoader", "inputs": {"model": ["6", 0], "lora_name": "ultratex_flux2.safetensors", "strength": 1.0}},
+  "11":  {"class_type": "UltraTexLoraLoader", "inputs": {"model": ["6", 0], "lora_name": "ultratex_flux2_mr.safetensors", "strength": 1.0}},
+  "12":  {"class_type": "CLIPTextEncode", "inputs": {"clip": ["7", 0], "text": ""}},
+  "14":  {"class_type": "UltraTexPrep", "inputs": {"reference_image": ["1", 0], "reference_mask": ["4", 0], "trimesh": ["2", 0], "mesh_path": "", "render_size": 4096, "atlas_size": 4096, "uv_mode": "comfy_gpu", "reference_alignment": "fit_front_silhouette", "mask_meaning": "foreground"}},
+  "18":  {"class_type": "UltraTexSampler", "inputs": {"model": ["10", 0], "vae": ["9", 0], "positive": ["12", 0], "prep": ["14", 0], "resolution": 1024, "steps": 25, "seed": 12345, "guidance": 4.0, "drop_background_tokens": true, "memory_factor": 0.0, "attention": "comfy_default", "sparse_topk": 0.2, "token_chunk": 8192, "denoise": 1.0}},
+  "20":  {"class_type": "UltraTexSampler", "inputs": {"model": ["11", 0], "vae": ["9", 0], "positive": ["12", 0], "prep": ["14", 0], "resolution": 1024, "steps": 25, "seed": 12345, "guidance": 4.0, "drop_background_tokens": true, "memory_factor": 0.0, "attention": "comfy_default", "sparse_topk": 0.2, "token_chunk": 8192, "denoise": 1.0}},
+  "23":  {"class_type": "UltraTexBake", "inputs": {"prep": ["14", 0], "albedo_views": ["18", 0], "metallic_roughness_views": ["20", 0], "texture_size": 2048, "filename_prefix": "UltraTex/SET_BY_PA_PY", "view_weight_power": 4.0, "best_view_mix": 0.5, "edge_feather_px": 6.0, "views_2_use": "all"}},
+  "30":  {"class_type": "SaveImage", "inputs": {"images": ["18", 2], "filename_prefix": "UltraTex/SET_BY_PA_PY_views"}},
+  "31":  {"class_type": "SaveImage", "inputs": {"images": ["14", 1], "filename_prefix": "UltraTex/SET_BY_PA_PY_normals"}}
+}
