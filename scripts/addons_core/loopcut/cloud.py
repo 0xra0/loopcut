@@ -789,7 +789,7 @@ def model_source():
         return ""
     if prefs.provider == "LOOPCUT":
         return "loopcut"
-    if prefs.provider == "OLLAMA" or prefs.base_url.startswith(("http://127.0.0.1", "http://localhost")):
+    if prefs.provider in ("OLLAMA", "AGY") or prefs.base_url.startswith(("http://127.0.0.1", "http://localhost", "agy://")):
         return "local"
     return "own_key"
 

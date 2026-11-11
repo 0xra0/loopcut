@@ -128,6 +128,54 @@ REASONING_MODEL = "loopcut_reasoning_model"  # On a stored assistant message: th
 REASONING_FIELDS = ("reasoning_details", "reasoning_content")  # The message fields kept and sent back per model.
 _DETAIL_TEXT = ("text", "summary", "data")  # The fields of a reasoning detail that a stream sends in pieces.
 
+def normalize_tool_arguments(name: str, arguments: str) -> str:
+    """Repair literal CR/LF/TAB in a *complete* tool call JSON string.
+
+    Some local OpenAI-compatible models stream newlines literally inside
+    JSON string values (such as python code in run_python or file content in write_file)
+    instead of escaping them. That is invalid JSON, though the intended source
+    is unambiguous if the surrounding JSON closes.
+    Do not guess missing quotes/braces or run a partially generated call:
+    Blender tools can modify the user's scene.
+    """
+    if not isinstance(arguments, str):
+        return arguments
+    try:
+        json.loads(arguments)
+        return arguments  # Already valid; preserve the original byte-for-byte.
+    except ValueError:
+        pass
+
+    replacements = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+    escaped, inside, touched = False, False, False
+    cleaned = []
+    for ch in arguments:
+        if escaped:
+            escaped = False
+            cleaned.append(ch)
+        elif inside and ch == "\\":
+            escaped = True
+            cleaned.append(ch)
+        elif ch == '"':
+            inside = not inside
+            cleaned.append(ch)
+        elif inside and ch in replacements:
+            cleaned.append(replacements[ch])
+            touched = True
+        else:
+            cleaned.append(ch)
+    if not touched or inside or escaped:  # Truncated/unclosed or unrelated invalid JSON.
+        return arguments
+    candidate = "".join(cleaned)
+    try:
+        parsed = json.loads(candidate)
+    except ValueError:
+        return arguments
+    if not isinstance(parsed, dict):
+        return arguments
+    if name == "run_python" and not isinstance(parsed.get("code"), str):
+        return arguments
+    return candidate
 
 def merge_reasoning_details(merged: list[dict], pieces) -> None:
     """Fold one chunk's delta.reasoning_details into merged, as OpenRouter describes: the entries of one
@@ -299,6 +347,16 @@ def _open(build: Callable[[], urllib.request.Request], base_url: str, timeout: f
             if last and unanswered and not answered and dropped_connection(ex) and not _never_connected(ex):
                 raise unanswered(ex) from ex
             if last:
+                import errno
+                reason = ex.reason
+                hostname = urlparse(base_url).hostname
+                if (hostname in ("127.0.0.1", "localhost", "::1")
+                        and isinstance(reason, OSError) and reason.errno == errno.ECONNREFUSED):
+                    raise LLMError(
+                        f"Local model endpoint {base_url} refused the connection. "
+                        "Check that Strata (or your local provider) is running. If it stopped "
+                        "during a Blender task, check RAM/earlyoom logs before restarting; "
+                        "then press Try again.", code=CONNECTION_LOST) from ex
                 raise LLMError(f"Could not reach {base_url}: {ex.reason}", code=CONNECTION_LOST) from ex
             on_drop()  # A broken pipe or a reset as the body went up: large uploads are cut that way.
             delay = delays[attempt]
@@ -484,7 +542,10 @@ def _read(response, on_text: Callable[[str], None], is_cancelled: Callable[[], b
                         call.id = part.get("id") or call.id
                         function = part.get("function") or {}
                         call.name = function.get("name") or call.name
-                        call.arguments += function.get("arguments") or ""
+                        args_chunk = function.get("arguments")
+                        if isinstance(args_chunk, dict):
+                            args_chunk = json.dumps(args_chunk)
+                        call.arguments += args_chunk or ""
                     if choice.get("finish_reason"):
                         completion.finish_reason = choice["finish_reason"]
     except (OSError, http.client.HTTPException) as ex:  # socket.timeout is TimeoutError since Python 3.10.
@@ -617,6 +678,9 @@ def stream_chat(
     anthropic_messages.stream speaks Anthropic's Messages API with the user's key and prompt caching, and returns
     the same Completion. It never sends the x-loopcut-* headers.
 
+    The Antigravity CLI provider (base URL config.AGY_BASE_URL, agy://...) communicates with the local agy
+    CLI session via its streaming NDJSON protocol, returning the same Completion.
+
     An OpenAI model on OpenRouter (openai/*, _on_openrouter) gets each function tool with strict false
     (_non_strict); every other route sends the tools as wire_tools leaves them. On the wire only: the prompt's
     token estimate (context.fixed_tokens) counts wire_tools."""
@@ -635,6 +699,12 @@ def stream_chat(
             base_url=base_url, api_key=api_key, model=model, messages=messages, tools=tools,
             reasoning_effort=reasoning_effort, on_text=on_text, is_cancelled=is_cancelled, timeout=timeout,
             max_tokens=max_tokens, call_max_seconds=call_max_seconds, headers=headers, on_retry=on_retry,
+            on_progress=on_progress)
+    if base_url.startswith("agy://") or base_url == "agy":
+        from . import agy_cli
+        return agy_cli.stream(
+            model=model, messages=messages, tools=tools, reasoning_effort=reasoning_effort, on_text=on_text,
+            is_cancelled=is_cancelled, call_max_seconds=call_max_seconds, headers=headers, on_retry=on_retry,
             on_progress=on_progress)
     if _on_openrouter(base_url) and model.startswith("openai/"):
         tools = _non_strict(tools)
@@ -692,7 +762,16 @@ def stream_chat(
         if service and prompt_id is not None:
             cloud.note_prompt_version(response.headers.get("x-loopcut-prompt-version"))
         try:
-            return _read(response, on_text, is_cancelled, deadline, on_progress)
+            completion = _read(response, on_text, is_cancelled, deadline, on_progress)
+            if tools and not completion.tool_calls and completion.text:
+                from . import agy_cli
+                allowed_names = {(t.get("function") or t).get("name", "") for t in tools}
+                clean_text, fallback_calls = agy_cli.parse_tool_calls(completion.text, allowed_names)
+                if fallback_calls:
+                    completion.tool_calls = fallback_calls
+                    completion.text = clean_text
+                    completion.finish_reason = "tool_calls"
+            return completion
         except _ReadInterrupted as ex:
             cause = ex.__cause__
             shown = network_cause(cause) or repr(cause)

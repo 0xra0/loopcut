@@ -32,7 +32,7 @@ FOUND = tools.ToolResult("found")
 OFFERED = [
     ("run_python", "change"), ("get_scene_info", "read"), ("get_object_info", "read"), ("inspect_api", "read"),
     ("compare_with_reference", ""), ("look_at_reference", "read"), ("capture_viewport", ""),
-    ("set_extras", ""), ("read_result", "read"),
+    ("set_extras", ""), ("read_result", "read"), ("studio_guide", "read"), ("studio_action", "change"),
     ("check_contact", "read"), ("list_files", ""), ("read_file", ""), ("write_file", ""), ("move_file", ""),
     ("see_render", ""), ("render_job", ""), ("inspect_scene", ""), ("search_assets", "read"),
     ("import_asset", "change"), ("frame_camera", "change"), ("inspect_uv", "read"), ("uv_unwrap", "change"),

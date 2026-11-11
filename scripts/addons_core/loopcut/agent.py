@@ -26,6 +26,10 @@ or collection, described in the same block.
 
 - Look before you edit: use the context block, and get_object_info before changing an existing material, \
 modifier or rig; change what is there instead of rebuilding the user's work.
+- For complex sculpting, topology, UV baking, rigs, animation, game-ready exports, and reference reconstruction,\
+use studio_guide to learn structured commands and practical stage playbooks, then studio_action.\
+Verify with mesh_report/uv_report and captures. Prefer Loopcut run_python for general custom code;\
+use Loopcut checkpoints, not the legacy Claude MCP checkpoint system.\
 - One run_python step per coherent piece of work (a whole material, several objects), not one per object. \
 Its result ends with "Scene changes", measured from the scene: trust that; do not print values to check. \
 Verify placement and contact with check_contact, not from bounds or captures.
@@ -909,12 +913,12 @@ def _changes_item(session: dict, turn: Turn) -> dict | None:
 
 
 def _tool_schemas() -> list[dict]:
-    from . import assets, autorig, camera, cloud, contact, files, inspection, job_tools, texture_tools, tools, uv_tools, video_attach
+    from . import assets, autorig, camera, cloud, contact, files, inspection, job_tools, studio, texture_tools, tools, uv_tools, video_attach
     remote = cloud.tool_schemas()
     # character_rig only beside the account's cloud auto_rig: without auto-rig access the model has no rig tools.
     rig = autorig.SCHEMAS if any(cloud.tool_name(s["function"]["name"]) == "auto_rig" for s in remote) else []
     return video_attach.with_clip_tools(
-        tools.SCHEMAS + contact.SCHEMAS + files.SCHEMAS + job_tools.SCHEMAS + inspection.SCHEMAS + assets.SCHEMAS
+        tools.SCHEMAS + studio.SCHEMAS + contact.SCHEMAS + files.SCHEMAS + job_tools.SCHEMAS + inspection.SCHEMAS + assets.SCHEMAS
         + camera.SCHEMAS + uv_tools.SCHEMAS + texture_tools.SCHEMAS + rig + remote)
 
 
@@ -1875,9 +1879,31 @@ class LoopSpec:
     prompt_id: str | None = None                # Hosted injection; workspace/summary remain open.
 
 
+SINGLE_NOTED = "loopcut_single_craft"  # On the message a single turn started from: its craft notes are on it.
+
+
+def _single_turn(session: dict, turn: "Turn") -> None:
+    """The local skills (LOOPCUT_SKILLS_DIR) whose words the request uses, as <craft_notes> on the message that
+    started the turn, the way the workspace agent gets them: the only way to teach a model on this computer, which
+    gets no hosted skills. Off without that directory. Once per message: a resumed turn finds it noted."""
+    if config.skills_dir() is None or not config.load_roles().single_craft:
+        return
+    from . import router, skills
+    starts = [m for m in session["messages"] if context.is_turn_start(m)]
+    if not starts or starts[-1].get(SINGLE_NOTED):
+        return
+    message = starts[-1]
+    available = {s["function"]["name"] for s in _session_schemas(session, SINGLE_SPEC)}
+    notes = skills.single_notes(router.user_request(message), role="single", available_tools=available)
+    if notes:
+        router._add_note(message, f"<craft_notes>\n{notes}\n</craft_notes>")
+    message[SINGLE_NOTED] = True
+
+
 # Today's single loop. The lambdas look the functions up when called, so tests can replace them.
 SINGLE_SPEC = LoopSpec(role="single", system=lambda session: _system_prompt(session),
-                       schemas=lambda: _tool_schemas(), save=lambda session: conversations.save(session), prompt_id="single")
+                       schemas=lambda: _tool_schemas(), save=lambda session: conversations.save(session), prompt_id="single",
+                       on_turn_start=lambda session, turn: _single_turn(session, turn))
 
 
 def _orchestrator_schemas() -> list[dict]:
@@ -2090,6 +2116,17 @@ def _record_level(session: dict, turn: Turn) -> None:
         job.write()
 
 
+def _normalize_tool_calls(completion: llm.Completion) -> llm.Completion:
+    """Normalize complete local run_python arguments before validation, storage or execution.
+
+    Keep malformed/truncated calls invalid; normalization only escapes literal control
+    characters in an otherwise complete JSON payload. No tools are executed here.
+    """
+    for call in completion.tool_calls:
+        call.arguments = llm.normalize_tool_arguments(call.name, call.arguments)
+    return completion
+
+
 def _completion_unusable(completion: llm.Completion) -> bool:
     """Hit the output cap (the model's own finish_reason "length", or llm.py's call_max_seconds
     reporting the same way) without giving the loop anything it can act on: no reply text, and no
@@ -2200,7 +2237,7 @@ def _request(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SIN
 
     def call(messages: list[dict], effort: str) -> llm.Completion:
         try:
-            return llm.stream_chat(
+            completion = llm.stream_chat(
                 base_url=cfg.base_url, api_key=cfg.api_key, model=cfg.model,
                 messages=messages, tools=schemas, reasoning_effort=effort,
                 on_text=on_text, is_cancelled=turn.cancel.is_set,
@@ -2208,6 +2245,7 @@ def _request(session: dict, turn: Turn, cfg: config.Config, spec: LoopSpec = SIN
                 headers=_correlation_headers(session, spec.role, turn), on_retry=on_retry,
                 prompt_id=hosted, on_progress=on_progress,
             )
+            return _normalize_tool_calls(completion)
         except llm.LLMError as ex:
             if config.on_service(cfg.base_url) and ex.code in state.HOSTED_LIMITS:
                 _drop_empty(items, reply)
@@ -2645,6 +2683,7 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
             # Synthetic and model tool calls share cards, consent, checkpoints, results and saving below.
             completion = first if first is not None else _request(session, turn, cfg, spec)
             first = None
+            _normalize_tool_calls(completion)  # Also covers externally supplied first completions.
             messages.append(completion.as_message(cfg.model if cfg.keep_reasoning else ""))
             if carry and getattr(turn, "carry_steps", False):  # A failed request is made again by a resume:
                 request[STEPS_TAKEN] = step  # only a reply counts.
@@ -3213,8 +3252,9 @@ def _launch(session: dict, turn: Turn) -> None:
     if chat_credits.is_tool((state.ui.get("allowance_notice") or {}).get("item")):
         state.ui.pop("allowance_notice")  # A paid tool's refusal was its turn's; its card stays, as history.
     session["scroll"], session["confirm_restore"] = 0.0, None
-    if llm._is_loopback(getattr(turn.config, "base_url", "")):
-        turn.stall_seconds = 0  # The Claude Code bridge may take minutes, as call_max_seconds allows it (llm.py).
+    base_url = getattr(turn.config, "base_url", "")
+    if llm._is_loopback(base_url) or config.agy(base_url):
+        turn.stall_seconds = 0  # Local CLI sessions (Claude Code bridge, agy) manage their own deadlines via call_max_seconds.
     session["busy"], session["turn"] = True, turn
     session["turn_outcome"] = "running"
     turn.thread = threading.Thread(target=_run, args=(session, turn), name="loopcut-turn", daemon=True)

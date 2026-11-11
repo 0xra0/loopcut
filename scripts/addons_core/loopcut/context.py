@@ -99,7 +99,7 @@ RECORD_ARGUMENTS = 100  # Characters of a call's arguments that its record keeps
 CHARS_PER_TOKEN = 3.4   # JSON and code run denser than prose; the ratio is corrected from usage.
 IMAGE_TOKENS = 2000     # One capture at worker_capture.WIDTH (1024 px, the M4 quality audit's looks); it was 800
                         # at tools.CAPTURE_WIDTH (640 px) and 1700 at 960 px, scaling with pixels.
-FIXED_TOKENS = 8600     # System prompt and tool schemas when the caller does not say (measured 2026-09-27;
+FIXED_TOKENS = 9400     # Studio integration: ~9,100 fixed tokens (previous limit 8,600).
                         # 7,901 on 2026-09-30 with inspect_uv, uv_unwrap and inspect_texture, and after the M4 merges;
                         # 7,926 with text blocks in owns, run_python's fresh namespace and capture view layers;
                         # 7,982 on 2026-10-10 with the libraries-first rule; 8,149 on 2026-10-13 with transfer_textures;

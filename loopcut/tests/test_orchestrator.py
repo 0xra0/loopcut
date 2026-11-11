@@ -1446,7 +1446,7 @@ class RoleTypesTest(unittest.TestCase):
 
 
 class PromptTest(unittest.TestCase):
-    def test_the_orchestrators_fixed_cost_stays_under_10830_tokens(self):
+    def test_the_orchestrators_fixed_cost_stays_under_11600_tokens(self):
         """Service prompt size plus the public schemas stays within the fixed-cost cap."""
         from prompt_index_fixture import built_index
         index = built_index()
@@ -1454,7 +1454,8 @@ class PromptTest(unittest.TestCase):
         # 10,534 on 2026-10-17 with the captures' labels switch; 10,549 on 2026-10-24, when the tool summaries
         # were asked for in the user's language; 10,654 on 2026-10-26 with set_extras (0.2.20, paid extras); 10,825
         # with read_result as well (rc/0.2.20).
-        self.assertLessEqual(fixed, 10830)
+        # The two Claude Blender Integration schemas add about 500 estimated prompt tokens.
+        self.assertLessEqual(fixed, 11600)
         self.assertLessEqual(fixed, context.fixed_tokens(agent.SYSTEM_PROMPT, TOOL_SCHEMAS()) * 1.3 + 200)
 
     def test_step_titles_are_in_the_language_the_user_writes_in(self):

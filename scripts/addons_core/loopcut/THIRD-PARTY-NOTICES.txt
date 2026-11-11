@@ -34,3 +34,8 @@ ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
 WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
 ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+Claude Blender Integration, by Rotem Babani (2026)
+Source: https://github.com/rotembab/claude-blender-integration
+License: MIT. Vendored studio_vendor handlers, protocol, and studio_playbooks.
+Complete license: studio_vendor/LICENSE.

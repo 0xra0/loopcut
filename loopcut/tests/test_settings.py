@@ -371,7 +371,7 @@ class SettingsTest(unittest.TestCase):
         self.assertIn(call(self.prefs, "private_mode"), layout.prop.call_args_list)
 
     def test_workers_checkbox_is_disabled_with_note_for_each_byok_provider(self):
-        for provider in ("META", "OPENAI", "OPENROUTER", "OLLAMA", "CUSTOM", "ANTHROPIC", "GEMINI", "KIMI"):
+        for provider in ("META", "OPENAI", "OPENROUTER", "OLLAMA", "CUSTOM", "ANTHROPIC", "GEMINI", "KIMI", "AGY"):
             for stored in (True, False):
                 with self.subTest(provider=provider, stored=stored):
                     calls = self.draw_preferences(provider, stored)
@@ -400,11 +400,37 @@ class SettingsTest(unittest.TestCase):
     def test_providers_keep_their_stored_order_with_new_ones_appended(self):
         """Blender saves an enum by its item's position: a row inserted anywhere but the end would turn every saved
         provider after it into the next one."""
-        order = ["LOOPCUT", "META", "OPENAI", "OPENROUTER", "OLLAMA", "CUSTOM", "CHATGPT", "ANTHROPIC", "GEMINI", "KIMI"]
+        order = ["LOOPCUT", "META", "OPENAI", "OPENROUTER", "OLLAMA", "CUSTOM", "CHATGPT", "ANTHROPIC", "GEMINI", "KIMI", "AGY",
+                 "STRATA"]
         self.assertEqual([p[0] for p in self.settings.PROVIDERS], order,
                          "appended, so the stored enum values of the others stay what they were")
         items = type(self.prefs).__annotations__["provider"].options["items"]
         self.assertEqual([item[0] for item in items], order)
+
+    def test_strata_preset_runs_on_this_computer_without_a_key(self):
+        self.assertEqual(self.settings._BY_ID["STRATA"][1:4], ("Strata (this computer)", "http://127.0.0.1:8099/v1", "strata"))
+        self.prefs.provider = "STRATA"
+        self.settings._provider_changed(self.prefs, None)
+        self.assertEqual((self.prefs.base_url, self.prefs.model), ("http://127.0.0.1:8099/v1", "strata"))
+        with patch.object(self.settings, "preferences", return_value=self.prefs), \
+                patch.object(self.settings.credentials, "api_key", return_value=""):
+            found = self.settings.values()
+        self.assertEqual((found["LOOPCUT_BASE_URL"], found["LOOPCUT_MODEL"], found["LOOPCUT_API_KEY"]),
+                         ("http://127.0.0.1:8099/v1", "strata", "local"))
+
+    def test_agy_preset(self):
+        by_id = self.settings._BY_ID
+        self.assertIn("AGY", by_id)
+        self.assertEqual(by_id["AGY"][1:4], ("Antigravity CLI (agy)", "agy://local", "claude-sonnet-4-6"))
+        self.prefs.provider = "AGY"
+        self.settings._provider_changed(self.prefs, None)
+        self.assertEqual((self.prefs.base_url, self.prefs.model), ("agy://local", "claude-sonnet-4-6"))
+        self.assertEqual(self.prefs.agy_effort, "high")
+        with patch.object(self.settings, "preferences", return_value=self.prefs):
+            efforts = self.settings.effort_options()
+            self.assertEqual([e[0] for e in efforts], ["low", "medium", "high", "xhigh", "max"])
+            self.settings.choose_effort("low")
+            self.assertEqual(self.prefs.agy_effort, "low")
 
     def test_gemini_and_kimi_presets(self):
         by_id = self.settings._BY_ID

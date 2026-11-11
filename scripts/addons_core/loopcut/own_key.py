@@ -28,7 +28,7 @@ from urllib.parse import urlparse
 
 from . import config, llm
 
-HOSTED = ("LOOPCUT", "CHATGPT")  # Loopcut's account and the ChatGPT plan: no own key to check.
+HOSTED = ("LOOPCUT", "CHATGPT", "AGY")  # Loopcut's account, ChatGPT plan, and Antigravity CLI: no own key to check.
 
 OK = "ok"                      # The model answered the probe.
 KEY_OK = "key_ok"              # The models were listed; no model picked yet, so no probe.
@@ -70,6 +70,8 @@ PING_MESSAGES = [{"role": "user", "content": "Reply OK."}]
 
 def endpoint(base_url: str) -> str:
     """host[:port] of a base URL (anthropic:// too), without any user or password in it."""
+    if config.agy(base_url):
+        return "local"
     try:
         parsed = urlparse((base_url or "").strip())
         host, port = parsed.hostname or "", parsed.port
@@ -86,7 +88,7 @@ def who(provider: str, label: str, base_url: str, key: str = "") -> dict:
     custom = provider == "CUSTOM"
     name = host if custom else (label or "").split(" (")[0].strip()
     return {"name": name or "your provider", "host": host, "custom": custom, "keyed": bool(key),
-            "local": (base_url or "").startswith("http://127.0.0.1")}
+            "local": (base_url or "").startswith("http://127.0.0.1") or config.agy(base_url)}
 
 
 def message(code: str, about: dict, model: str = "", detail: str = "") -> str:

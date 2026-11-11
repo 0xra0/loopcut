@@ -42,6 +42,7 @@
  */
 
 #include <algorithm>
+#include <cstdint>
 #include <iosfwd>
 
 #include "BLI_assert.h"

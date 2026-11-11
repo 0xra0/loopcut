@@ -51,6 +51,14 @@ PROVIDERS = (
     ("KIMI", "Kimi Code (your membership)", "https://api.kimi.ai/coding/v1", "kimi-for-coding",
      "Paste the API key from your Kimi Code console; it uses your own membership quota, and Kimi's rules apply to "
      "your account. In China use Custom with https://api.kimi.com/coding/v1."),
+    ("AGY", "Antigravity CLI (agy)", config.AGY_BASE_URL, config.AGY_MODEL,
+     "Antigravity CLI (agy) on this computer. Chat uses the local agy CLI session and models such as "
+     "Claude Sonnet 4.6 (Thinking)."),
+    # Appended, so the stored enum values of the rows above stay what they were. Strata's server ignores the model
+    # name and serves the model its run-*.sh started (port 8099 here; Strata's own default is 8080).
+    ("STRATA", "Strata (this computer)", "http://127.0.0.1:8099/v1", "strata",
+     "Model requests stay on this computer: Qwen3.8-Flash-Next on Strata's engine. Start it with --vision so it "
+     "can read viewport captures. Set LOOPCUT_SKILLS_DIR to a folder of skills to teach it this computer's work."),
 )
 _BY_ID = {p[0]: p for p in PROVIDERS}
 _models: list[str] = []  # Filled by "Fetch models"; not saved.
@@ -63,6 +71,10 @@ PLAN_MODELS_TTL = 600.0
 CHATGPT_EFFORTS = (("low", "Low", "Fastest"), ("medium", "Medium", ""), ("high", "High", ""),
                    ("xhigh", "Extra High", "Slower; more careful work"),
                    ("max", "Max", "Slowest; the most careful work, on the models that offer it"))
+# Antigravity CLI (agy) reasoning efforts: high by default.
+AGY_EFFORTS = (("low", "Low", "Fastest"), ("medium", "Medium", ""), ("high", "High", ""),
+               ("xhigh", "Extra High", "Slower; more careful work"),
+               ("max", "Max", "Slowest; deepest reasoning"))
 # What the menu offers for a model whose /models row lists no levels: max only where a row lists it.
 _UNLISTED_EFFORTS = ("low", "medium", "high", "xhigh")
 PLAN_MODELS_FAILED = "Couldn't load your plan's models"
@@ -236,6 +248,8 @@ def _provider_changed(self, context) -> None:
         self.base_url, self.model = base_url, self.tier
     elif self.provider != "CUSTOM":
         self.base_url, self.model = base_url, model
+    if self.provider == "AGY" and hasattr(self, "agy_effort") and not self.agy_effort:
+        self.agy_effort = config.AGY_EFFORT
     _models.clear()
     _changed()
     from . import own_key_ui
@@ -252,6 +266,9 @@ def listed_models(provider: str = "") -> list[str]:
     if provider == "ANTHROPIC":
         from . import anthropic_messages
         return list(anthropic_messages.MODELS)
+    if provider == "AGY":
+        from . import agy_cli
+        return list(agy_cli.MODELS)
     return []
 
 
@@ -323,17 +340,17 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
 
     provider: bpy.props.EnumProperty(
         name="Provider", items=[(p[0], p[1], p[2] or "Your own endpoint") for p in PROVIDERS],
-        default="LOOPCUT", update=_provider_changed)
+        default="AGY", update=_provider_changed)
     tier: bpy.props.StringProperty(
         name="Model", default="fast", update=_tier_changed,
         description="Which Loopcut model answers; the menu says how much usage each takes against the default")
     base_url: bpy.props.StringProperty(
-        name="Base URL", default=PROVIDERS[0][2], update=_connection_changed,
+        name="Base URL", default=config.AGY_BASE_URL, update=_connection_changed,
         description="OpenAI-compatible endpoint. Must be https, or http on 127.0.0.1")
     api_key: bpy.props.StringProperty(
         name="API Key", subtype="PASSWORD", options={"SKIP_SAVE"}, get=_get_key, set=_set_key,
         description="Stored in Loopcut's own file in your Blender config folder, not in preferences")
-    model: bpy.props.StringProperty(name="Model", default=PROVIDERS[0][3], update=_connection_changed,
+    model: bpy.props.StringProperty(name="Model", default=config.AGY_MODEL, update=_connection_changed,
                                    description="Type your provider's model name, or use refresh and pick from the menu")
     reasoning_effort: bpy.props.EnumProperty(
         name="Reasoning", items=[("low", "Low", "Fastest"), ("medium", "Medium", ""), ("high", "High", "Slowest")],
@@ -341,6 +358,10 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
     # The ChatGPT plan's own (config.CHATGPT_PLAN_EFFORTS): high by default, as in the evals, and xhigh too.
     chatgpt_effort: bpy.props.EnumProperty(
         name="Reasoning", items=list(CHATGPT_EFFORTS), default=config.CHATGPT_PLAN_EFFORT, update=_changed)
+    # Antigravity CLI (agy) reasoning effort: high by default.
+    agy_effort: bpy.props.EnumProperty(
+        name="Reasoning", items=list(AGY_EFFORTS), default=config.AGY_EFFORT, update=_changed,
+        description="Reasoning effort sent to Antigravity CLI (agy)")
     auto_run: bpy.props.BoolProperty(
         name="Run without asking", default=False, update=_changed,
         description="Run code and file changes without the Run / Reject step. Renders and bakes still ask, and "
@@ -481,7 +502,7 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
         else:
             if self.provider == "CUSTOM":
                 column.prop(self, "base_url")
-            if not self.base_url.startswith("http://127.0.0.1"):
+            if not self.base_url.startswith("http://127.0.0.1") and self.provider != "AGY":
                 draw_key(column, self)
             row = column.row(align=True)
             row.prop(self, "model")
@@ -508,7 +529,13 @@ class LoopcutPreferences(bpy.types.AddonPreferences):
         agent = split.box()
         agent.label(text="Agent", icon="PLAY")
         chatgpt = self.provider == "CHATGPT"
-        agent.column().prop(self, "chatgpt_effort" if chatgpt else "reasoning_effort")
+        agy_provider = self.provider == "AGY"
+        if chatgpt:
+            agent.column().prop(self, "chatgpt_effort")
+        elif agy_provider:
+            agent.column().prop(self, "agy_effort")
+        else:
+            agent.column().prop(self, "reasoning_effort")
         flags = agent.column()
         flags.use_property_split = False  # A checkbox reads best with its whole label beside it.
         flags.prop(self, "auto_run")
@@ -624,6 +651,14 @@ class LOOPCUT_OT_fetch_models(bpy.types.Operator):
             if not found:
                 self.report({"WARNING"}, "ChatGPT listed no models for this account; type the model name instead")
                 return {"CANCELLED"}
+            _models[:] = found[:200]
+            self.report({"INFO"}, f"{len(found)} models; pick one from the menu next to the field")
+            return {"FINISHED"}
+        if prefs is not None and prefs.provider == "AGY":
+            from . import agy_cli
+            found = agy_cli.list_models()
+            if not found:
+                found = list(agy_cli.MODELS)
             _models[:] = found[:200]
             self.report({"INFO"}, f"{len(found)} models; pick one from the menu next to the field")
             return {"FINISHED"}
@@ -801,7 +836,15 @@ def has_models() -> bool:
 def preferences():
     """None when Loopcut runs from a dev checkout without being enabled as an add-on."""
     addon = bpy.context.preferences.addons.get(PACKAGE)
-    return addon.preferences if addon else None
+    prefs = addon.preferences if addon else None
+    if prefs is not None and getattr(prefs, "provider", None) == "LOOPCUT":
+        if not account.signed_in() and not credentials.api_key(getattr(prefs, "base_url", "")):
+            prefs.provider = "AGY"
+            prefs.base_url = config.AGY_BASE_URL
+            prefs.model = config.AGY_MODEL
+            if hasattr(prefs, "agy_effort") and not prefs.agy_effort:
+                prefs.agy_effort = config.AGY_EFFORT
+    return prefs
 
 
 def model_options() -> list[tuple[str, str, str, bool]]:
@@ -815,12 +858,23 @@ def model_options() -> list[tuple[str, str, str, bool]]:
             return []
         return [(current, current, "from .env", True)]
     if prefs.provider == "LOOPCUT":
-        return [(m["id"], m["label"], m["note"], prefs.tier == m["id"]) for m in account.models()]
+        tiers = [(m["id"], m["label"], m["note"], prefs.tier == m["id"]) for m in account.models()]
+        if not account.signed_in():
+            from . import agy_cli
+            agy_rows = [(name, f"agy · {agy_cli.model_label(name)}", "local agy CLI", False) for name in agy_cli.MODELS]
+            return agy_rows + tiers
+        return tiers
     if prefs.provider == "CHATGPT" and _plan_models["rows"]:  # The plan's own list, by display name.
         rows = [(row["slug"], row["display_name"]) for row in _plan_models["rows"]]
         if prefs.model and prefs.model not in [slug for slug, _ in rows]:
             rows.insert(0, (prefs.model, prefs.model))
         return [(slug, label, "", slug == prefs.model) for slug, label in rows]
+    if prefs.provider == "AGY":
+        from . import agy_cli
+        names = listed_models("AGY")
+        if prefs.model and prefs.model not in names:
+            names.insert(0, prefs.model)
+        return [(name, agy_cli.model_label(name), "", name == prefs.model) for name in names]
     names = listed_models(prefs.provider)
     if prefs.model and prefs.model not in names:
         names.insert(0, prefs.model)
@@ -882,21 +936,30 @@ def plan_efforts(model: str) -> list[str]:
 
 
 def effort_options() -> list[tuple[str, str, bool, str]]:
-    """(id, label, current, tooltip) for the "Reasoning" rows of the panel's model menu: the ChatGPT plan only, and
-    only the efforts the chosen model takes. The tooltip is the /models row's description of that level, else ours."""
+    """(id, label, current, tooltip) for the "Reasoning" rows of the panel's model menu."""
     prefs = preferences()
-    if prefs is None or prefs.provider != "CHATGPT":
+    if prefs is None:
         return []
-    allowed, notes = plan_efforts(prefs.model), _plan_row(prefs.model).get("effort_notes") or {}
-    return [(effort, label, effort == prefs.chatgpt_effort, notes.get(effort) or tip)
-            for effort, label, tip in CHATGPT_EFFORTS if effort in allowed]
+    if prefs.provider == "CHATGPT":
+        allowed, notes = plan_efforts(prefs.model), _plan_row(prefs.model).get("effort_notes") or {}
+        return [(effort, label, effort == prefs.chatgpt_effort, notes.get(effort) or tip)
+                for effort, label, tip in CHATGPT_EFFORTS if effort in allowed]
+    if prefs.provider == "AGY":
+        current = getattr(prefs, "agy_effort", config.AGY_EFFORT)
+        return [(effort, label, effort == current, tip)
+                for effort, label, tip in AGY_EFFORTS]
+    return []
 
 
 def choose_effort(effort: str) -> None:
-    """The panel's model menu picked a reasoning effort for the ChatGPT plan."""
+    """The panel's model menu picked a reasoning effort."""
     prefs = preferences()
-    if prefs is not None and prefs.provider == "CHATGPT" and effort in config.CHATGPT_PLAN_EFFORTS:
+    if prefs is None:
+        return
+    if prefs.provider == "CHATGPT" and effort in config.CHATGPT_PLAN_EFFORTS:
         prefs.chatgpt_effort = effort
+    elif prefs.provider == "AGY" and effort in config.AGY_EFFORTS:
+        prefs.agy_effort = effort
 
 
 def _nearest(effort: str, allowed: list[str]) -> str:
@@ -929,6 +992,15 @@ def choose_model(model_id: str) -> None:
     prefs = preferences()
     if prefs is None or not model_id:
         return
+    from . import agy_cli
+    if model_id in agy_cli.MODELS or model_id in agy_cli.MODEL_LABELS or agy_cli.resolve_model(model_id) in agy_cli.MODELS:
+        prefs.provider = "AGY"
+        prefs.base_url = config.AGY_BASE_URL
+        prefs.model = model_id
+        if hasattr(prefs, "agy_effort") and not prefs.agy_effort:
+            prefs.agy_effort = config.AGY_EFFORT
+        _changed()
+        return
     if prefs.provider == "LOOPCUT":
         set_tier(model_id)
     else:
@@ -945,6 +1017,9 @@ def model_label(model_id: str) -> str:
         return label if label.startswith("Loopcut") else f"Loopcut {label}"
     if on_chatgpt_plan():  # The route shows too: signed in with ChatGPT.
         return f"ChatGPT · {model_id}"
+    if prefs is not None and prefs.provider == "AGY":
+        from . import agy_cli
+        return f"agy · {agy_cli.model_label(model_id)}"
     return model_id
 
 
@@ -1000,7 +1075,9 @@ def values() -> dict[str, str]:
     if prefs is None:
         return {}
     found = {
-        "LOOPCUT_REASONING_EFFORT": _plan_effort(prefs) if prefs.provider == "CHATGPT" else prefs.reasoning_effort,
+        "LOOPCUT_REASONING_EFFORT": _plan_effort(prefs) if prefs.provider == "CHATGPT" else (
+            getattr(prefs, "agy_effort", config.AGY_EFFORT) if prefs.provider == "AGY" else prefs.reasoning_effort
+        ),
         "LOOPCUT_AUTO_RUN": "true" if prefs.auto_run else "false",
         "LOOPCUT_AUTO_LOOK": "true" if prefs.auto_look else "false",
         "LOOPCUT_ORCHESTRATE": "true" if prefs.orchestrate else "false",
@@ -1025,6 +1102,11 @@ def values() -> dict[str, str]:
             found.update({"LOOPCUT_BASE_URL": chatgpt_auth.CHATGPT_PLAN_BASE_URL,
                           "LOOPCUT_MODEL": prefs.model or config.CHATGPT_PLAN_MODEL,
                           "LOOPCUT_API_KEY": chatgpt_auth.PLACEHOLDER_KEY})
+        return found
+    if prefs.provider == "AGY" or config.agy(prefs.base_url):
+        found.update({"LOOPCUT_BASE_URL": config.AGY_BASE_URL,
+                      "LOOPCUT_MODEL": prefs.model or config.AGY_MODEL,
+                      "LOOPCUT_API_KEY": config.AGY_KEY})
         return found
     base_url = prefs.base_url.rstrip("/")
     key = credentials.api_key(base_url) if base_url else ""

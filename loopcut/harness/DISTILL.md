@@ -36,7 +36,7 @@ at most 13,600 characters, and each full draft file at most 3,060 (about 900 tok
 excerpts carry a marker. Extraction writes a `.metadata.json` with source identity, known names
 and packet SHA-256, so later checks can catch stale packet metadata and leaked names.
 
-The Codex mode uses `/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex` with
+The Codex mode uses `$LOOPCUT_CODEX`, else `codex` on PATH, else the macOS app's bundled CLI, with
 `exec -s workspace-write -C SCRATCH --skip-git-repo-check -o FILE`, `/dev/null` stdin and an
 environment containing only `CODEX_HOME=$HOME/.codex`. It sends the prompt as an argument.
 Codex writes each complete skill

@@ -101,6 +101,19 @@ def anthropic(base_url: str) -> bool:
     return (base_url or "").strip().startswith("anthropic://")
 
 
+# The "Antigravity CLI (agy)" provider: communicates via the local agy CLI binary.
+# No external API key: uses the local agy session and models (Claude Sonnet 4.6 Thinking, etc.).
+AGY_BASE_URL = "agy://local"
+AGY_KEY = "agy-local"
+AGY_MODEL = "claude-sonnet-4-6"
+AGY_EFFORT = "high"
+AGY_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def agy(base_url: str) -> bool:
+    return (base_url or "").strip().startswith("agy://") or (base_url or "").strip() == "agy"
+
+
 KIMI_HOSTS = ("api.kimi.ai", "api.moonshot.ai", "api.moonshot.cn")
 
 
@@ -392,7 +405,7 @@ def stall_seconds() -> int:
 
 
 def _check_base_url(base_url: str, key: str) -> None:
-    if base_url == CHATGPT_PLAN_BASE_URL or anthropic(base_url):  # anthropic:// is always sent as https.
+    if base_url == CHATGPT_PLAN_BASE_URL or anthropic(base_url) or agy(base_url):  # anthropic:// and agy:// are custom schemes.
         return
     if not base_url.startswith("https://") and not base_url.startswith("http://127.0.0.1"):
         raise ConfigError(f"{key} must be https (http is allowed only for 127.0.0.1)")
@@ -414,6 +427,8 @@ def load() -> Config:
     model = get("LOOPCUT_MODEL")
     if chatgpt_plan(base_url):
         base_url, api_key, model = CHATGPT_PLAN_BASE_URL, CHATGPT_PLAN_KEY, model or CHATGPT_PLAN_MODEL
+    elif agy(base_url):
+        base_url, api_key, model = AGY_BASE_URL, AGY_KEY, model or AGY_MODEL
     missing = [k for k, v in (("LOOPCUT_API_KEY", api_key), ("LOOPCUT_BASE_URL", base_url),
                               ("LOOPCUT_MODEL", model)) if not v]
     # Codex runs its own model calls under its own sign-in (codex_app.py): no key or URL needed then.
@@ -442,7 +457,10 @@ def load() -> Config:
         api_key=api_key,
         base_url=base_url,
         model=model,
-        reasoning_effort=get("LOOPCUT_REASONING_EFFORT", CHATGPT_PLAN_EFFORT if chatgpt_plan(base_url) else "medium"),
+        reasoning_effort=get(
+            "LOOPCUT_REASONING_EFFORT",
+            AGY_EFFORT if agy(base_url) else (CHATGPT_PLAN_EFFORT if chatgpt_plan(base_url) else "medium"),
+        ),
         # Model-written code only runs unprompted if the user opts in.
         auto_run=_as_bool(get("LOOPCUT_AUTO_RUN", "false"), "LOOPCUT_AUTO_RUN"),
         auto_look=_as_bool(get("LOOPCUT_AUTO_LOOK", "true"), "LOOPCUT_AUTO_LOOK"),
@@ -484,6 +502,8 @@ def _role(base: Config, get, prefix: str, service_model: str = "") -> Config:
     base_url = (get(prefix + "BASE_URL") or base.base_url).rstrip("/")
     if chatgpt_plan(base_url):
         base_url = CHATGPT_PLAN_BASE_URL
+    elif agy(base_url):
+        base_url = AGY_BASE_URL
     _check_base_url(base_url, prefix + "BASE_URL")
     model = get(prefix + "MODEL") or (service_model if service_model and on_service(base_url) else base.model)
     max_output_tokens = _whole(get, prefix + "MAX_OUTPUT_TOKENS", base.max_output_tokens, 1, MAX_OUTPUT_TOKENS_CEILING)

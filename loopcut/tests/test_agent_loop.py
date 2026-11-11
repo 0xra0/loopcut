@@ -258,6 +258,31 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(SCRIPT.requests[0]["_auth"], "Bearer test-key")
         self.assertEqual(SCRIPT.requests[0]["messages"][0]["role"], "system")
 
+    SKILL = ("---\nid: local/witcher-export\nversion: 1\ntitle: Witcher export\nwhen: exporting for The Witcher 3\n"
+             "roles: [single]\nrequires_tools: []\ntier: free\nkind: assist\npart: single\nwords: witcher|redengine\n"
+             "---\nWITCHER EXPORT MARKER: one material, Z up.\n")
+
+    def test_a_local_skill_whose_words_match_reaches_a_single_turn_once(self):
+        with tempfile.TemporaryDirectory() as folder:
+            Path(folder, "witcher.md").write_text(self.SKILL, encoding="utf-8")
+            with mock.patch.dict(os.environ, {"LOOPCUT_SKILLS_DIR": folder}):
+                SCRIPT.replies += [tool_reply("get_scene_info", {}), text_reply("Done.")]
+                self.start("export this sword for the Witcher").thread.join(5)
+                first, second = (json.dumps(r["messages"]) for r in SCRIPT.requests)
+                self.assertIn("<craft_notes>\\nWITCHER EXPORT MARKER", first)
+                self.assertEqual(second.count("WITCHER EXPORT MARKER"), 1)  # Noted once, not again per step.
+                SCRIPT.requests.clear()
+                self.session = state.reset()
+                SCRIPT.replies.append(text_reply("Done."))
+                self.start("add a red sphere").thread.join(5)
+                self.assertNotIn("WITCHER EXPORT MARKER", json.dumps(SCRIPT.requests[0]["messages"]))
+
+    def test_no_skills_folder_adds_no_craft_notes_to_a_single_turn(self):
+        with mock.patch.dict(os.environ, {"LOOPCUT_SKILLS_DIR": ""}):
+            SCRIPT.replies.append(text_reply("Done."))
+            self.start("export this sword for the Witcher").thread.join(5)
+            self.assertNotIn("<craft_notes>", json.dumps(SCRIPT.requests[0]["messages"]))
+
     def test_a_long_result_is_cut_for_the_model_and_read_back_from_the_conversation(self):
         """result_store: the model is shown a long result's start and a pointer, the card and the conversation's
         store keep all of it, and read_result is answered by the loop from that store, never by a tool."""

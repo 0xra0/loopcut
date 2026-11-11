@@ -200,7 +200,7 @@ class Ledger:
             return ""
         return (f"Not run: you made this same call at steps {_steps(steps)} and got the same result, and nothing "
                 f"has changed the scene since, so the result has not changed: see step {steps[-1]}. Go on with "
-                f"it, or change something first.")
+                f"your next modeling or Python step; do not repeat this same read call.")
 
     def record(self, step: int, key: tuple[str, str], text: str, ok: bool, read: bool = False,
                where=None) -> str:

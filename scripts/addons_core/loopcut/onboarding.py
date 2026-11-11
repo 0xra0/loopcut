@@ -1544,7 +1544,7 @@ def _connected_route(prefs) -> tuple[dict, str, str]:
         return _icon("person"), "ChatGPT", chatgpt_ui.account_line()
     if prefs.provider == "LOOPCUT":
         return _row_mark(), "Loopcut models", settings.model_label(prefs.model)
-    if prefs.provider == "OLLAMA":
+    if prefs.provider in ("OLLAMA", "AGY", "STRATA"):
         return _icon("computer"), settings.provider_label(prefs.provider), prefs.model
     return _icon("key"), f"{settings.provider_label(prefs.provider)}, with your key", prefs.model
 
@@ -1599,7 +1599,7 @@ def _route_line(provider: str) -> str:
         return "Loopcut models"
     if provider == "CHATGPT":
         return "ChatGPT, on your plan"
-    if provider == "OLLAMA":
+    if provider in ("OLLAMA", "AGY", "STRATA"):
         return settings.provider_label(provider)  # On this computer: no key.
     return f"{settings.provider_label(provider)}, with your key"
 

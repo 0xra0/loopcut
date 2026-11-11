@@ -187,5 +187,6 @@ class SharedNudgeTest(unittest.TestCase):
             with self.subTest(line=line[:40]):
                 self.assertFalse(completion_guard.introduces_example(line))
 
+
 if __name__ == "__main__":
     unittest.main()

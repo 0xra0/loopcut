@@ -832,7 +832,16 @@ def _stream(*, model: str, messages: list[dict], tools: list[dict], reasoning_ef
         meta = {"model": model, "effort": reasoning_effort, "request_id": _request_id(response.headers),
                 "headers": _headers(response.headers)}
         try:
-            return _read(response, on_text, is_cancelled, deadline, transcript, meta, on_progress)
+            completion = _read(response, on_text, is_cancelled, deadline, transcript, meta, on_progress)
+            if tools and not completion.tool_calls and completion.text:
+                from . import agy_cli
+                allowed_names = {(t.get("function") or t).get("name", "") for t in tools}
+                clean_text, fallback_calls = agy_cli.parse_tool_calls(completion.text, allowed_names)
+                if fallback_calls:
+                    completion.tool_calls = fallback_calls
+                    completion.text = clean_text
+                    completion.finish_reason = "tool_calls"
+            return completion
         except _Interrupted as ex:
             cause = ex.__cause__ or EOFError("the stream ended before response.completed")
             shown = llm.network_cause(cause) or cause

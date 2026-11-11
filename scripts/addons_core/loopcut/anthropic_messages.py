@@ -808,7 +808,16 @@ def stream(*, base_url: str, api_key: str, model: str, messages: list[dict], too
         response = _open(build, url, api_key, read_timeout(timeout), host, model, state, is_cancelled, sized.tighten)
         meta = {"model": model, "request_id": _request_id(response.headers)}
         try:
-            return _read(response, on_text, is_cancelled, deadline, meta, on_progress)
+            completion = _read(response, on_text, is_cancelled, deadline, meta, on_progress)
+            if tools and not completion.tool_calls and completion.text:
+                from . import agy_cli
+                allowed_names = {(t.get("function") or t).get("name", "") for t in tools}
+                clean_text, fallback_calls = agy_cli.parse_tool_calls(completion.text, allowed_names)
+                if fallback_calls:
+                    completion.tool_calls = fallback_calls
+                    completion.text = clean_text
+                    completion.finish_reason = "tool_calls"
+            return completion
         except _Interrupted as ex:
             cause = ex.__cause__ or "the stream ended before message_stop"
             shown = llm.network_cause(cause) or repr(cause)

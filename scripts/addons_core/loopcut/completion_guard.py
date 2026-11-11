@@ -139,17 +139,35 @@ def imitates_records(text: str, tool_names) -> bool:
 # "I will next import ...", "I'll now search ...", "Let's try ...": first person, about to act, with a verb
 # for something the tools do. English only, and narrow on purpose: a missed nudge costs the user one
 # "go on"; a false one makes Loopcut talk over a question it asked.
-_STEP_VERBS = (r"import|search|look|browse|find|fetch|download|grab|bring|load|add|create|make|build|model|place|"
-               r"put|position|move|rotate|scale|resize|arrange|align|set|adjust|apply|assign|tweak|refine|fix|"
-               r"repair|replace|swap|remove|delete|duplicate|generate|render|capture|check|inspect|verify|test|try|"
-               r"retry|attempt|start|begin|continue|proceed|work|focus|populate|furnish|decorate|light|texture|"
-               r"sculpt|animate|rig|run|organi[sz]e|parent|join|combine|assemble|scatter|configure|update|change|"
-               r"edit|improve|conduct|perform|measure")
+_STEP_VERBS = (r"import(?:ing)?|search(?:ing)?|look(?:ing)?|browse|find(?:ing)?|fetch(?:ing)?|download(?:ing)?|"
+               r"grab(?:bing)?|bring(?:ing)?|load(?:ing)?|add(?:ing)?|create|creating|make|making|build(?:ing)?|"
+               r"model(?:l?ing)?|place|placing|put(?:ting)?|position(?:ing)?|move|moving|rotate|rotating|scale|"
+               r"scaling|resize|resizing|arrange|arranging|align(?:ing)?|set(?:ting)?|adjust(?:ing)?|apply|applying|"
+               r"assign(?:ing)?|tweak(?:ing)?|refine|refining|fix(?:ing)?|repair(?:ing)?|replace|replacing|swap|"
+               r"swapping|remove|removing|delete|deleting|duplicate|duplicating|generate|generating|render(?:ing)?|"
+               r"capture|capturing|check(?:ing)?|inspect(?:ing)?|verify|verifying|test(?:ing)?|try|trying|retry|"
+               r"retrying|attempt(?:ing)?|start(?:ing)?|begin(?:ning)?|continue|continuing|proceed(?:ing)?|work(?:ing)?|"
+               r"focus(?:ing)?|populate|populating|furnish(?:ing)?|decorate|decorating|light(?:ing)?|texture|"
+               r"texturing|sculpt(?:ing)?|animate|animating|rig(?:ging)?|run(?:ning)?|organi[sz](?:e|ing)|parent(?:ing)?|"
+               r"join(?:ing)?|combine|combining|assemble|assembling|scatter(?:ing)?|configure|configuring|update|"
+               r"updating|change|changing|edit(?:ing)?|improve|improving|conduct(?:ing)?|perform(?:ing)?|measure|"
+               r"measuring|separate|separating|unwrap(?:ping)?|remesh(?:ing)?|retopo(?:logizing)?|bake|baking|"
+               r"clean(?:ing)?|dissolve|dissolving|bisect(?:ing)?|merge|merging|smooth(?:ing)?|bevel(?:l?ing)?|"
+               r"decimate|decimating|subdivide|subdividing|unparent(?:ing)?|pack(?:ing)?|"
+               r"analyz(?:e|ing)|audit(?:ing)?|examin(?:e|ing)|assess(?:ing)?|isolat(?:e|ing)|extract(?:ing)?|"
+               r"reconstruct(?:ing)?|carv(?:e|ing)|emboss(?:ing)?|extrud(?:e|ing)|boolean(?:ing)?|sharpen(?:ing)?|"
+               r"orient(?:ing)?")
 _LEAD = (r"(?:(?:now|next|then|first|also|just|quickly|immediately|again|instead|finally|go\s+ahead\s+and|"
-         r"go\s+on\s+to|move\s+on\s+to|proceed\s+to|need\s+to|have\s+to|try\s+to|start\s+by|begin\s+by|"
+         r"go\s+on\s+to|move\s+on\s+to|proceed\s+to|proceed\s+with|need\s+to|have\s+to|try\s+to|start\s+by|begin\s+by|"
          r"continue\s+by)[\s,]+){0,3}")
-_INTENT = re.compile(r"\b(?:i\s+will|i'll|i\s+shall|i(?:'m|\s+am)\s+(?:now\s+)?(?:going|about)\s+to|let\s+me|"
-                     r"let's|let\s+us)\s+" + _LEAD + r"(?:" + _STEP_VERBS + r")\b", re.I)
+_INTENT = re.compile(
+    r"\b(?:i\s+will|i'll|i\s+shall|i(?:'m|\s+am)\s+(?:now\s+)?(?:going|about)\s+to|"
+    r"i(?:'m|\s+am)\s+(?:now\s+)?(?:running|executing|performing|conducting)|"
+    r"let\s+me|let's|let\s+us|proceeding\s+to|proceeding\s+with)\s+" + _LEAD + r"(?:" + _STEP_VERBS + r")\b|"
+    r"\b(?:now|next),?\s+(?:i\s+will|i'll)\s+" + _LEAD + r"(?:" + _STEP_VERBS + r")\b|"
+    r"\b(?:i(?:'m|\s+am)\s+(?:now\s+)?(?:running|executing)\s+(?:a\s+)?(?:[\w-]+\s+)*(?:script|code|pass|inspection|audit|check|test|operator))\b",
+    re.I
+)
 # The step waits on the user, a condition or a later turn: not something to do now. Any "you" in the
 # sentence ("the one you pick"), any condition ("If this looks good, I'll..."), and a step that follows
 # something else ("Say the word and I'll...", "Sign in..., then I'll...") all count as waiting.
@@ -167,9 +185,12 @@ _HANDOFF = re.compile(
     r"you\s+(?:can|could|might|may)\s+(?:now|also|then|want|wish|choose|pick|tell|let)|"
     r"your\s+(?:approval|confirmation|go-?ahead|ok|okay|input|feedback|preference|choice)|"
     r"i(?:'m|\s+am)\s+(?:stopping|done|finished)|i(?:'ll|\s+will)\s+(?:stop|pause|wait|end\s+here|leave\s+it)|"
-    r"stopping\s+here|(?:that|this)(?:'s|\s+is)\s+(?:all|it)|all\s+(?:done|set)|"
-    r"(?:is|are)\s+(?:now\s+)?(?:done|complete|completed|finished|ready))\b|"
-    r"(?:^|[.!:]\s+)(?:please\s+)?(?:done|finished|choose|pick|select|confirm|tell\s+me|reply)\b",
+    r"stopping\s+here|(?:that|this)(?:'s|\s+is)\s+(?:all|it)|all\s+(?:done|set))\b|"
+    r"(?:^|[.!:]\s+)(?:please\s+)?(?:choose|pick|select|confirm|tell\s+me|reply)\b",
+    re.I | re.M)
+_INTERIM_DONE = re.compile(
+    r"\b(?:is|are)\s+(?:now\s+)?(?:done|complete|completed|finished|ready)\b|"
+    r"(?:^|[.!:]\s+)(?:please\s+)?(?:done|finished)\b",
     re.I | re.M)
 _LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
 
@@ -221,5 +242,11 @@ def announces_step(text: str) -> bool:
     if _LIST_ITEM.match(lines[-1]):
         return False
     sentences = [s.strip() for line in lines for s in re.split(r"(?<=[.!])\s+", _plain(line)) if s.strip()]
-    return any(_INTENT.search(s) and not _DEFERRED.search(s) and not s.rstrip(" .!*_").endswith(":")
-               for s in sentences[-2:])
+    has_intent = any(_INTENT.search(s) and not _DEFERRED.search(s) and not s.rstrip(" .!*_").endswith(":")
+                     for s in sentences[-2:])
+    if not has_intent:
+        return False
+    if _INTERIM_DONE.search(sentences[-1]) and not _INTENT.search(sentences[-1]):
+        return False
+    return True
+

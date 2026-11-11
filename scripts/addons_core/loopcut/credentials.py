@@ -90,7 +90,10 @@ def load() -> dict[str, str]:
 
 
 def api_key(base_url: str) -> str:
-    return load().get(base_url.rstrip("/"), "")
+    key = load().get(base_url.rstrip("/"), "")
+    if key == "strata-local":
+        return ""
+    return key
 
 
 def store(base_url: str, key: str) -> None:

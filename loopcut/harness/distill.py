@@ -12,6 +12,7 @@ import ast
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -23,7 +24,9 @@ from datetime import datetime, timezone
 REPO = Path(__file__).resolve().parents[2]
 SKILLS = REPO / 'scripts/addons_core/loopcut/skills'
 PREMIUM = Path('/Volumes/BackupFiles/MasterCoding/BlenderCursor/loopcut-web-client-shared/skills/distilled')
-CODEX = '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex'
+# LOOPCUT_CODEX, else `codex` on PATH (Linux, Windows), else the CLI the ChatGPT app ships on macOS.
+CODEX = (os.environ.get('LOOPCUT_CODEX') or shutil.which('codex')
+         or '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex')
 MAX_SKILL_CHARS = 3060  # About 900 tokens at the add-on's 3.4 chars/token estimate.
 MAX_PACKET_CHARS = 13600  # About 4,000 tokens; includes provenance and render paths.
 OPTIONAL_KEYS = frozenset({'words', 'leads', 'craft'})
