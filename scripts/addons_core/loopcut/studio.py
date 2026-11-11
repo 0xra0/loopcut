@@ -19,10 +19,11 @@ SCHEMAS = [
         "name": "studio_guide", "title": "Exploring 3D studio tools",
         "description": ("Discover advanced Blender operations for sculpting, retopology, UVs, baking, "
                         "rigging, character animation, references and game exports, and read staged build "
-                        "playbooks with acceptance checks. Call with no fields for the command groups, "
-                        "toolset for commands in one group, command for its exact parameters, or playbook "
-                        "for a workflow. Then call studio_action."),
+                        "playbooks with acceptance checks. Call with task for concise task-sized menus "
+                        "('modeling', 'sculpting', 'uv', 'export'), toolset for commands in one group, "
+                        "command for its exact parameters, or playbook for a workflow. Then call studio_action."),
         "parameters": {"type": "object", "properties": {
+            "task": {"type": "string", "description": "Concise task-sized menu: 'modeling', 'sculpting', 'uv', or 'export'"},
             "toolset": {"type": "string", "description": "One toolset from the overview, e.g. sculpt, topology, uv_bake"},
             "command": {"type": "string", "description": "Specific command's Python signature and usage"},
             "playbook": {"type": "string", "description": "Playbook name, or 'list' for available playbooks"},
@@ -73,8 +74,98 @@ def only_reads(command: str) -> bool:
     return isinstance(command, str) and command in READ_ONLY
 
 
-def guide(toolset: str = "", command: str = "", playbook: str = ""):
+TASK_MENUS = {
+    "modeling": {
+        "task": "modeling",
+        "description": "Safe, structured mesh modeling and topology operations",
+        "tools": [
+            "extrude", "inset", "bevel", "boolean", "mirror", "solidify",
+            "merge", "separate", "knife", "bridge", "mesh_report"
+        ],
+        "always_available": {
+            "inspect_api": "Inspect any bpy.ops / bpy.types operator or property signature",
+            "run_python": "Execute direct Python script in Blender's main thread",
+            "capture_viewport": "Rendered or solid viewport visual capture",
+        },
+    },
+    "sculpting": {
+        "task": "sculpting",
+        "description": "Fast regional sculpting and thin-shell surface protection",
+        "tools": [
+            "sculpt_prepare", "sculpt_stroke", "sculpt_smooth", "sculpt_mask", "thin_shell_guard"
+        ],
+        "always_available": {
+            "inspect_api": "Inspect any bpy.ops / bpy.types operator or property signature",
+            "run_python": "Execute direct Python script in Blender's main thread",
+            "capture_viewport": "Rendered or solid viewport visual capture",
+        },
+    },
+    "uv": {
+        "task": "uv",
+        "description": "Seams, unwrapping, packing, texel density, and PBR baking",
+        "tools": [
+            "uv_smart_project", "uv_unwrap", "uv_pack", "uv_seams", "uv_texel_density", "bake_maps", "uv_report"
+        ],
+        "always_available": {
+            "inspect_api": "Inspect any bpy.ops / bpy.types operator or property signature",
+            "run_python": "Execute direct Python script in Blender's main thread",
+            "capture_viewport": "Rendered or solid viewport visual capture",
+        },
+    },
+    "export": {
+        "task": "export",
+        "description": "Game engine export, LOD validation, and asset round-trip checks",
+        "tools": [
+            "export_model", "validate_export", "reimport_check", "texture_pack"
+        ],
+        "always_available": {
+            "inspect_api": "Inspect any bpy.ops / bpy.types operator or property signature",
+            "run_python": "Execute direct Python script in Blender's main thread",
+            "capture_viewport": "Rendered or solid viewport visual capture",
+        },
+    },
+}
+
+
+def task_tool_menu(task: str = "") -> dict:
+    """Return concise task-sized tool menu with guaranteed inspect_api and raw bpy access."""
+    norm = task.lower().strip()
+    if norm in ("sculpt", "sculpting"):
+        return TASK_MENUS["sculpting"]
+    if norm in ("uv", "uvs", "uv_bake", "texturing"):
+        return TASK_MENUS["uv"]
+    if norm in ("model", "modeling", "mesh"):
+        return TASK_MENUS["modeling"]
+    if norm in ("export", "engine_export"):
+        return TASK_MENUS["export"]
+    if norm and norm in TASK_MENUS:
+        return TASK_MENUS[norm]
+    return {
+        "task": "overview",
+        "description": "Selectable task-sized tool menus",
+        "available_tasks": list(TASK_MENUS.keys()),
+        "always_available": {
+            "inspect_api": "Inspect any bpy.ops / bpy.types operator or property signature",
+            "run_python": "Execute direct Python script in Blender's main thread",
+            "capture_viewport": "Rendered or solid viewport visual capture",
+        },
+    }
+
+
+def guide(toolset: str = "", command: str = "", playbook: str = "", task: str = ""):
     from .tools import InputMistake, ToolResult
+    if task:
+        menu = task_tool_menu(task)
+        if menu.get("task") == "overview":
+            return ToolResult(f"Available task menus: {', '.join(menu['available_tasks'])}\n"
+                              "Guaranteed core tools: inspect_api, run_python, capture_viewport.\n"
+                              "Call studio_guide(task='modeling'|'sculpting'|'uv'|'export').")
+        tools_str = ", ".join(menu.get("tools", []))
+        anchors_str = "\n".join(f"- {k}: {v}" for k, v in menu.get("always_available", {}).items())
+        return ToolResult(f"Task Menu [{menu['task'].upper()}]: {menu['description']}\n\n"
+                          f"Concise task commands:\n{tools_str}\n\n"
+                          f"Guaranteed core tools (always available):\n{anchors_str}\n\n"
+                          "Call studio_guide(command=...) for parameter details, then studio_action.")
     if playbook:
         names = sorted(p.stem for p in PLAYBOOKS.glob("*.md"))
         if playbook == "list":

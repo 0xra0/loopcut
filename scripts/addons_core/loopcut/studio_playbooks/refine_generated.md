@@ -9,7 +9,7 @@ Generated meshes look right from the generator's camera and wrong elsewhere: the
 ### 1. Save and measure
 
 - `checkpoint("before refine")`, so any step below can be undone with `rollback`.
-- `mesh_report(name)`: triangles, non-manifold edges, loose parts, flipped normals. `object_details(name)`: materials and the images they use.
+- `pixal3d_refine(object_name=...)` or `mesh_report(name)`: triangles, non-manifold edges, loose parts, flipped normals, minimum shell thickness and symmetry residual. `object_details(name)`: materials and the images they use.
 - `capture_views(objects=[name], views=["front","right","back","iso"], shading="material")`. Write down what is wrong in each view before changing anything.
 
 ### 2. Compare with the source picture

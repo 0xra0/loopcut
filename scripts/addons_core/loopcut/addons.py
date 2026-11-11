@@ -208,3 +208,106 @@ def line(entries: list[dict], bundled: Sequence[dict] = (), off_count: int = 0) 
         sections.append(f"{off_count} more installed add-ons are off: inspect_api search (e.g. 'uv', 'retopology', "
                         "'rig') finds them, and naming one's [module] as path turns it on")
     return "; ".join(sections)
+
+
+RECIPES = {
+    "zenuv": {
+        "module": "zenuv",
+        "name": "Zen UV",
+        "operator": "bpy.ops.uv.zenuv_unwrap",
+        "signature": "bpy.ops.uv.zenuv_unwrap(action='UNWRAP', method='CONFORMAL', pack=True)",
+        "mode": "EDIT_MESH",
+        "context": "Active mesh object in edit mode with faces selected",
+        "working_example": "bpy.ops.object.mode_set(mode='EDIT')\nbpy.ops.mesh.select_all(action='SELECT')\nbpy.ops.uv.zenuv_unwrap()",
+        "native_fallback": "bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)",
+        "description": "High-efficiency UV unwrapping and seam processing.",
+    },
+    "quad_remesher": {
+        "module": "quad_remesher",
+        "name": "Quad Remesher",
+        "operator": "bpy.ops.qremesher.remesh",
+        "signature": "bpy.ops.qremesher.remesh(target_count=5000, adaptive_size=50)",
+        "mode": "OBJECT",
+        "context": "Active mesh object in object mode",
+        "working_example": "bpy.ops.object.mode_set(mode='OBJECT')\nbpy.ops.qremesher.remesh(target_count=4000)",
+        "native_fallback": "bpy.ops.object.modifier_add(type='REMESH')\nbpy.context.active_object.modifiers['Remesh'].mode = 'VOXEL'\nbpy.context.active_object.modifiers['Remesh'].voxel_size = 0.02",
+        "description": "Automatic quad topology reconstruction.",
+    },
+    "hardops": {
+        "module": "hardops",
+        "name": "Hard Ops",
+        "operator": "bpy.ops.hops.bool_difference",
+        "signature": "bpy.ops.hops.bool_difference()",
+        "mode": "OBJECT",
+        "context": "Active base object with selected cutter object",
+        "working_example": "bpy.ops.hops.bool_difference()",
+        "native_fallback": "mod = bpy.context.active_object.modifiers.new('Boolean', 'BOOLEAN')\nmod.operation = 'DIFFERENCE'\nmod.object = cutter",
+        "description": "Non-destructive hard-surface boolean modeling.",
+    },
+    "meshmachine": {
+        "module": "meshmachine",
+        "name": "MESHmachine",
+        "operator": "bpy.ops.machin3.fuse",
+        "signature": "bpy.ops.machin3.fuse()",
+        "mode": "EDIT_MESH",
+        "context": "Edit mode with bevel or chamfer edges selected",
+        "working_example": "bpy.ops.object.mode_set(mode='EDIT')\nbpy.ops.machin3.fuse()",
+        "native_fallback": "bpy.ops.mesh.bevel(offset=0.02, segments=4)",
+        "description": "Chamfer, fuse, and polygon transition modeling.",
+    },
+    "uvpackmaster": {
+        "module": "uvpackmaster",
+        "name": "UVPackmaster",
+        "operator": "bpy.ops.uvpm.pack",
+        "signature": "bpy.ops.uvpm.pack(margin=0.005, rot_step=90)",
+        "mode": "EDIT_MESH",
+        "context": "Edit mode with UV editor active and islands selected",
+        "working_example": "bpy.ops.uvpm.pack()",
+        "native_fallback": "bpy.ops.uv.pack_islands(margin=0.005)",
+        "description": "Optimized GPU-accelerated UV packing.",
+    },
+    "smart_remesh": {
+        "module": "smart_remesh",
+        "name": "Smart Remesh",
+        "operator": "bpy.ops.mesh.smart_remesh",
+        "signature": "bpy.ops.mesh.smart_remesh(voxel_size=0.02)",
+        "mode": "OBJECT",
+        "context": "Active mesh object in object mode",
+        "working_example": "bpy.ops.mesh.smart_remesh(voxel_size=0.02)",
+        "native_fallback": "bpy.ops.object.modifier_add(type='REMESH')",
+        "description": "Fast surface voxel and polygon remeshing.",
+    },
+}
+
+
+def get_recipe(addon_or_op: str) -> dict | None:
+    """Find a verified recipe by add-on name, module, or operator substring."""
+    key = str(addon_or_op).lower().strip()
+    if key in RECIPES:
+        return RECIPES[key]
+    for r_key, r in RECIPES.items():
+        if key in (r["module"].lower(), r["name"].lower(), r["operator"].lower()):
+            return r
+        if r_key in key or key in r_key:
+            return r
+    return None
+
+
+def list_recipes() -> list[dict]:
+    """Return all verified add-on recipes."""
+    return list(RECIPES.values())
+
+
+def recipes_for_installed() -> list[dict]:
+    """Return verified recipes matching currently installed or enabled add-ons."""
+    import bpy
+    prefs = getattr(bpy, "context", None)
+    pref_addons = getattr(getattr(prefs, "preferences", None), "addons", {}) if prefs else {}
+    enabled_keys = set(pref_addons.keys()) if hasattr(pref_addons, "keys") else set()
+    matched = []
+    for key, recipe in RECIPES.items():
+        if key in enabled_keys or recipe["module"] in enabled_keys:
+            matched.append(recipe)
+        elif any(key in k.lower() or recipe["module"] in k.lower() for k in enabled_keys):
+            matched.append(recipe)
+    return matched

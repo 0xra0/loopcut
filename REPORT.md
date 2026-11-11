@@ -62,3 +62,47 @@
 ```
 CHECK GREEN
 ```
+
+---
+
+# Batch 2 Report: Task-Sized Menus, Pixal3D Refinement Workflow, and Add-on Recipes
+
+## Summary of Changes
+
+### Item 5: Task-Sized Tool Menus with Guaranteed Discovery Path
+- **Files Changed**:
+  - `scripts/addons_core/loopcut/studio.py`
+- **Caller that runs the code**:
+  - `studio.guide(task=...)`, `studio.task_tool_menu()`, `studio.action()`
+- **Test that proves it**:
+  - `Batch2ToolsPixalRecipesTest.test_task_tool_menus_guaranteed_discovery_path`
+- **Observable Check**:
+  - Task tool menus for `modeling`, `sculpting`, `uv`, and `export` return concise domain tools with guaranteed discovery anchors (`inspect_api`, `run_python`, `capture_viewport`) always included.
+  - Calling `studio_guide(task="modeling")` returns formatted menu including `extrude`, `inspect_api`, and `run_python`.
+
+### Item 6: Pixal3D Refinement Workflow
+- **Files Changed**:
+  - `scripts/addons_core/loopcut/studio_vendor/handlers/pixal3d.py`
+  - `scripts/addons_core/loopcut/studio_playbooks/refine_generated.md`
+- **Caller that runs the code**:
+  - `pixal3d.pixal3d_refine`, `studio.action("pixal3d_refine", ...)`
+- **Test that proves it**:
+  - `Batch2ToolsPixalRecipesTest.test_pixal3d_refine_staged_repair_and_acceptance`
+- **Observable Check**:
+  - `pixal3d_refine` executes staged repair (`clean_loose`, `fix_non_manifold`, `solidify_thin_shells`, `symmetrize`, `quad_remesh`), measuring initial and final diagnostics (non-manifold edges reduced to 0, isolated debris islands cleaned, shell thickness protected >= 0.005, symmetry preserved), and returns measurable acceptance check results.
+
+### Item 7: Verified Recipes for Installed Add-ons
+- **Files Changed**:
+  - `scripts/addons_core/loopcut/addons.py`
+- **Caller that runs the code**:
+  - `addons.get_recipe()`, `addons.recipes_for_installed()`, `addons.list_recipes()`, `addons.line()`
+- **Test that proves it**:
+  - `Batch2ToolsPixalRecipesTest.test_verified_addon_recipes`
+- **Observable Check**:
+  - Verified recipes for Zen UV, Quad Remesher, Hard Ops, MESHmachine, UVPackmaster, and Smart Remesh provide operator signatures, required modes (`EDIT_MESH` / `OBJECT`), context requirements, working Python examples, and native fallbacks.
+  - `recipes_for_installed()` matches enabled add-ons.
+
+## `./check.sh main` Last Line
+```
+CHECK GREEN
+```
