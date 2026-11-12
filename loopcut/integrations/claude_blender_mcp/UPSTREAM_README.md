@@ -59,7 +59,7 @@ Requires Blender 4.2 LTS or newer. Tested headless on 4.2 and 5.0.
 2. In Blender: **Edit > Preferences > Get Extensions**, open the **v** menu at the top right, choose **Install from Disk...**, and pick the zip.
 3. In the 3D viewport press **N**, open the **Claude** tab and click **Start Claude Bridge**. To start it every time, tick **Start bridge when Blender opens** in the addon's preferences.
 
-The bridge listens on `127.0.0.1:9877` only. That's a different port from the older `blender-mcp` addon (9876), so both can be installed at once.
+The bridge listens on `127.0.0.1:9877` only. That's a different port from the older `blender-mcp` addon (9876), so both can be installed at once. It answers only requests carrying the token Blender writes on Start to `~/.claude_blender/token-<port>` (readable by your user only); the MCP server reads it there, so nothing needs configuring.
 
 ### 2. MCP server
 

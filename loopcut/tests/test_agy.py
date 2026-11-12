@@ -397,15 +397,12 @@ if obj:
     obj.rotation_euler = (0, 0, 0)
 ```
 Let me know if you need any adjustments."""
+        # Code in a reply is shown to the user, never run: the model runs code only through a tool call.
         clean_text, calls = self.agy_cli.parse_tool_calls(raw)
+        self.assertEqual(calls, [])
         self.assertIn("I will fix the mesh orientation", clean_text)
-        self.assertNotIn("```python", clean_text)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0].name, "run_python")
-        self.assertTrue(calls[0].id.startswith("call_"))
-        args = json.loads(calls[0].arguments)
-        self.assertIn("geometry_0", args["code"])
-        self.assertIn("rotation_euler", args["code"])
+        self.assertIn("```python", clean_text)
+        self.assertIn("rotation_euler", clean_text)
 
     def test_parse_tool_calls_single_json_call(self):
         raw = """```json
@@ -487,7 +484,11 @@ obj.rotation_euler = (0, 0, 0)",
         ]
         rendered = "\n".join(self.agy_cli._render_messages(messages))
         self.assertNotIn("iVBORw0KGgoAAAANSUhEUgAA", rendered)
-        self.assertIn("[image: /tmp/loopcut_agy_images/image_", rendered)
+        # agy runs with its file and shell tools off, so it cannot open an image file: it is told so,
+        # rather than handed a path it would spend a turn failing to read, and nothing is written.
+        self.assertIn(self.agy_cli.NO_IMAGES, rendered)
+        self.assertEqual(list(self.agy_cli._workdir().iterdir()), [])
+        self.assertEqual(self.agy_cli._workdir().stat().st_mode & 0o777, 0o700)
 
 
     def test_parse_tool_calls_dual_json_and_python_code(self):
@@ -508,14 +509,10 @@ print("Cleaned!")
 ```
 """
         clean_text, calls = self.agy_cli.parse_tool_calls(raw)
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0].name, "get_object_info")
-        self.assertEqual(calls[1].name, "run_python")
+        self.assertEqual([c.name for c in calls], ["get_object_info"])
         args1 = json.loads(calls[0].arguments)
         self.assertEqual(args1["names"], ["Vampire_Chestplate"])
-        args2 = json.loads(calls[1].arguments)
-        self.assertIn("Cleaned!", args2["code"])
-        self.assertNotIn("```python", clean_text)
+        self.assertIn("Cleaned!", clean_text)
         self.assertNotIn("```json", clean_text)
 
     def test_prompt_autonomous_mandate_and_addons_guidance(self):
@@ -524,22 +521,10 @@ print("Cleaned!")
         self.assertIn("Do NOT stop after a single step or pause to ask conversational confirmation", rendered)
         self.assertIn("Utilizing Installed Blender Add-ons", rendered)
         self.assertIn("30-Second Deadline", rendered)
+        self.assertNotIn("```python", rendered)  # Nothing invites code in a reply: it would only be shown.
 
         prompt = self.agy_cli.build_prompt([{"role": "user", "content": "Fix the mesh"}], [])
         self.assertIn("Do NOT pause to ask conversational permission for intermediate steps", prompt)
-
-    def test_llm_fallback_tool_call_extraction(self):
-        from scripts.addons_core.loopcut import llm
-        completion = llm.Completion()
-        completion.text = """Here is the fix:
-```python
-import bpy
-bpy.ops.mesh.primitive_cube_add()
-```
-"""
-        clean_text, calls = self.agy_cli.parse_tool_calls(completion.text)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0].name, "run_python")
 
     def test_nested_raw_json_and_untagged_code_blocks(self):
         raw = """I will now execute the script:
@@ -560,10 +545,8 @@ import bmesh
 bm = bmesh.new()
 ```"""
         clean_text2, calls2 = self.agy_cli.parse_tool_calls(raw_untagged, {"run_python"})
-        self.assertEqual(len(calls2), 1)
-        self.assertEqual(calls2[0].name, "run_python")
-        args2 = json.loads(calls2[0].arguments)
-        self.assertIn("bmesh.new()", args2["code"])
+        self.assertEqual(calls2, [])
+        self.assertIn("bmesh.new()", clean_text2)
 
     def test_xml_tool_use_and_calls_extraction(self):
         raw_xml = """<tool_use>
@@ -617,7 +600,7 @@ bm = bmesh.new()
         self.assertIn("[truncated", rendered)
         self.assertLess(len(rendered), 15000)
 
-    def test_stream_cmd_includes_skip_permissions(self):
+    def test_agy_runs_strict_in_its_own_folder(self):
         with patch.object(self.agy_cli, "find_agy_binary", return_value="/usr/bin/agy"):
             with patch("subprocess.Popen") as mock_popen:
                 mock_proc = Mock()
@@ -640,7 +623,13 @@ bm = bmesh.new()
 
                 args, kwargs = mock_popen.call_args
                 cmd = args[0]
-                self.assertIn("--dangerously-skip-permissions", cmd)
+                # Loopcut takes only agy's text; agy's own shell and file tools stay off, whatever the
+                # user's agy settings allow (those had toolPermission always-proceed).
+                self.assertFalse(any(arg.startswith("--dangerously") for arg in cmd))  # check: ok asserts the bypass flag is absent
+                held = json.loads(cmd[cmd.index("--settings") + 1])
+                self.assertEqual(held, {"toolPermission": "strict", "allowNonWorkspaceAccess": False})
+                self.assertEqual(kwargs.get("cwd"), self.agy_cli._workdir())
+                self.assertNotIn("/tmp/agy_loopcut.log", cmd)
                 self.assertTrue(kwargs.get("start_new_session"))
 
     def test_guidance_prohibits_in_process_render(self):

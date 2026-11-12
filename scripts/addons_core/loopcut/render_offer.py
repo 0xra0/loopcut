@@ -697,11 +697,6 @@ def _start(data: dict):
     if changed:
         return None, failed.format(error=changed[0].upper() + changed[1:]), False
     try:
-        try:
-            from . import gpu_coordinator
-            gpu_coordinator.acquire_gpu_stage(f"render_offer_{data.get('count', 1)}", "cycles_render", required_vram_mib=2048)
-        except (ImportError, AttributeError):
-            pass
         with _denoised(data):
             result = job_tools.start_render_job(budget(data), output_dir=OUTPUT_DIR,
                                                 frames=list(range(start, end + 1, step)),

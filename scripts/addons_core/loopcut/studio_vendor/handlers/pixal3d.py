@@ -87,11 +87,6 @@ def _run(job, args, cwd, env, max_seconds):
         job["error"] = str(exc)
     finally:
         job["finished"] = time.time()
-        try:
-            from loopcut import gpu_coordinator
-            gpu_coordinator.release_gpu_stage(job["id"])
-        except (ImportError, AttributeError):
-            pass
 
 
 @command("pixal3d_generate", "reference")
@@ -144,11 +139,6 @@ def pixal3d_generate(name, description, image_path=None, seed=None, tries=1, sep
     job = {"id": uuid.uuid4().hex[:8], "name": name, "state": "running", "started": time.time(),
            "log": os.path.join(bpy.app.tempdir or "/tmp", f"pixal3d_{name}_{int(time.time())}.log")}
     _jobs[job["id"]] = job
-    try:
-        from loopcut import gpu_coordinator
-        gpu_coordinator.acquire_gpu_stage(job["id"], "pixal3d_comfy", required_vram_mib=4096)
-    except (ImportError, AttributeError):
-        pass
     threading.Thread(target=_run, args=(job, args, str(root), env, int(max_minutes) * 60), daemon=True).start()
     return {"job_id": job["id"], "log": job["log"],
             "note": "A full run takes about 30-90 minutes on a 16 GB GPU. Poll pixal3d_status every few "
@@ -174,249 +164,154 @@ def pixal3d_status(job_id, name=None, height=None, base_z=0.0):
     return out
 
 
-def _measure_pixal3d_flaws(obj) -> dict:
+
+def _measure_pixal3d_flaws(mesh, dimensions) -> dict:
+    """Islands, non-manifold edges, shell thickness and X-mirror residual, all read from `mesh`.
+
+    min_thickness is the 5th percentile of inward ray hits from sampled vertices, or None when no
+    ray hit a surface (an open sheet has no thickness to measure).
+    """
+    import bmesh
     import numpy as np
-    data = getattr(obj, "data", None)
-    dims = [round(float(d), 4) for d in getattr(obj, "dimensions", (1.0, 1.0, 1.0))]
-    if data is None:
-        return {"islands": 1, "non_manifold_edges": 0, "min_thickness": 0.01, "symmetry_residual": 0.0, "bbox_dimensions": dims}
+    from mathutils import Vector
+    from mathutils.bvhtree import BVHTree
 
-    verts = getattr(data, "vertices", [])
-    edges = getattr(data, "edges", [])
-    n_verts = len(verts)
-    n_edges = len(edges)
-
+    dims = [round(float(d), 4) for d in dimensions]
+    n_verts = len(mesh.vertices)
     if n_verts == 0:
-        return {"islands": 0, "non_manifold_edges": 0, "min_thickness": 0.0, "symmetry_residual": 0.0, "bbox_dimensions": dims}
-
+        return {"islands": 0, "non_manifold_edges": 0, "min_thickness": None, "symmetry_residual": 0.0,
+                "bbox_dimensions": dims}
     co = np.empty(n_verts * 3, dtype=np.float32)
-    data.vertices.foreach_get("co", co)
+    mesh.vertices.foreach_get("co", co)
     co = co.reshape(-1, 3)
 
-    islands = 1
-    if n_edges > 0:
-        edge_verts = np.empty(n_edges * 2, dtype=np.int32)
-        data.edges.foreach_get("vertices", edge_verts)
-        edge_verts = edge_verts.reshape(-1, 2)
-        parent = list(range(n_verts))
+    parent = list(range(n_verts))
 
-        def find(i):
-            path = []
-            while parent[i] != i:
-                path.append(i)
-                i = parent[i]
-            for p in path:
-                parent[p] = i
-            return i
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
 
-        for v1, v2 in edge_verts:
-            r1, r2 = find(int(v1)), find(int(v2))
-            if r1 != r2:
-                parent[r1] = r2
-        islands = len({find(i) for i in range(n_verts)})
+    edge_verts = np.empty(len(mesh.edges) * 2, dtype=np.int32)
+    mesh.edges.foreach_get("vertices", edge_verts)
+    for v1, v2 in edge_verts.reshape(-1, 2).tolist():
+        r1, r2 = find(v1), find(v2)
+        if r1 != r2:
+            parent[r1] = r2
+    islands = len({find(i) for i in range(n_verts)})
 
-    non_manifold = 0
+    bm = bmesh.new()
     try:
-        import bmesh
-        bm = bmesh.new()
-        bm.from_mesh(data)
-        bm.edges.ensure_lookup_table()
-        non_manifold = sum(1 for e in bm.edges if not getattr(e, "is_manifold", True))
+        bm.from_mesh(mesh)
+        non_manifold = sum(1 for e in bm.edges if not e.is_manifold)
+    finally:
         bm.free()
-    except (ImportError, AttributeError, ValueError, RuntimeError):
-        if hasattr(data, "edges"):
-            non_manifold = sum(1 for e in data.edges if getattr(e, "is_loose", False))
 
-    refl_co = co.copy()
-    refl_co[:, 0] = -refl_co[:, 0]
-    sample_idx = np.linspace(0, n_verts - 1, min(100, n_verts), dtype=int)
-    diffs = np.linalg.norm(co[sample_idx, None, :] - refl_co[None, sample_idx, :], axis=-1)
-    symmetry_residual = float(np.mean(np.min(diffs, axis=1))) if len(sample_idx) > 0 else 0.0
+    sample = np.linspace(0, n_verts - 1, min(100, n_verts), dtype=int)
+    mirrored = co[sample] * np.array([-1.0, 1.0, 1.0], dtype=np.float32)
+    symmetry_residual = float(np.mean(np.min(np.linalg.norm(co[None, :, :] - mirrored[:, None, :], axis=-1), axis=1)))
 
-    min_thickness = 0.0
-    try:
-        from mathutils.bvhtree import BVHTree
-        import mathutils
-        polys = getattr(data, "polygons", [])
-        if len(polys) > 0 and n_verts > 0:
-            poly_verts = [list(p.vertices) for p in polys]
-            bvh = BVHTree.FromPolygons(co, poly_verts)
-            normals = np.empty(n_verts * 3, dtype=np.float32)
-            data.vertices.foreach_get("normal", normals)
-            normals = normals.reshape(-1, 3)
-            step = max(1, n_verts // 100)
-            hits = []
-            for idx in range(0, n_verts, step):
-                v_norm = mathutils.Vector(normals[idx])
-                if v_norm.length_squared < 1e-6:
-                    continue
-                v_norm.normalize()
-                v_co = mathutils.Vector(co[idx])
-                origin = v_co - v_norm * 1e-4
-                direction = -v_norm
-                loc, hit_norm, hit_idx, dist = bvh.ray_cast(origin, direction)
-                if loc is not None and dist is not None and dist > 1e-4:
-                    hits.append(dist)
-            if hits:
-                min_thickness = float(np.percentile(hits, 5))
-    except (ImportError, AttributeError, ValueError, RuntimeError):
-        pass
-
-    if min_thickness <= 0.0:
-        min_thickness = max(0.001, float(min(dims) * 0.05)) if dims else 0.001
+    hits = []
+    if len(mesh.polygons):
+        bvh = BVHTree.FromPolygons(co.tolist(), [tuple(p.vertices) for p in mesh.polygons])
+        normals = np.empty(n_verts * 3, dtype=np.float32)
+        mesh.vertices.foreach_get("normal", normals)
+        normals = normals.reshape(-1, 3)
+        for idx in range(0, n_verts, max(1, n_verts // 100)):
+            inward = -Vector(normals[idx].tolist())
+            if inward.length_squared < 1e-12:
+                continue
+            inward.normalize()
+            loc, _normal, _index, dist = bvh.ray_cast(Vector(co[idx].tolist()) + inward * 1e-4, inward)
+            if loc is not None and dist > 1e-4:
+                hits.append(dist)
 
     return {
-        "islands": int(islands),
-        "non_manifold_edges": int(non_manifold),
-        "min_thickness": round(float(min_thickness), 5),
-        "symmetry_residual": round(float(symmetry_residual), 5),
+        "islands": islands,
+        "non_manifold_edges": non_manifold,
+        "min_thickness": round(float(np.percentile(hits, 5)), 5) if hits else None,
+        "symmetry_residual": round(symmetry_residual, 5),
         "bbox_dimensions": dims,
     }
 
 
-def _apply_refinement_stages(obj, target_symmetry: bool, min_thickness: float, quad_target: int,
-                             skip_loose: bool = False, skip_holes: bool = False) -> list[str]:
+def _measure_evaluated(obj) -> dict:
+    """Measure the mesh as it renders, modifiers included."""
+    bpy.context.view_layer.update()
+    evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    try:
+        return _measure_pixal3d_flaws(evaluated.to_mesh(), obj.dimensions)
+    finally:
+        evaluated.to_mesh_clear()
+
+
+def _apply_refinement_stages(obj, target_symmetry: bool, min_thickness: float, quad_target: int) -> list[str]:
+    from .topology import quad_remesh
+    from .util import ops_context
+
     stages = []
-    if not skip_loose:
-        try:
-            bpy.ops.object.mode_set(mode='EDIT')
-            bpy.ops.mesh.select_all(action='SELECT')
-            if hasattr(bpy.ops.mesh, "delete_loose"):
-                bpy.ops.mesh.delete_loose()
-            stages.append("clean_loose")
-        except (RuntimeError, AttributeError):
-            pass
-        finally:
-            try:
-                bpy.ops.object.mode_set(mode='OBJECT')
-            except (RuntimeError, AttributeError):
-                pass
-
-    if not skip_holes:
-        try:
-            bpy.ops.object.mode_set(mode='EDIT')
-            if hasattr(bpy.ops.mesh, "fill_holes"):
-                bpy.ops.mesh.fill_holes(sides=4)
-            stages.append("fix_non_manifold")
-        except (RuntimeError, AttributeError):
-            pass
-        finally:
-            try:
-                bpy.ops.object.mode_set(mode='OBJECT')
-            except (RuntimeError, AttributeError):
-                pass
-
-    if min_thickness > 0:
-        try:
-            if hasattr(obj, "modifiers"):
-                mod = obj.modifiers.new(name="Pixal3D_Solidify", type='SOLIDIFY')
-                mod.thickness = float(min_thickness)
-                stages.append("solidify_thin_shells")
-        except (RuntimeError, AttributeError):
-            pass
-
-    if target_symmetry:
-        try:
-            bpy.ops.object.mode_set(mode='EDIT')
-            if hasattr(bpy.ops.mesh, "symmetrize"):
-                bpy.ops.mesh.symmetrize(direction='NEGATIVE_X')
-            stages.append("symmetrize")
-        except (RuntimeError, AttributeError):
-            pass
-        finally:
-            try:
-                bpy.ops.object.mode_set(mode='OBJECT')
-            except (RuntimeError, AttributeError):
-                pass
-
+    with ops_context(obj, mode="EDIT"):
+        bpy.ops.mesh.select_all(action="SELECT")
+        bpy.ops.mesh.delete_loose()
+        stages.append("delete_loose")
+        bpy.ops.mesh.select_all(action="SELECT")
+        bpy.ops.mesh.fill_holes(sides=4)
+        stages.append("fill_holes_up_to_4_sides")
+        if target_symmetry:
+            bpy.ops.mesh.select_all(action="SELECT")
+            bpy.ops.mesh.symmetrize(direction="NEGATIVE_X")
+            stages.append("symmetrize_minus_x_onto_plus_x")
     if quad_target > 0:
-        applied_quad = False
-        try:
-            if hasattr(bpy.ops.mesh, "quad_remesh"):
-                bpy.ops.mesh.quad_remesh(target_faces=int(quad_target))
-                stages.append("quad_remesh")
-                applied_quad = True
-            elif hasattr(bpy.ops, "qremesher") and hasattr(bpy.ops.qremesher, "remesh"):
-                bpy.ops.qremesher.remesh()
-                stages.append("quad_remesh")
-                applied_quad = True
-        except (RuntimeError, AttributeError):
-            pass
-
-        if not applied_quad:
-            try:
-                if hasattr(obj, "modifiers"):
-                    mod = obj.modifiers.new(name="Pixal3D_Remesh", type='REMESH')
-                    mod.mode = 'VOXEL'
-                    mod.voxel_size = 0.02
-                    stages.append("voxel_remesh")
-            except (RuntimeError, AttributeError):
-                pass
-
+        quad_remesh(obj.name, target_faces=int(quad_target))
+        stages.append("quadriflow_remesh")
+    if min_thickness > 0:
+        mod = obj.modifiers.new(name="Pixal3D_Solidify", type="SOLIDIFY")
+        mod.thickness = float(min_thickness)
+        stages.append("solidify_modifier")
     return stages
 
 
 @command("pixal3d_refine", "topology")
-def pixal3d_refine(object_name=None, target_symmetry=True, min_thickness=0.005, quad_target=0):
-    """Staged refinement workflow for Pixal3D generated meshes.
+def pixal3d_refine(object_name=None, target_symmetry=False, min_thickness=0.005, quad_target=0):
+    """Repair a generated mesh in stages and measure it before and after.
 
-    Measures disconnected components, non-manifold edges, shell thickness, symmetry,
-    and reference alignment before and after staged repair, validating against
-    measurable acceptance criteria.
+    Deletes loose vertices and edges, fills holes of up to 4 sides, mirrors -X onto +X only when
+    target_symmetry, QuadriFlow-remeshes to quad_target faces when above 0 (destroys UVs), and adds a
+    Solidify modifier of min_thickness when above 0. object_name defaults to the active object.
+    The after numbers are measured on the evaluated mesh, modifiers included.
     """
-    target = None
+    from .util import get_mesh
+
     if object_name:
-        b_data = getattr(bpy, "data", None)
-        target = getattr(b_data, "objects", {}).get(object_name) if b_data else None
-    if target is None:
-        context = getattr(bpy, "context", None)
-        target = getattr(context, "active_object", None) if context else None
-    if target is None:
-        raise CommandError(f"No object found for refinement (object_name={object_name!r})")
+        target = get_mesh(object_name)
+    else:
+        target = bpy.context.active_object
+        if target is None or target.type != "MESH":
+            raise CommandError("Name the mesh to refine: object_name, or make it the active object")
 
-    initial = _measure_pixal3d_flaws(target)
+    initial = _measure_evaluated(target)
+    stages = _apply_refinement_stages(target, bool(target_symmetry), float(min_thickness), int(quad_target))
+    final = _measure_evaluated(target)
 
-    # Durable pipeline resumption from project memory
-    pipe_name = f"pixal3d_refine_{getattr(target, 'name', 'mesh')}"
-    from loopcut import project_memory
-    potential = ["clean_loose", "fix_non_manifold"]
+    checks = [
+        {"check": "no_non_manifold_edges", "passed": final["non_manifold_edges"] == 0,
+         "value": final["non_manifold_edges"]},
+        {"check": "islands_not_increased", "passed": final["islands"] <= initial["islands"],
+         "value": final["islands"]},
+    ]
     if float(min_thickness) > 0:
-        potential.append("solidify_thin_shells")
+        thickness = final["min_thickness"]
+        checks.append({"check": "shell_thickness_at_least_min", "value": thickness,
+                       "passed": thickness is not None and thickness >= float(min_thickness) * 0.8})
     if target_symmetry:
-        potential.append("symmetrize")
-    if int(quad_target) > 0:
-        potential.append("quad_remesh")
-
-    remaining = set(project_memory.resume_pipeline(pipe_name, potential))
-
-    stages = _apply_refinement_stages(
-        target,
-        target_symmetry=("symmetrize" in remaining),
-        min_thickness=(float(min_thickness) if "solidify_thin_shells" in remaining else 0.0),
-        quad_target=(int(quad_target) if "quad_remesh" in remaining else 0),
-        skip_loose=("clean_loose" not in remaining),
-        skip_holes=("fix_non_manifold" not in remaining),
-    )
-    for st in stages:
-        project_memory.record_completed_stage(pipe_name, st)
-
-    final = _measure_pixal3d_flaws(target)
-
-    acc_non_manifold = final.get("non_manifold_edges", 0) <= max(0, initial.get("non_manifold_edges", 0) // 2)
-    acc_islands = final.get("islands", 1) <= max(1, initial.get("islands", 1))
-    acc_thickness = final.get("min_thickness", 0.0) >= float(min_thickness) * 0.8
-    passed = acc_non_manifold and acc_islands and acc_thickness
-
+        checks.append({"check": "symmetry_residual_not_increased", "value": final["symmetry_residual"],
+                       "passed": final["symmetry_residual"] <= initial["symmetry_residual"]})
     return {
-        "object": getattr(target, "name", "Mesh"),
+        "object": target.name,
         "initial_diagnostics": initial,
         "final_diagnostics": final,
         "stages_completed": stages,
-        "acceptance_passed": passed,
-        "acceptance_checks": [
-            {"check": "non_manifold_eliminated", "passed": final.get("non_manifold_edges", 0) == 0, "value": final.get("non_manifold_edges")},
-            {"check": "isolated_islands_cleaned", "passed": acc_islands, "value": final.get("islands")},
-            {"check": "shell_thickness_protected", "passed": acc_thickness, "value": final.get("min_thickness")},
-            {"check": "symmetry_preserved", "passed": final.get("symmetry_residual", 0.0) <= initial.get("symmetry_residual", 1.0), "value": final.get("symmetry_residual")},
-        ],
+        "acceptance_passed": all(c["passed"] for c in checks),
+        "acceptance_checks": checks,
     }

@@ -1,7 +1,7 @@
 """Unit tests for Batch 2: Items 5, 6, 7.
 
 Item 5: Task-sized tool menus with guaranteed discovery path (inspect_api + run_python).
-Item 6: Pixal3D refinement workflow with staged measurement, checkpoints, and acceptance checks.
+Item 6: Pixal3D refinement is checked in real Blender by loopcut/harness/smoke_check.py.
 Item 7: Verified recipes for installed add-ons with signatures, mode, and working examples.
 """
 
@@ -10,7 +10,6 @@ import types
 import unittest
 from pathlib import Path
 from unittest import mock
-import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts" / "addons_core"))
@@ -105,85 +104,24 @@ class Batch2ToolsPixalRecipesTest(unittest.TestCase):
     # Item 5: Task-Sized Tool Menus with Guaranteed Discovery Path
     # -------------------------------------------------------------------------
 
-    def test_task_tool_menus_guaranteed_discovery_path(self):
-        """Task menus return domain tools while guaranteeing inspect_api and raw bpy access."""
-        for task in ("modeling", "sculpting", "uv", "export"):
-            menu = studio.task_tool_menu(task)
-            self.assertEqual(menu["task"], task)
-            self.assertGreater(len(menu["tools"]), 0)
-
-            # Guaranteed discovery anchors must always be present
-            anchors = menu.get("always_available", {})
-            self.assertIn("inspect_api", anchors)
-            self.assertIn("run_python", anchors)
-            self.assertIn("capture_viewport", anchors)
-
-        # Calling studio_guide with task returns formatted menu text
-        res = studio.guide(task="modeling")
-        self.assertIn("inspect_api", res.text)
-        self.assertIn("run_python", res.text)
-        self.assertIn("extrude", res.text)
-
-    # -------------------------------------------------------------------------
-    # Item 6: Pixal3D Refinement Workflow
-    # -------------------------------------------------------------------------
-
-    def test_pixal3d_refine_staged_repair_and_acceptance(self):
-        """Pixal3D refinement measures mesh flaws and executes staged repair with acceptance check."""
-        from loopcut.studio_vendor.handlers import pixal3d
-
-        # Mock geometry measurements for staged repair
-        meas_before = {
-            "islands": 5,
-            "non_manifold_edges": 12,
-            "min_thickness": 0.001,
-            "symmetry_residual": 0.045,
-            "bbox_dimensions": [0.8, 0.4, 1.2],
+    def test_task_menus_list_only_registered_commands(self):
+        """A task menu is built from the registry, so every name it offers can be called."""
+        registry = {
+            "mesh_extrude": {"toolset": "modeling"},
+            "quad_remesh": {"toolset": "topology"},
+            "sculpt_stroke": {"toolset": "sculpt"},
+            "uv_pack": {"toolset": "uv_bake"},
         }
-        meas_after = {
-            "islands": 1,
-            "non_manifold_edges": 0,
-            "min_thickness": 0.008,
-            "symmetry_residual": 0.002,
-            "bbox_dimensions": [0.8, 0.4, 1.2],
-        }
-
-        with mock.patch("loopcut.studio_vendor.handlers.pixal3d._measure_pixal3d_flaws", side_effect=[meas_before, meas_after]):
-            with mock.patch("loopcut.studio_vendor.handlers.pixal3d._apply_refinement_stages", return_value=["clean_loose", "fix_non_manifold", "solidify_thin_shells", "symmetrize"]):
-                report = pixal3d.pixal3d_refine("Pixal3D_Imported_Mesh", target_symmetry=True, min_thickness=0.005)
-                self.assertIn("initial_diagnostics", report)
-                self.assertIn("final_diagnostics", report)
-                self.assertIn("stages_completed", report)
-                self.assertTrue(report["acceptance_passed"])
-                self.assertEqual(report["final_diagnostics"]["non_manifold_edges"], 0)
-                self.assertEqual(report["final_diagnostics"]["islands"], 1)
-                self.assertGreaterEqual(report["final_diagnostics"]["min_thickness"], 0.005)
-
-    def test_pixal3d_honest_remesh_labeling(self):
-        """When native quad remesher is unavailable, remesh stage is honestly labeled voxel_remesh."""
-        from loopcut.studio_vendor.handlers import pixal3d
-        obj = types.SimpleNamespace(modifiers=types.SimpleNamespace(new=lambda **kw: types.SimpleNamespace()))
-        stages = pixal3d._apply_refinement_stages(obj, target_symmetry=False, min_thickness=0.0, quad_target=1000)
-        self.assertIn("voxel_remesh", stages)
-        self.assertNotIn("quad_remesh", stages)
-
-    def test_pixal3d_refine_resumes_using_project_memory(self):
-        """pixal3d_refine skips already completed stages recorded in project memory."""
-        from loopcut import project_memory
-        from loopcut.studio_vendor.handlers import pixal3d
-
-        pipe_name = "pixal3d_refine_Pixal3D_Imported_Mesh"
-        project_memory.record_completed_stage(pipe_name, "clean_loose")
-        project_memory.record_completed_stage(pipe_name, "fix_non_manifold")
-
-        meas = {"islands": 1, "non_manifold_edges": 0, "min_thickness": 0.01, "symmetry_residual": 0.0, "bbox_dimensions": [1, 1, 1]}
-        with mock.patch("loopcut.studio_vendor.handlers.pixal3d._measure_pixal3d_flaws", return_value=meas):
-            with mock.patch("loopcut.studio_vendor.handlers.pixal3d._apply_refinement_stages", return_value=["solidify_thin_shells"]) as mock_apply:
-                report = pixal3d.pixal3d_refine("Pixal3D_Imported_Mesh", target_symmetry=False, min_thickness=0.005)
-                mock_apply.assert_called_once()
-                kwargs = mock_apply.call_args[1]
-                self.assertTrue(kwargs.get("skip_loose"))
-                self.assertTrue(kwargs.get("skip_holes"))
+        with mock.patch.object(studio, "_registry", return_value=registry):
+            self.assertEqual(studio.task_tool_menu("modeling"), ["mesh_extrude", "quad_remesh"])
+            self.assertEqual(studio.task_tool_menu("Sculpting"), ["sculpt_stroke"])
+            self.assertIsNone(studio.task_tool_menu("cooking"))
+            text = studio.guide(task="uv").text
+            self.assertIn("uv_pack", text)
+            self.assertNotIn("mesh_extrude", text)
+            from loopcut.tools import InputMistake
+            with self.assertRaises(InputMistake):
+                studio.guide(task="cooking")
 
     # -------------------------------------------------------------------------
     # Item 7: Verified Recipes for Installed Add-ons

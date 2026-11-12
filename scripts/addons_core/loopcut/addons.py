@@ -96,36 +96,23 @@ def search_off(query: str) -> list[str]:
     if not hits:
         return []
     shown = hits[:MAX_OFF_HITS] + ([f"  +{len(hits) - MAX_OFF_HITS} more"] if len(hits) > MAX_OFF_HITS else [])
-    return ["Installed add-ons that are off; pass the [module] as inspect_api path to turn one on:", *shown]
+    return ["Installed add-ons that are off; turning one on runs its code, so it goes through run_python: "
+            f"`import addon_utils; {TURN_ON.format(module='<module>')}`:", *shown]
 
 
-def enable_installed(module: str) -> str | None:
-    """Turn on an installed-but-off add-on for this session and describe its operators; None when module names
-    none. Leaves preferences as clean as they were, so the add-on stays on after a restart only if the user saves
-    preferences. Raises RuntimeError when its register() fails."""
+TURN_ON = "addon_utils.enable({module!r}, default_set=True)"
+
+
+def off_notice(module: str) -> str | None:
+    """How to turn on the installed-but-off add-on that module names; None when it names none. Turning one on runs
+    its register(), so it goes through run_python, which the user approves; inspect_api, which runs unasked, only
+    says how."""
     entry = next((e for e in installed_off() if e["module"] == module), None)
     if entry is None:
         return None
-    import addon_utils
-    import bpy
-    preferences = bpy.context.preferences
-    dirty = preferences.is_dirty
-    failure = []
-    try:
-        addon_utils.enable(module, default_set=True, handle_error=failure.append)
-    finally:
-        preferences.is_dirty = dirty
-    if failure or not addon_utils.check(module)[1]:
-        if module in preferences.addons:
-            addon_utils.disable(module, default_set=True, handle_error=lambda ex: None)
-            preferences.is_dirty = dirty
-        why = f": {failure[0]!r}" if failure else ""
-        raise RuntimeError(f"Could not turn on {entry['name']} [{module}]{why}")
-    operators = _operators_by_addon({module: sys.modules.get(module)}).get(module, [])
-    shown = ", ".join(f"bpy.ops.{op}" for op in sorted(operators)[:40])
-    more = f" (+{len(operators) - 40} more)" if len(operators) > 40 else ""
-    return (f"Turned on {off_hint(entry)} for this session. Its operators: {shown or 'none registered'}{more}. "
-            "Its panels and properties are in bpy.types now: inspect_api describes any of them.")
+    return (f"{off_hint(entry)} is installed but off, so it has registered nothing yet. Turning it on runs its "
+            f"code: call run_python with `import addon_utils; {TURN_ON.format(module=module)}`, then inspect_api "
+            "again for its operators.")
 
 
 def _info(module) -> dict:
@@ -206,7 +193,7 @@ def line(entries: list[dict], bundled: Sequence[dict] = (), off_count: int = 0) 
         sections.append("Bundled, off until inspect_api names one: " + "; ".join(shown))
     if off_count:
         sections.append(f"{off_count} more installed add-ons are off: inspect_api search (e.g. 'uv', 'retopology', "
-                        "'rig') finds them, and naming one's [module] as path turns it on")
+                        "'rig') finds them and says how to turn one on")
     return "; ".join(sections)
 
 

@@ -43,6 +43,13 @@ class StudioTest(unittest.TestCase):
             studio.action('run_python', {'code': 'print(1)'}, 'bypass')
         self.assertNotIn('run_python', studio.READ_ONLY)
 
+    def test_export_is_held_to_the_paths_write_file_may_write(self):
+        # export_model writes where its path says; a hidden path (a shell profile, an autostart entry) is refused
+        # before anything runs, as write_file refuses it.
+        for path in ('~/.bashrc', '~/.config/autostart/model.fbx'):
+            with self.subTest(path=path), self.assertRaisesRegex(tools.ToolError, 'hidden'):
+                studio.action('export_model', {'path': path}, 'export')
+
     def test_result_png_payload_is_not_passed_to_the_model(self):
         import base64
         png = base64.b64encode(b'\x89PNG\r\n\x1a\n0000').decode()

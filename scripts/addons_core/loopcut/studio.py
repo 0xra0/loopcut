@@ -61,6 +61,7 @@ HEAVY = {"voxel_remesh", "quad_remesh", "decimate", "sculpt_prepare", "sculpt_st
          "quad_remesh_op", "reproject_shrinkwrap_op", "render_configure_engine", "sim_add_cloth"}
 # UniRig and Pixal3D launch scripts in a subprocess: never waive their per-call approval.
 EXTERNAL_EXECUTION = {"auto_rig_unirig", "image_to_3d", "pixal3d_generate"}
+WRITES_FILE = {"export_model"}  # Its `path` is where it writes.
 PLAYBOOKS = Path(__file__).with_name("studio_playbooks")
 
 
@@ -74,98 +75,32 @@ def only_reads(command: str) -> bool:
     return isinstance(command, str) and command in READ_ONLY
 
 
-TASK_MENUS = {
-    "modeling": {
-        "task": "modeling",
-        "description": "Safe, structured mesh modeling and topology operations",
-        "tools": [
-            "extrude", "inset", "bevel", "boolean", "mirror", "solidify",
-            "merge", "separate", "knife", "bridge", "mesh_report"
-        ],
-        "always_available": {
-            "inspect_api": "Inspect any bpy.ops / bpy.types operator or property signature",
-            "run_python": "Execute direct Python script in Blender's main thread",
-            "capture_viewport": "Rendered or solid viewport visual capture",
-        },
-    },
-    "sculpting": {
-        "task": "sculpting",
-        "description": "Fast regional sculpting and thin-shell surface protection",
-        "tools": [
-            "sculpt_prepare", "sculpt_stroke", "sculpt_smooth", "sculpt_mask", "thin_shell_guard"
-        ],
-        "always_available": {
-            "inspect_api": "Inspect any bpy.ops / bpy.types operator or property signature",
-            "run_python": "Execute direct Python script in Blender's main thread",
-            "capture_viewport": "Rendered or solid viewport visual capture",
-        },
-    },
-    "uv": {
-        "task": "uv",
-        "description": "Seams, unwrapping, packing, texel density, and PBR baking",
-        "tools": [
-            "uv_smart_project", "uv_unwrap", "uv_pack", "uv_seams", "uv_texel_density", "bake_maps", "uv_report"
-        ],
-        "always_available": {
-            "inspect_api": "Inspect any bpy.ops / bpy.types operator or property signature",
-            "run_python": "Execute direct Python script in Blender's main thread",
-            "capture_viewport": "Rendered or solid viewport visual capture",
-        },
-    },
-    "export": {
-        "task": "export",
-        "description": "Game engine export, LOD validation, and asset round-trip checks",
-        "tools": [
-            "export_model", "validate_export", "reimport_check", "texture_pack"
-        ],
-        "always_available": {
-            "inspect_api": "Inspect any bpy.ops / bpy.types operator or property signature",
-            "run_python": "Execute direct Python script in Blender's main thread",
-            "capture_viewport": "Rendered or solid viewport visual capture",
-        },
-    },
+# A task names the toolsets it needs; its menu lists the commands registered in them.
+TASK_TOOLSETS = {
+    "modeling": ("modeling", "topology"),
+    "sculpting": ("sculpt",),
+    "uv": ("uv_bake",),
+    "export": ("export",),
 }
 
 
-def task_tool_menu(task: str = "") -> dict:
-    """Return concise task-sized tool menu with guaranteed inspect_api and raw bpy access."""
-    norm = task.lower().strip()
-    if norm in ("sculpt", "sculpting"):
-        return TASK_MENUS["sculpting"]
-    if norm in ("uv", "uvs", "uv_bake", "texturing"):
-        return TASK_MENUS["uv"]
-    if norm in ("model", "modeling", "mesh"):
-        return TASK_MENUS["modeling"]
-    if norm in ("export", "engine_export"):
-        return TASK_MENUS["export"]
-    if norm and norm in TASK_MENUS:
-        return TASK_MENUS[norm]
-    return {
-        "task": "overview",
-        "description": "Selectable task-sized tool menus",
-        "available_tasks": list(TASK_MENUS.keys()),
-        "always_available": {
-            "inspect_api": "Inspect any bpy.ops / bpy.types operator or property signature",
-            "run_python": "Execute direct Python script in Blender's main thread",
-            "capture_viewport": "Rendered or solid viewport visual capture",
-        },
-    }
+def task_tool_menu(task: str) -> list[str] | None:
+    """The registered commands for a task, or None for a task not in TASK_TOOLSETS."""
+    toolsets = TASK_TOOLSETS.get(task.lower().strip())
+    if toolsets is None:
+        return None
+    return sorted(name for name, entry in _registry().items() if entry["toolset"] in toolsets)
 
 
 def guide(toolset: str = "", command: str = "", playbook: str = "", task: str = ""):
     from .tools import InputMistake, ToolResult
     if task:
-        menu = task_tool_menu(task)
-        if menu.get("task") == "overview":
-            return ToolResult(f"Available task menus: {', '.join(menu['available_tasks'])}\n"
-                              "Guaranteed core tools: inspect_api, run_python, capture_viewport.\n"
-                              "Call studio_guide(task='modeling'|'sculpting'|'uv'|'export').")
-        tools_str = ", ".join(menu.get("tools", []))
-        anchors_str = "\n".join(f"- {k}: {v}" for k, v in menu.get("always_available", {}).items())
-        return ToolResult(f"Task Menu [{menu['task'].upper()}]: {menu['description']}\n\n"
-                          f"Concise task commands:\n{tools_str}\n\n"
-                          f"Guaranteed core tools (always available):\n{anchors_str}\n\n"
-                          "Call studio_guide(command=...) for parameter details, then studio_action.")
+        names = task_tool_menu(task)
+        if names is None:
+            raise InputMistake(f"Unknown task {task!r}. Tasks: {', '.join(TASK_TOOLSETS)}")
+        return ToolResult(f"Studio commands for {task}: {', '.join(names)}\n"
+                          "Read studio_guide(command=...) before calling one. For an operator outside "
+                          "these, inspect_api finds it; run_python does anything else.")
     if playbook:
         names = sorted(p.stem for p in PLAYBOOKS.glob("*.md"))
         if playbook == "list":
@@ -241,9 +176,12 @@ def _images(value):
 
 def action(command: str, params: dict, summary: str):
     """Dispatch a native handler with Loopcut's existing guardrails and audit trail."""
-    from . import cost_guard, live_file, op_notes, scene_diff, shape_key_guard, tools
+    from . import cost_guard, files, live_file, op_notes, scene_diff, shape_key_guard, tools
     if not isinstance(command, str) or command in BLOCKED:
         raise tools.InputMistake("This command is not exposed by studio_action; use Loopcut's native tools.")
+    # A file it writes is held to what write_file may write: nothing hidden, nothing of Loopcut's own.
+    if command in WRITES_FILE and isinstance(params, dict) and "path" in params:
+        params = {**params, "path": str(files.check(files.resolve(str(params["path"]))))}
     registry = _registry()
     entry = registry.get(command)
     if entry is None:

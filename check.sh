@@ -3,7 +3,9 @@
 #
 #   1. Rules on the lines added since BASE (default HEAD: uncommitted work, new files included).
 #      For a branch, pass where it started:  ./check.sh main
-#   2. Headless smoke: the add-on registers in real Blender and runs two real tools.
+#      Also names used but never defined in the changed files (ruff F821), compared with BASE.
+#   2. Headless smoke: the add-on registers in real Blender and runs real tools, studio commands
+#      included, through tools.execute (loopcut/harness/smoke_check.py).
 #   3. The full unit suite (about 4 minutes). Two failures are known and allowed.
 #
 # Exit 0 and "CHECK GREEN" only when all three pass. A flagged line that is right as written
@@ -18,9 +20,11 @@ failed=()
 
 echo "== 1/3 rules on lines added since $BASE"
 if ! python3 - "$BASE" <<'PY'
+import json
 import re
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 base = sys.argv[1]
@@ -88,6 +92,27 @@ for p in sorted({p for p, _, _ in added}):
             compile(Path(p).read_text(), p, "exec")
         except SyntaxError as e:
             problems.append(f"{p}:{e.lineno}: syntax error: {e.msg}")
+
+# A name used and never defined (a missing import) fails only when that line runs, and the fake bpy in
+# the unit tests keeps most lines from running. Compared with BASE, so names undefined before don't count.
+def undefined(path, source):
+    out = subprocess.run(["ruff", "check", "--select", "F821", "--output-format", "json", "--no-cache",
+                          "--exit-zero", "--stdin-filename", path, "-"],
+                         input=source, capture_output=True, text=True, check=True).stdout
+    return [(d["location"]["row"], d["message"]) for d in json.loads(out)]
+
+
+try:
+    for p in sorted({p for p, _, _ in added if Path(p).exists()}):
+        old = subprocess.run(["git", "show", f"{base}:{p}"], capture_output=True, text=True)
+        known = Counter(m for _, m in undefined(p, old.stdout)) if old.returncode == 0 else Counter()
+        for row, message in undefined(p, Path(p).read_text()):
+            if known[message]:
+                known[message] -= 1
+            else:
+                problems.append(f"{p}:{row}: {message}: import it or define it")
+except FileNotFoundError:
+    problems.append("ruff is not installed, so the undefined-name check could not run: pip install ruff")
 
 for p in sorted(new_modules):
     stem = Path(p).stem

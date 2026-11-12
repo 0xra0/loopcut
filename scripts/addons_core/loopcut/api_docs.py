@@ -674,8 +674,8 @@ def _inspect(path: str, search: str) -> str:
     try:
         if search:
             lines = _search(search)
-        elif (turned_on := addons.enable_installed(path)) is not None:
-            lines = [turned_on]
+        elif (off := addons.off_notice(path)) is not None:
+            lines = [off]
         else:
             package, path = bundled_addons.matching_path(path)
             notice = bundled_addons.ensure_enabled(package) if package else ""

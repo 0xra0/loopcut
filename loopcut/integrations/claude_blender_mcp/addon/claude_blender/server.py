@@ -1,6 +1,7 @@
 """Local socket server. Network I/O runs on a background thread; every command runs on
 Blender's main thread through a queue drained by a bpy timer, because bpy is not thread safe."""
 
+import hmac
 import queue
 import socket
 import threading
@@ -32,6 +33,7 @@ class BridgeServer:
         self._jobs = queue.Queue()
         self._running = threading.Event()
         self.clients = 0
+        self.token = ""
 
     @property
     def running(self):
@@ -46,6 +48,7 @@ class BridgeServer:
         sock.listen(4)
         sock.settimeout(0.5)
         self.port = sock.getsockname()[1]  # resolves port 0 in tests
+        self.token = protocol.new_token(self.port)
         self._sock = sock
         self._running.set()
         self._thread = threading.Thread(target=self._accept_loop, name="claude-blender-accept", daemon=True)
@@ -61,6 +64,7 @@ class BridgeServer:
             except OSError:
                 pass
             self._sock = None
+            protocol.token_path(self.port).unlink(missing_ok=True)
         if bpy.app.timers.is_registered(self._tick):
             bpy.app.timers.unregister(self._tick)
         # Unblock anyone still waiting.
@@ -130,6 +134,11 @@ class BridgeServer:
             request = protocol.decode(line)
         except ValueError as exc:
             return protocol.error(None, "BadRequest", f"Invalid JSON: {exc}")
+        if not isinstance(request, dict):
+            return protocol.error(None, "BadRequest", "Expected a JSON object")
+        if not hmac.compare_digest(str(request.pop("token", "")).encode(), self.token.encode()):
+            return protocol.error(request.get("id"), "Unauthorized",
+                                  f"Wrong or missing token; the client reads it from {protocol.token_path(self.port)}")
         job = _Job(request)
         self._jobs.put(job)
         timeout = float(request.get("timeout") or protocol.DEFAULT_TIMEOUT)

@@ -35,7 +35,7 @@ Generated meshes look right from the generator's camera and wrong elsewhere: the
 
 ### 6. Installed add-ons
 
-- The add-ons line names what is on. Many more are installed but off. `inspect_api(search="uv")`, `"retopology"`, `"pbr"`, `"decal"` or `"rig"` lists them, and `inspect_api(path="<module>")` turns one on and lists its operators.
+- The add-ons line names what is on. Many more are installed but off. `inspect_api(search="uv")`, `"retopology"`, `"pbr"`, `"decal"` or `"rig"` lists them, and `inspect_api(path="<module>")` says how to turn one on with `run_python`; turning one on runs its code, so the user approves it.
 - Call their operators from `run_python`. Modal tools that need the mouse (RetopoFlow, BoxCutter, the modal parts of HardOps) do not run from a script. Use their non-modal operators, or tell the user which one to click.
 
 ### 7. Check and hand over

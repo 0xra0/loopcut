@@ -112,3 +112,13 @@ def test_to_jsonable_handles_iterables_and_named():
         name = "Cube"
 
     assert protocol.to_jsonable({"v": (1.0, 2.0), "o": Named(), "s": {3}}) == {"v": [1.0, 2.0], "o": "Cube", "s": [3]}
+
+
+def test_call_sends_the_token_blender_wrote(monkeypatch, tmp_path):
+    monkeypatch.setattr(protocol, "TOKEN_DIR", tmp_path)
+    fake = FakeAddon(lambda r: protocol.ok(r["id"], "pong"))
+    token = protocol.new_token(fake.port)
+    assert protocol.token_path(fake.port).stat().st_mode & 0o777 == 0o600
+    assert BlenderConnection(port=fake.port).call("ping") == "pong"
+    assert fake.received[0]["token"] == token
+    fake.close()

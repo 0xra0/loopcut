@@ -270,11 +270,6 @@ def start_render_job(budget_seconds, output_dir=None, frames=None, camera=None, 
             raise ToolError(refusal)
         save_snapshot(spec, path)
         row = jobs.launch(path)
-        try:
-            from . import gpu_coordinator
-            gpu_coordinator.acquire_gpu_stage(f"render_job_{row['id']}", "cycles_render", required_vram_mib=2048)
-        except (ImportError, AttributeError):
-            pass
     except (jobs.JobError, OSError, ValueError, RuntimeError) as ex:
         raise ToolError(str(ex)) from ex
     from . import files

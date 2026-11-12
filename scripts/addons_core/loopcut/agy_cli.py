@@ -5,13 +5,12 @@ The user selects agy in Blender preferences; default model is Claude Sonnet 4.6 
 Tools are exposed to the model via JSON instructions and converted into Loopcut ToolCalls.
 """
 
-import base64
-import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -19,6 +18,26 @@ from pathlib import Path
 from typing import Callable
 
 from . import config, llm
+
+# Loopcut takes only agy's text: the model acts through Loopcut's tool calls, which the user approves. agy's own
+# tools stay off whatever the user's agy settings allow: "strict" refuses every shell command, allow-listed ones
+# too, and with no access outside its empty working folder it cannot read or write the user's files (checked
+# against agy, 2026-11-12: always-proceed and request-review ran `touch`, strict refused it and an outside write).
+HELD_TO_TEXT = {"toolPermission": "strict", "allowNonWorkspaceAccess": False}
+# So agy cannot open an image file either (strict refuses read_file, even with an allow rule for it); before, it
+# read one by running Python in a shell. Said where the image was, so it does not spend a turn trying.
+NO_IMAGES = ("[An image was attached here, but this connection passes text only, so you cannot see it. "
+             "Judge from tool results instead.]")
+_workdir_path: Path | None = None
+
+
+def _workdir() -> Path:
+    """agy's working folder for this Blender session: private (0700) and empty, so its workspace never holds the
+    user's files, wherever Blender was started."""
+    global _workdir_path
+    if _workdir_path is None or not _workdir_path.is_dir():
+        _workdir_path = Path(tempfile.mkdtemp(prefix="loopcut-agy-"))
+    return _workdir_path
 
 # Models supported by agy; default is claude-sonnet-4-6.
 MODELS = (
@@ -189,27 +208,8 @@ def _render_messages(messages: list[dict]) -> list[str]:
                 if isinstance(part, dict):
                     if part.get("type") == "image_url":
                         url = part.get("image_url", {}).get("url", "")
-                        if url.startswith("data:"):
-                            # Save data URI to image file in temp directory so agy receives a clean path
-                            # instead of hundreds of kilobytes of base64 text.
-                            try:
-                                img_dir = Path("/tmp/loopcut_agy_images")
-                                img_dir.mkdir(parents=True, exist_ok=True)
-                                img_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
-                                ext = "png"
-                                if "image/jpeg" in url or "image/jpg" in url:
-                                    ext = "jpg"
-                                elif "image/webp" in url:
-                                    ext = "webp"
-                                img_path = img_dir / f"image_{img_hash}.{ext}"
-                                if not img_path.exists():
-                                    _, b64_data = url.split(",", 1)
-                                    img_path.write_bytes(base64.b64decode(b64_data))
-                                out.append(f"[image: {img_path}]")
-                            except Exception:
-                                out.append("[image: (attached image)]")
-                        elif url:
-                            out.append(f"[image: {url}]")
+                        if url:
+                            out.append(NO_IMAGES)
                     else:
                         out.append(part.get("text", ""))
                 elif isinstance(part, str):
@@ -269,7 +269,7 @@ def _render_tools(tools: list[dict]) -> str:
         "- Color attributes: inspect `domain` ('CORNER' or 'POINT') and `data_type` ('BYTE_COLOR' or 'FLOAT_COLOR'). Access data via `obj.data.color_attributes[name].data[i].color`.",
         "",
         "## Tool Invocation Syntax",
-        "CRITICAL: To execute Python code in Blender, invoke `run_python` via a JSON tool call OR output an executable ```python ... ``` code block. Do NOT just write code in plain text without executing it.",
+        "CRITICAL: To execute Python code in Blender, invoke `run_python` via a JSON tool call. Code written in a reply is only shown to the user, never run.",
         "To invoke a tool, output a JSON block in this exact structure:",
         "```json",
         "{",
@@ -281,7 +281,6 @@ def _render_tools(tools: list[dict]) -> str:
         "  ]",
         "}",
         "```",
-        "You may also output executable ```python ... ``` code blocks directly for `run_python`.",
         "",
     ]
     for tool in tools:
@@ -326,7 +325,7 @@ def build_prompt(messages: list[dict], tools: list[dict]) -> str:
         "You do NOT have terminal access. Calling RunCommand will immediately fail.\n"
         "- NEVER call `bpy.ops.render.render()` inside run_python (refused by cost guard). Use `see_render` or `capture_viewport`.\n"
         "- All scene queries, mesh edits, sculpting, materials, and exports MUST be performed through Blender Python.\n"
-        "- You MUST output either a JSON tool call (e.g. `run_python`) OR an executable ```python ... ``` code block.\n"
+        "- To act, you MUST output a JSON tool call (e.g. `run_python`); code in a reply is never run.\n"
         "- Do NOT stop after inspection, audit, or backup. Proceed to the next modification autonomously.\n"
         "- Do NOT pause to ask conversational permission for intermediate steps.\n"
     )
@@ -475,47 +474,6 @@ def _extract_calls_from_obj(data, allowed_names: set[str] | None = None) -> list
     return calls
 
 
-def _extract_python_calls(text: str) -> tuple[str, list[llm.ToolCall]]:
-    """Detect markdown python code blocks and convert them to run_python tool calls.
-
-    When models write Blender python scripts directly in markdown blocks (e.g. ```python ... ```),
-    convert them to Loopcut run_python tool calls so the code actually executes in Blender.
-    """
-    tool_calls = []
-    clean = text
-
-    # Matches ```python ... ``` or ```py ... ``` or ```bpy ... ``` or untagged ``` containing bpy
-    pattern = re.compile(r"```(?:python|py|bpy)?\s*\n(.*?)\n```", re.DOTALL | re.IGNORECASE)
-    matches = list(pattern.finditer(text))
-
-    for m in reversed(matches):
-        code = m.group(1).strip()
-        if not code:
-            continue
-        # Check if the code looks like executable python code (bpy, imports, functions, statements)
-        is_blender_or_python = (
-            "bpy" in code
-            or "bmesh" in code
-            or "mathutils" in code
-            or ("import " in code and ("os" in code or "sys" in code or "math" in code or "numpy" in code or "np" in code))
-            or ("def " in code and ("bpy" in code or "mesh" in code or "context" in code))
-        )
-        if is_blender_or_python:
-            preceding = text[: m.start()].strip().splitlines()
-            summary = "Run Python script in Blender"
-            if preceding:
-                last_line = preceding[-1].strip().lstrip("#-* >").strip()
-                if last_line and len(last_line) < 120 and not last_line.endswith("```"):
-                    summary = last_line
-
-            call_id = f"call_{uuid.uuid4().hex[:9]}"
-            args = json.dumps({"code": code, "summary": summary})
-            tool_calls.insert(0, llm.ToolCall(id=call_id, name="run_python", arguments=args))
-            clean = clean[:m.start()] + clean[m.end():]
-
-    return clean.strip(), tool_calls
-
-
 def _find_balanced_json_blocks(text: str):
     """Scan text for balanced {...} and [...] blocks and return list of (start_idx, end_idx, parsed_obj)."""
     results = []
@@ -562,7 +520,6 @@ def parse_tool_calls(text: str, allowed_names: set[str] | None = None) -> tuple[
     - List of tool calls in JSON blocks: ```json [ { "name": ... }, ... ] ```
     - Raw JSON in text without markdown fence (via balanced brace scanner)
     - XML <tool_call>...</tool_call>, <tool_use>...</tool_use>, <invoke>...</invoke> tags
-    - Markdown Python code blocks (```python ... ```) converted to run_python calls
 
     Returns (clean_text, tool_calls).
     """
@@ -598,12 +555,6 @@ def parse_tool_calls(text: str, allowed_names: set[str] | None = None) -> tuple[
                 tool_calls.extend(calls)
                 matched_str = clean_text[start_idx:end_idx]
                 clean_text = clean_text.replace(matched_str, "").strip()
-
-    # 4. Check for markdown Python code blocks (run_python), extracting all executable blocks
-    clean_after_python, python_calls = _extract_python_calls(clean_text)
-    if python_calls:
-        tool_calls.extend(python_calls)
-        clean_text = clean_after_python
 
     # Ensure all tool calls have valid IDs and normalized arguments
     for call in tool_calls:
@@ -679,9 +630,8 @@ def _stream_once(
         "--input-format",
         "text",
         "--disable-slash-commands",
-        "--dangerously-skip-permissions",
-        "--log-file",
-        "/tmp/agy_loopcut.log",
+        "--settings",
+        json.dumps(HELD_TO_TEXT),
     ]
     if effort and effort in EFFORTS:
         cmd.extend(["--effort", effort])
@@ -696,6 +646,7 @@ def _stream_once(
             text=True,
             bufsize=1,
             start_new_session=True,
+            cwd=_workdir(),
         )
         try:
             pgid = os.getpgid(proc.pid)
@@ -832,8 +783,6 @@ def _stream_once(
                         or "<tool_call>" in accumulated
                         or "<tool_use>" in accumulated
                         or "<invoke>" in accumulated
-                        or "```python" in accumulated
-                        or "```bpy" in accumulated
                     ):
                         in_tool_block = True
 

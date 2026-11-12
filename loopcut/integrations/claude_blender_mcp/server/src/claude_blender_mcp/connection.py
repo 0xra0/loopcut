@@ -87,7 +87,8 @@ class BlenderConnection:
         return protocol.decode(line)
 
     def call(self, cmd, params=None, timeout=protocol.DEFAULT_TIMEOUT):
-        request = {"id": next(self._ids), "cmd": cmd, "params": params or {}, "timeout": timeout}
+        request = {"id": next(self._ids), "cmd": cmd, "params": params or {}, "timeout": timeout,
+                   "token": protocol.read_token(self.port)}  # read each call: a restarted Blender writes a new one
         payload = protocol.encode(request)
         with self._lock:
             try:

@@ -258,11 +258,6 @@ def list_jobs(root: Path) -> list[dict]:
 def cancel(path: Path) -> None:
     if status(path)["state"] in ACTIVE:
         (path / "cancel").touch()
-    try:
-        from . import gpu_coordinator
-        gpu_coordinator.release_gpu_stage(f"render_job_{path.name}")
-    except (ImportError, AttributeError):
-        pass
 
 
 def _alive(pid: int) -> bool:
