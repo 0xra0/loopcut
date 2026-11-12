@@ -46,9 +46,11 @@ class StudioTest(unittest.TestCase):
     def test_export_is_held_to_the_paths_write_file_may_write(self):
         # export_model writes where its path says; a hidden path (a shell profile, an autostart entry) is refused
         # before anything runs, as write_file refuses it.
-        for path in ('~/.bashrc', '~/.config/autostart/model.fbx'):
-            with self.subTest(path=path), self.assertRaisesRegex(tools.ToolError, 'hidden'):
-                studio.action('export_model', {'path': path}, 'export')
+        for command, params in (('export_model', {'path': '~/.bashrc'}),
+                                ('export_model', {'path': '~/.config/autostart/model.fbx'}),
+                                ('bake_maps', {'low': 'Cube', 'output_dir': '~/.config/autostart'})):
+            with self.subTest(command=command, params=params), self.assertRaisesRegex(tools.ToolError, 'hidden'):
+                studio.action(command, params, command)
 
     def test_result_png_payload_is_not_passed_to_the_model(self):
         import base64

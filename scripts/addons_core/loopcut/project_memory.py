@@ -6,77 +6,24 @@ Main thread only.
 """
 
 import json
-import tempfile
-from pathlib import Path
 from typing import Any
 
 MEMORY_PROP_KEY = "loopcut_project_memory"
 
 
-def _recovery_path() -> Path | None:
-    """Path to the durable disk sidecar file for project memory recovery across crashes."""
-    import bpy
-    filepath = getattr(getattr(bpy, "data", None), "filepath", "")
-    if filepath:
-        p = Path(filepath)
-        return p.parent / f".{p.stem}_recovery.json"
-    return None
-
-
 def load_memory() -> dict:
-    """The constraints set for the open file; recovered from durable sidecar after a crash."""
+    """The constraints set for the open file; {} when none were."""
     import bpy
-    data = {}
-    raw = None
-    try:
-        raw = bpy.context.scene.get(MEMORY_PROP_KEY)
-    except (AttributeError, KeyError):
-        pass
-    if raw:
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                data = parsed
-        except (ValueError, json.JSONDecodeError):
-            pass
-
-    # Merge records from durable disk sidecar
-    try:
-        sidecar = _recovery_path()
-        if sidecar is not None and sidecar.is_file():
-            disk_data = json.loads(sidecar.read_text(encoding="utf-8"))
-            if isinstance(disk_data, dict):
-                for k, v in disk_data.items():
-                    if k not in data:
-                        data[k] = v
-                    elif isinstance(v, list) and isinstance(data[k], list):
-                        data[k] = list({json.dumps(x, sort_keys=True): x for x in data[k] + v}.values())
-                    elif isinstance(v, dict) and isinstance(data[k], dict):
-                        data[k].update(v)
-    except (OSError, ValueError, json.JSONDecodeError):
-        pass
-
-    return data
+    raw = bpy.context.scene.get(MEMORY_PROP_KEY)
+    if not raw:
+        return {}
+    data = json.loads(raw)
+    return data if isinstance(data, dict) else {}
 
 
 def save_memory(mem: dict) -> None:
     import bpy
-    try:
-        bpy.context.scene[MEMORY_PROP_KEY] = json.dumps(mem, ensure_ascii=False)
-    except (AttributeError, KeyError):
-        pass
-    # Persist atomically to disk sidecar so stages survive an unexpected crash before .blend save
-    try:
-        sidecar = _recovery_path()
-        if sidecar is not None:
-            sidecar.parent.mkdir(parents=True, exist_ok=True)
-            tmp = sidecar.with_suffix(".tmp")
-            tmp.write_text(json.dumps(mem, ensure_ascii=False, indent=2), encoding="utf-8")
-            tmp.replace(sidecar)
-    except OSError:
-        pass
-    except OSError:
-        pass
+    bpy.context.scene[MEMORY_PROP_KEY] = json.dumps(mem, ensure_ascii=False)
 
 
 def get_constraint(key: str, default: Any = None) -> Any:

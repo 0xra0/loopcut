@@ -281,7 +281,8 @@ def bake_maps(low, high=None, maps=("NORMAL",), size=1024, cage_extrusion=0.05, 
                 kwargs["pass_filter"] = {"COLOR"}
             with ops_context(lo, selected=highs, mode="OBJECT"):
                 bpy.ops.object.bake(**kwargs)
-            path = os.path.join(out, f"{lo.name}_{kind.lower()}.png")
+            # An object name may hold "/" or "..": clean it, so the file stays in out.
+            path = os.path.join(out, f"{bpy.path.clean_name(lo.name)}_{kind.lower()}.png")
             img.filepath_raw = path
             img.file_format = "PNG"
             img.save()

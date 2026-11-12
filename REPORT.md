@@ -253,6 +253,8 @@ CHECK GREEN
   - When Blender crashes before the user or agent saves the `.blend`, `load_memory()` merges recovered records from disk, preserving stage completions and constraints.
   - `pixal3d_refine` queries `resume_pipeline`, passing `skip_loose` and `skip_holes` to skip already completed work when resuming a pipeline run.
 
+- **Removed since** (security review): the sidecar. A JSON file beside a downloaded .blend went into the model's prompt, so project memory lives in the .blend only; `pixal3d_refine` no longer resumes from it.
+
 ### Item 6: Show Measured Quality in Eval Output
 - **Files Changed**:
   - `loopcut/harness/local_evals/run.py`

@@ -6,6 +6,7 @@ Already fixed, don't redo:
   modifier results it never measured
 - the GPU leases, removed again
 - task menus that listed commands which don't exist
+- the project-memory sidecar beside the .blend (removed; memory lives in the .blend only)
 
 Fix the items below as one batch, following AGENTS.md. Every fix needs a test that fails first. A
 Blender behaviour belongs in `loopcut/harness/smoke_check.py`, since the unit tests' fake bpy can't
@@ -27,17 +28,7 @@ show it. Finish with `./check.sh main` printing CHECK GREEN.
    - compare each signature argument with `get_rna_type().properties`;
    - call the check from `inspect_api`.
 
-2. **Project memory writes a hidden file next to the user's .blend.** `save_memory` writes
-   `.{stem}_recovery.json` beside the .blend on every change, into the user's project folder without
-   asking (AGENTS.md: "The user approves"). Also:
-   - REPORT.md says it falls back to "temp/cache", but the code has no such fallback.
-   - `except OSError: pass` appears twice in a row.
-   - `import tempfile` is unused.
-   - Corrupt JSON in the scene property is now silently dropped instead of raised.
-
-   `pixal3d_refine` no longer records stages, so nothing needs the sidecar any more. Remove it.
-
-3. **These functions have no caller.** Wire each one into a real caller, or delete it together with
+2. **These functions have no caller.** Wire each one into a real caller, or delete it together with
    its tests:
    - `project_memory`: `record_completed_stage`, `get_completed_stages`, `is_stage_completed`,
      `resume_pipeline`, `set_target_export_format`, `record_failed_approach`,
@@ -47,8 +38,8 @@ show it. Finish with `./check.sh main` printing CHECK GREEN.
 
 ## Minor
 
-4. `LOOPCUT_OT_strata_verify_vision` blocks Blender for up to 20 s on the main thread. Its check
+3. `LOOPCUT_OT_strata_verify_vision` blocks Blender for up to 20 s on the main thread. Its check
    `"red" in reply` also passes for "not red".
-5. `tools.py` moved `from . import studio` and the other imports into the middle of the module
+4. `tools.py` moved `from . import studio` and the other imports into the middle of the module
    without saying why. Move them back unless a circular import needs this, and if one does, say
    so in a comment.

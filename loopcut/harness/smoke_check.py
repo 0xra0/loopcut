@@ -62,8 +62,15 @@ try:
         after = len(cube.data.vertices), len(sphere.data.vertices)
         assert after == (before[0] - 1, before[1]), (before, after, refined)
 
+    # A name with "../" in it still bakes into output_dir.
     bpy.ops.mesh.primitive_uv_sphere_add(radius=1.2)
-    studio("bake_maps", low="Cube", high=bpy.context.active_object.name, maps=["NORMAL"], size=32)
+    baked = Path(tempfile.mkdtemp(prefix="loopcut-smoke-bake-")) / "maps"
+    cube.name = "../Cube"
+    studio("bake_maps", low=cube.name, high=bpy.context.active_object.name, maps=["NORMAL"], size=32,
+           output_dir=str(baked))
+    cube.name = "Cube"
+    pngs = list(baked.parent.rglob("*.png"))
+    assert [png.parent for png in pngs] == [baked], pngs
 
     # An export to an ordinary folder still writes; the hidden-path refusal is the unit tests'.
     exported = Path(tempfile.mkdtemp(prefix="loopcut-smoke-export-")) / "cube.glb"

@@ -61,7 +61,7 @@ HEAVY = {"voxel_remesh", "quad_remesh", "decimate", "sculpt_prepare", "sculpt_st
          "quad_remesh_op", "reproject_shrinkwrap_op", "render_configure_engine", "sim_add_cloth"}
 # UniRig and Pixal3D launch scripts in a subprocess: never waive their per-call approval.
 EXTERNAL_EXECUTION = {"auto_rig_unirig", "image_to_3d", "pixal3d_generate"}
-WRITES_FILE = {"export_model"}  # Its `path` is where it writes.
+WRITES_FILE = {"export_model": "path", "bake_maps": "output_dir"}  # Command: the parameter naming where it writes.
 PLAYBOOKS = Path(__file__).with_name("studio_playbooks")
 
 
@@ -180,8 +180,9 @@ def action(command: str, params: dict, summary: str):
     if not isinstance(command, str) or command in BLOCKED:
         raise tools.InputMistake("This command is not exposed by studio_action; use Loopcut's native tools.")
     # A file it writes is held to what write_file may write: nothing hidden, nothing of Loopcut's own.
-    if command in WRITES_FILE and isinstance(params, dict) and "path" in params:
-        params = {**params, "path": str(files.check(files.resolve(str(params["path"]))))}
+    key = WRITES_FILE.get(command)
+    if key and isinstance(params, dict) and params.get(key):
+        params = {**params, key: str(files.check(files.resolve(str(params[key]))))}
     registry = _registry()
     entry = registry.get(command)
     if entry is None:

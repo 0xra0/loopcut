@@ -92,13 +92,6 @@ class Batch2ToolsPixalRecipesTest(unittest.TestCase):
         })
         self.patch.start()
         self.addCleanup(self.patch.stop)
-        import tempfile
-        self.tmp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp_dir.cleanup)
-        self.sidecar = Path(self.tmp_dir.name) / ".test_recovery.json"
-        self.sidecar_patch = mock.patch("loopcut.project_memory._recovery_path", return_value=self.sidecar)
-        self.sidecar_patch.start()
-        self.addCleanup(self.sidecar_patch.stop)
 
     # -------------------------------------------------------------------------
     # Item 5: Task-Sized Tool Menus with Guaranteed Discovery Path
