@@ -905,6 +905,8 @@ def _offer_action(session: dict, index: int, choice: int) -> None:
         account.open_browser(arg)
     elif do == "manage_chatgpt":
         bpy.ops.loopcut.chatgpt_manage_usage()
+    elif do == "retry_chatgpt" and not session["busy"]:
+        nudges.watch_chatgpt_limit(session, item, lambda: _resume_on_chatgpt(session))
     elif do == "vendor_keys":
         _close_popups()
         _open_settings()
@@ -933,6 +935,16 @@ def _offer_action(session: dict, index: int, choice: int) -> None:
         if item.get("nudge") in nudges.SOFT + ("locked_tool",):
             nudges.snooze(item["nudge"])
         item["resolved"] = nudges.DISMISSED
+
+
+def _resume_on_chatgpt(session: dict) -> bool:
+    """The limit card's retries found ChatGPT answering again: carry the saved request on, on the same plan."""
+    prefs = settings.preferences()
+    if (prefs is None or prefs.provider != "CHATGPT" or session["busy"] or state.session() is not session
+            or not state.can_resume(session)):
+        return False
+    agent.resume()
+    return True
 
 
 def _local_limit_action(session: dict, index) -> bool:

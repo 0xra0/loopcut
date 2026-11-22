@@ -119,7 +119,8 @@ def message(code: str) -> str:
     if code == "ready":
         return "ChatGPT is ready."
     if code == "subscription_sharing_usage_limit_exceeded":
-        return "Your ChatGPT plan's limit for Loopcut is reached. Manage usage or use Loopcut Fast."
+        return ("ChatGPT paused requests from Loopcut: a usage limit for your plan or for Loopcut, which can apply "
+                "while ChatGPT still shows usage left. Manage usage or use Loopcut Fast.")
     return "Couldn't check ChatGPT just now. Try again or use Loopcut Fast."
 
 

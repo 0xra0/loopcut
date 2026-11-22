@@ -111,11 +111,26 @@ class CardsTest(DataDir):
     def test_chatgpt_stops_offer_loopcut_models_by_sign_in_state(self):
         card = nudges.chatgpt_card("subscription_sharing_usage_limit_exceeded")
         self.assertEqual(card["nudge"], "chatgpt")
-        self.assertIn("goes through Loopcut's server", card["text"])
         whens = {a["do"]: a["when"] for a in card["actions"]}
         self.assertEqual(whens["continue_loopcut"], "loopcut_in")
         self.assertEqual(whens["sign_in_loopcut"], "loopcut_out")
-        self.assertIn("manage_chatgpt", whens)
+        # Carrying this chat on with Loopcut's models comes first; retrying ChatGPT is the second choice.
+        self.assertEqual([a["do"] for a in card["actions"]],
+                         ["continue_loopcut", "sign_in_loopcut", "retry_chatgpt", "manage_chatgpt"])
+        # The usage limit may be the plan's or one on the app, and names no reset: the card says both and
+        # promises no reset time.
+        self.assertEqual(card["title"], "ChatGPT paused requests from Loopcut")
+        self.assertIn("for your plan or for Loopcut as an app", card["text"])
+        self.assertNotIn("resets", card["text"])
+        # Short: one sentence and what carrying on costs; no vendor named but ChatGPT.
+        self.assertLessEqual(card["text"].count(". "), 1)
+        self.assertNotIn("OpenAI", card["text"])
+        self.assertTrue(card["text"].endswith("Loopcut's Fast model is free with an account."))
+        from loopcut import chat_credits
+        with patch.object(chat_credits, "active", return_value=True):
+            paid = nudges.chatgpt_card("subscription_sharing_usage_limit_exceeded")
+        self.assertTrue(paid["text"].endswith("Loopcut's AI can carry on from your credits."))
+        self.assertNotIn("retry_chatgpt", [a["do"] for a in nudges.chatgpt_card("subscription_sharing_user_not_eligible")["actions"]])
         self.assertIn("own_key", [a["do"] for a in nudges.chatgpt_card("subscription_sharing_user_not_eligible")["actions"]])
         self.assertIsNone(nudges.chatgpt_card("rate_limited"))
 
@@ -276,6 +291,32 @@ class OfferCardDrawTest(DataDir):
         drawn = display(session, loopcut_signed_in=True)
         self.assertEqual(self.actions(drawn), [])
         self.assertIn("Carrying on with Loopcut Fast.", json.dumps(drawn["prims"]))
+
+    def test_continue_on_loopcut_is_the_primary_button_and_retry_the_secondary(self):
+        from loopcut.ui import theme as T
+        session = state.new_session()
+        session["items"] = [self.card()]
+        for signed_in, first in ((True, "Continue on Loopcut Fast"), (False, "Sign in to Loopcut (free)")):
+            prims = display(session, loopcut_signed_in=signed_in)["prims"]
+            buttons = [(p["id"], p["text"]) for p in prims if p["id"].endswith(".label") and ".offer.a" in p["id"]]
+            fills = {p["id"]: p["color"] for p in prims if p["t"] == "rect" and ".offer.a" in p["id"]}
+            self.assertEqual([text for _, text in buttons][:2], [first, nudges.RETRY_LABEL])
+            styles = [fills[id.removesuffix(".label")] for id, _ in buttons]
+            self.assertEqual(styles[0], T.BUTTON, "the Loopcut button is the filled one")
+            self.assertEqual(set(styles[1:]), {T.BUTTON_GHOST}, "Retry and the rest are secondary")
+
+    def test_the_retry_button_waits_for_a_running_turn_and_its_note_shows(self):
+        session = state.new_session()
+        card = self.card()
+        session["items"] = [card]
+        labels = lambda drawn: [p["text"] for p in drawn["prims"] if p["id"].endswith(".label") and ".offer." in p["id"]]
+        self.assertIn(nudges.RETRY_LABEL, labels(display(session)))
+        session["busy"] = True
+        self.assertNotIn(nudges.RETRY_LABEL, labels(display(session)))
+        session["busy"] = False
+        card["note"] = nudges.RETRY_NOTE
+        note = " ".join(p["text"] for p in display(session)["prims"] if p["id"].startswith("item0.offer.note"))
+        self.assertEqual(note, nudges.RETRY_NOTE)
 
     def test_buttons_wrap_inside_a_narrow_panel(self):
         session = state.new_session()
@@ -637,6 +678,108 @@ class ModelLineTest(unittest.TestCase):
         with patch.object(agent, "_model_line", side_effect=RuntimeError("no prefs")), \
                 patch.object(cloud, "unavailable_line", return_value="Cloud: X: coming soon."):
             self.assertEqual(agent._setup_line(None), "Cloud: X: coming soon.")
+
+
+class PlanRetryTest(DataDir):
+    """The ChatGPT limit card's Retry: armed by a click, a one-word check on a schedule, the saved request carried
+    on once ChatGPT answers. Driven here with a fake clock and checks that answer at once."""
+
+    def setUp(self):
+        super().setUp()
+        self.session = state.replace(state.new_session())
+        self.addCleanup(state.replace, state.new_session())
+        self.session["messages"] = [{"role": "user", "content": "make a chair"}]
+        self.card = nudges.chatgpt_card("subscription_sharing_usage_limit_exceeded")
+        self.card["model"] = "gpt-test"
+        self.session["items"] = [state.item_user("make a chair"), self.card]
+        self.clock, self.answers, self.checked, self.resumed, self.timers = 1000.0, [], [], [], []
+        self.chatgpt = True
+        self.addCleanup(nudges._plan_retries.clear)
+
+    def arm(self):
+        def probe(model, cancelled):
+            self.checked.append(model)
+            return {"code": self.answers.pop(0) if self.answers else "subscription_sharing_usage_limit_exceeded"}
+        return nudges.watch_chatgpt_limit(
+            self.session, self.card, lambda: self.resumed.append(True) or True, on_chatgpt=lambda: self.chatgpt,
+            probe=probe, register=lambda fn, first: self.timers.append(fn), start=lambda work: work(),
+            now=lambda: self.clock)
+
+    def run_until(self, seconds):
+        """The timer, stepped as Blender would: each step's return value is the wait before the next."""
+        step, end = self.timers[-1], self.clock + seconds
+        while self.clock < end:
+            wait = step()
+            if wait is None:
+                return False
+            self.clock += wait
+        return True
+
+    def label(self):
+        return next(a["label"] for a in self.card["actions"] if a["do"] == "retry_chatgpt")
+
+    def test_nothing_is_checked_before_the_first_wait_and_the_card_says_what_it_does(self):
+        self.assertTrue(self.arm())
+        self.assertEqual((self.label(), self.card["note"]), (nudges.RETRY_STOP_LABEL, nudges.RETRY_NOTE))
+        self.assertTrue(nudges.chatgpt_retry_pending(self.card))
+        self.run_until(nudges.PLAN_RETRY_WAITS[0] - 5)
+        self.assertEqual(self.checked, [], "never at once: the limit was just reported")
+        self.run_until(10)
+        self.assertEqual(self.checked, ["gpt-test"], "the card's own model")
+        self.assertEqual(self.resumed, [])
+
+    def test_the_checks_space_out_and_the_request_carries_on_when_chatgpt_answers(self):
+        self.answers = ["subscription_sharing_usage_limit_exceeded", "offline", "check_failed", "ready"]
+        self.arm()
+        finished = not self.run_until(sum(nudges.PLAN_RETRY_WAITS) + 60)
+        self.assertTrue(finished)
+        self.assertEqual(len(self.checked), 4, "a refused, offline or failed check is one more wait")
+        self.assertEqual(self.resumed, [True])
+        self.assertEqual(self.card["resolved"], nudges.RETRY_RESUMED)
+        self.assertFalse(nudges.chatgpt_retry_pending(self.card))
+
+    def test_a_check_that_no_wait_gets_past_ends_the_retries_with_its_reason(self):
+        self.answers = ["subscription_sharing_user_not_eligible"]
+        self.arm()
+        self.run_until(nudges.PLAN_RETRY_WAITS[0] + 5)
+        self.assertEqual(self.resumed, [])
+        self.assertEqual(self.label(), nudges.RETRY_LABEL)
+        self.assertIn("didn't let this account share its plan", self.card["note"])
+
+    def test_the_retries_stop_after_their_span(self):
+        self.arm()
+        self.assertFalse(self.run_until(nudges.PLAN_RETRY_SPAN + 3600))
+        self.assertEqual(self.card["note"], nudges.RETRY_GAVE_UP)
+        self.assertEqual(self.label(), nudges.RETRY_LABEL)
+        self.assertLess(len(self.checked), 20, "spaced checks, not a poll")
+        self.assertEqual(self.resumed, [])
+
+    def test_a_second_click_stops_them_and_a_new_message_or_another_provider_ends_them(self):
+        self.answers = ["ready"]
+        self.arm()
+        self.assertTrue(self.arm(), "the same button stops them")
+        self.assertEqual((self.label(), self.card["note"]), (nudges.RETRY_LABEL, ""))
+        self.assertFalse(self.run_until(nudges.PLAN_RETRY_WAITS[0] + 5))
+        self.assertEqual((self.checked, self.resumed), ([], []))
+        for change in ("message", "provider", "resolved"):
+            with self.subTest(change=change):
+                self.setUp()
+                self.answers = ["ready"]
+                self.arm()
+                if change == "message":
+                    self.session["messages"].append({"role": "user", "content": "something else"})
+                elif change == "provider":
+                    self.chatgpt = False
+                else:
+                    self.card["resolved"] = "Carrying on with Loopcut Fast."
+                self.assertFalse(self.run_until(nudges.PLAN_RETRY_WAITS[0] + 5))
+                self.assertEqual(self.resumed, [])
+
+    def test_nothing_to_carry_on_arms_nothing(self):
+        self.session["messages"].append({"role": "assistant", "content": "done"})
+        self.assertFalse(self.arm())
+        self.assertEqual((self.timers, self.label()), ([], nudges.RETRY_LABEL))
+
 
 if __name__ == "__main__":
     unittest.main()
