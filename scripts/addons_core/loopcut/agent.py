@@ -3424,6 +3424,7 @@ def run_loop(session: dict, turn: Turn, spec: LoopSpec, run_tool=_run_tool_on_ma
             if ex.code == "subscription_sharing_usage_limit_exceeded":
                 reset = nudges.chatgpt_reset(ex.details)
                 request["loopcut_chatgpt_limit"] = {"resets_at": reset}
+                stopped["model"] = getattr(cfg, "model", "") or ""  # What the card's Retry checks (nudges.PlanRetry).
             items.append(stopped)  # The ChatGPT plan stopped: offer Loopcut's models for the same chat (M2).
         elif own_key_text := own_key.chat_text(ex, getattr(turn, "own_key", None),
                                                     getattr(turn.config, "model", "")):

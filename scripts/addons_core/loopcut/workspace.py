@@ -867,6 +867,16 @@ def _read(path: Path) -> str:
         return ""
 
 
+def _discard(path: Path) -> None:
+    """Remove a command's spent output file if the system lets go of it. On Windows a process the command left
+    running in the background keeps its output open (WinError 32); the file then stays in .loopcut/tmp, which
+    never fails the command's result."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def image_size(path: Path) -> tuple[int, int] | None:
     """Width and height of a PNG or JPEG from its header, without loading it."""
     try:
@@ -1157,10 +1167,14 @@ def shell(command: str, timeout: int | None = None, summary: str = "") -> ToolRe
         head = _exit_text(code, took, stopped, seconds)
         if len(output) > MAX_OUTPUT_CHARS:
             kept = ws / LOGS / f"shell-{number:04d}.txt"
-            os.replace(log, kept)
+            try:
+                os.replace(log, kept)
+            except OSError:  # Windows: a process the command left running still holds the log open.
+                shutil.copyfile(log, kept)
+                _discard(log)
             head += f"; the whole output ({_human(len(output.encode('utf-8')))}) is in {LOGS}/{kept.name}"
         else:
-            log.unlink(missing_ok=True)
+            _discard(log)
         result = ToolResult(f"{head}\n{_clip(output.rstrip()) or '(no output)'}", ok=code == 0 and not stopped)
         result.text += "\n" + "\n".join(_publish_outputs(session, ws, before, files_state(ws), destination, on_main))
         if left:  # Said to both: a 4K render left this way ran for 14 h while the user asked how far it was.

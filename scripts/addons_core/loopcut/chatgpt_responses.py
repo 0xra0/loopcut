@@ -71,11 +71,17 @@ _NO_RETRY = {
 # Failures inside a stream that are worth the same bounded retries as a broken stream (the docs: retry
 # usage_unavailable and user_unavailable with backoff; server_error is the API's own transient one). One with no
 # code at all is retried too: twice in a row on 2026-10-25 (0.2.14 logs) it ended a turn as "ChatGPT request failed".
-_RETRY_IN_STREAM = {"subscription_sharing_usage_unavailable", "subscription_sharing_user_unavailable", "server_error"}
+# server_is_overloaded is OpenAI's busy signal; it names its wait in the error's own headers (retry-after), which
+# _stream honours, and a wait longer than the retry budget ends the turn with that wait and Try again.
+_RETRY_IN_STREAM = {"subscription_sharing_usage_unavailable", "subscription_sharing_user_unavailable", "server_error",
+                    "server_is_overloaded"}
+# The usage limit carries no reset time, and it is not always the plan's own: OpenAI may also limit plan use per app,
+# so ChatGPT's usage page can still show usage left. The text says so rather than "your plan is used up".
 _MESSAGES = {
     "subscription_sharing_usage_limit_exceeded":
-        "Your ChatGPT plan's usage limit for Loopcut is reached (your plan's limit, or the weekly limit set for "
-        f"Loopcut). New requests are paused. Manage usage: {chatgpt_auth.USAGE_URL}",
+        "ChatGPT paused requests from Loopcut: OpenAI reports a usage limit reached, for your plan or for Loopcut "
+        "as an app. It can apply while ChatGPT still shows usage left. Your request is saved. Review limits in "
+        f"ChatGPT settings, Usage: {chatgpt_auth.USAGE_URL}",
     "subscription_sharing_user_not_eligible":
         "ChatGPT says this account can't share its plan with Loopcut. OpenAI decides that by plan, workspace "
         "and country. Pick another provider.",
@@ -672,6 +678,24 @@ def _shape(value) -> str:
     return text[:400]
 
 
+def _server_wait(raw) -> dict:
+    """{"retry_after": seconds} when a failure inside the stream names its own wait: the error object can carry
+    the headers its HTTP answer would have had (retry-after-ms, else retry-after). {} otherwise."""
+    headers = raw.get("headers") if isinstance(raw, dict) else None
+    if not isinstance(headers, dict):
+        return {}
+    headers = {str(k).lower(): v for k, v in headers.items()}
+    try:
+        seconds = float(headers["retry-after-ms"]) / 1000.0 if "retry-after-ms" in headers else None
+    except (TypeError, ValueError):
+        seconds = None
+    if seconds is None and headers.get("retry-after") is not None:
+        seconds = llm.retry_delay(-1.0, str(headers["retry-after"]), cap=86400.0)
+    if seconds is None or not math.isfinite(seconds) or seconds < 0:
+        return {}
+    return {"retry_after": min(seconds, 86400.0)}
+
+
 def _stream_failed(error: llm.LLMError, *, retry_after: float | None = None) -> llm.LLMError:
     """A failure inside the stream that came back on every retry: what happened and what to do, with Try again on
     the card (llm.STREAM_FAILED). The plan's own reason when Loopcut has words for it; the request id last."""
@@ -753,7 +777,8 @@ def _read(response, on_text, is_cancelled, deadline, transcript: _Transcript, me
                     raw = {**(event.get("error") if isinstance(event.get("error"), dict) else {}),
                            **{k: event[k] for k in ("code", "message", "param") if event.get(k)}}
                     error = _error(None, str(raw.get("code") or raw.get("type") or ""), str(raw.get("message") or ""),
-                                   {k: raw.get(k) for k in ("code", "message", "param")}, meta.get("request_id", ""))
+                                   {**{k: raw.get(k) for k in ("code", "message", "param")}, **_server_wait(raw)},
+                                   meta.get("request_id", ""))
                     print(f"Loopcut: ChatGPT's stream sent an error event: {_shape(event)}")
                     break
     except (TimeoutError, ConnectionError, OSError, http.client.HTTPException) as ex:
@@ -776,7 +801,7 @@ def _read(response, on_text, is_cancelled, deadline, transcript: _Transcript, me
     if terminal == "response.failed":
         raw = final_response.get("error") or {}
         error = _error(None, str(raw.get("code") or ""), str(raw.get("message") or "response.failed"),
-                       raw if isinstance(raw, dict) else {}, meta.get("request_id", ""))
+                       {**raw, **_server_wait(raw)} if isinstance(raw, dict) else {}, meta.get("request_id", ""))
         print(f"Loopcut: ChatGPT's stream ended in response.failed: {_shape(raw)}")
     if error is not None:
         _log_response(transcript, meta, started, first_byte, events, items, order, final_response, completion,
@@ -885,11 +910,16 @@ def _stream(*, model: str, messages: list[dict], tools: list[dict], reasoning_ef
                 print(f"Loopcut: retrying the ChatGPT request once from scratch after the stream broke ({cause!r})")
                 on_retry()
                 continue
+            server_wait = failed.details.get("retry_after") if failed else None  # _server_wait
+            server_wait = (float(server_wait) if type(server_wait) in (int, float) and math.isfinite(server_wait)
+                           and server_wait > 0 else 0.0)
             if before_content == len(llm.RETRY_DELAYS):
-                raise (_stream_failed(failed) if failed else llm.connection_lost("ChatGPT", shown)) from cause
-            delay = llm.RETRY_DELAYS[before_content]
+                raise (_stream_failed(failed, retry_after=server_wait or None) if failed
+                       else llm.connection_lost("ChatGPT", shown)) from cause
+            delay = max(llm.RETRY_DELAYS[before_content], server_wait)
             if backoff.waited + delay > llm.CHATGPT_RETRY_WAIT:
-                raise (_stream_failed(failed) if failed else llm.connection_lost("ChatGPT", shown)) from cause
+                raise (_stream_failed(failed, retry_after=server_wait or None) if failed
+                       else llm.connection_lost("ChatGPT", shown)) from cause
             print(f"Loopcut: retrying the ChatGPT request after {cause!r} ({before_content + 1}/{len(llm.RETRY_DELAYS)}, "
                   f"waiting {delay:g}s)")
             before_content += 1
