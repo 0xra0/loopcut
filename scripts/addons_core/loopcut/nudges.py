@@ -133,8 +133,8 @@ def mark_shown(kind: str, key: str = "", now: float | None = None) -> None:
 # --- Cards --------------------------------------------------------------------------------------------------
 
 def _action(label: str, do: str, arg: str = "", when: str = "") -> dict:
-    """do: sign_in_loopcut | sign_in_chatgpt | web (arg: URL) | continue_loopcut | manage_chatgpt | own_key |
-    vendor_keys | prompt (arg: text for the input) | dismiss. when: "" | loopcut_in | loopcut_out (drawn only
+    """do: sign_in_loopcut | sign_in_chatgpt | web (arg: URL) | continue_loopcut | manage_chatgpt | retry_chatgpt |
+    own_key | vendor_keys | prompt (arg: text for the input) | dismiss. when: "" | loopcut_in | loopcut_out (drawn only
     then, so a card answers a sign-in that happens while it shows)."""
     return {"label": label, "do": do, "arg": arg, "when": when}
 
@@ -233,23 +233,30 @@ def credits_item(tool: dict, balance=None) -> dict | None:
     return chat_credits.tool_item(tool["title"], tool.get("credits"), balance, account, reason="locked_tool")
 
 
+def _loopcut_price() -> str:
+    """What carrying a chat on with Loopcut's models costs this account, as one line."""
+    from . import chat_credits
+    return ("Loopcut's AI can carry on from your credits." if chat_credits.active()
+            else "Loopcut's Fast model is free with an account.")
+
+
 def chatgpt_card(code: str) -> dict | None:
-    """M2: the ChatGPT plan stopped this turn. Loopcut's models can carry the same conversation on."""
+    """M2: the ChatGPT plan stopped this turn. Loopcut's models can carry the same conversation on: that is each
+    card's first, primary button (or the sign-in that leads to it); anything else comes after it."""
     keep_going = [_action("Continue on Loopcut Fast", "continue_loopcut", when="loopcut_in"),
                   _action("Sign in to Loopcut (free)", "sign_in_loopcut", when="loopcut_out")]
     if code == "subscription_sharing_usage_limit_exceeded":
+        # The limit may be the plan's own or one on Loopcut as an app, and names no reset, so the text promises none.
+        # Retrying ChatGPT is the second choice, after carrying on here.
         return state.item_offer(
-            "chatgpt", "Your ChatGPT plan's limit for Loopcut is reached",
-            "New requests wait until your plan resets. You can carry on with Loopcut's models; from here this "
-            "chat goes through Loopcut's server.",
-            keep_going + [_action("Manage ChatGPT usage ↗", "manage_chatgpt")])
+            "chatgpt", "ChatGPT paused requests from Loopcut",
+            "A usage limit for your plan or for Loopcut as an app; ChatGPT may still show usage left. "
+            + _loopcut_price(),
+            keep_going + [_action(RETRY_LABEL, "retry_chatgpt"), _action("Manage ChatGPT usage ↗", "manage_chatgpt")])
     if code == "subscription_sharing_user_not_eligible":
-        from . import chat_credits
-        fast = ("Loopcut's AI can carry on from your credits." if chat_credits.active()
-                else "Loopcut's Fast model is free with an account.")
         return state.item_offer(
             "chatgpt", "This ChatGPT account can't share its plan",
-            f"OpenAI decides that by plan, workspace and country. {fast}",
+            f"OpenAI decides that by plan, workspace and country. {_loopcut_price()}",
             keep_going + [_action("Use my own key", "own_key")])
     if code in ("unsupported_country_region_territory", "country_not_supported"):
         return state.item_offer(
@@ -340,6 +347,130 @@ def watch_chatgpt_reset(session: dict, item: dict) -> bool:
 
     _reset_waits[id(item)] = check
     bpy.app.timers.register(check, first_interval=max(1.0, min(remaining, 30.0)), persistent=True)
+    return True
+
+
+# --- Retrying the ChatGPT plan after its usage limit -------------------------------------------------------------
+# The usage limit (subscription_sharing_usage_limit_exceeded) names no reset time, and OpenAI asks apps not to guess
+# one: it may be the plan's own window or a limit on the app. So nothing retries by itself. The card's Retry button
+# asks ChatGPT again on this schedule with a one-word readiness check (chatgpt_ready.check, never the saved request
+# and its images), and carries the saved request on once the check is answered.
+PLAN_RETRY_WAITS = (5 * 60, 10 * 60, 15 * 60, 30 * 60)   # Seconds before each check; the last repeats.
+PLAN_RETRY_SPAN = 6 * 3600                                # Then it stops: past a 5-hour usage window.
+RETRY_LABEL, RETRY_STOP_LABEL = "Retry ChatGPT automatically", "Stop retrying"
+RETRY_NOTE = "Loopcut asks ChatGPT again every few minutes and carries this request on once it answers."
+RETRY_GAVE_UP = "ChatGPT still refused after 6 hours of retries. Press Retry again, or check ChatGPT settings, Usage."
+RETRY_RESUMED = "ChatGPT answered again. Continuing this request on your ChatGPT plan."
+# Readiness codes no wait gets past: the retries end with what the check says.
+_RETRY_ENDS = frozenset(("subscription_sharing_user_not_eligible", "invalid_grant", "no_plan_scope",
+                         "chatgpt_not_signed_in", "subscription_sharing_invalid_user", "invalid_refresh_token",
+                         "unsupported_model", "unsupported_country_region_territory", "country_not_supported"))
+_plan_retries: dict = {}  # id(card) -> PlanRetry. Session-local, armed only by a click; never restored.
+
+
+class PlanRetry:
+    """One limit card's retries. step(now), from a main-thread timer, returns the seconds to the next step or None
+    when done. probe(model, cancelled) runs on its own thread (chatgpt_ready.check); resume() carries the saved
+    request on and says whether it could; on_chatgpt() says whether the ChatGPT plan is still the chosen provider."""
+
+    def __init__(self, session: dict, item: dict, *, probe, resume, on_chatgpt, start, now: float):
+        self.session, self.item, self.probe, self.resume, self.on_chatgpt, self.start = (
+            session, item, probe, resume, on_chatgpt, start)
+        self.stopped = session["messages"][-1]
+        self.started, self.attempt, self.next_at = now, 0, now + PLAN_RETRY_WAITS[0]
+        self.running, self.result, self.cancelled = False, None, False
+
+    def _gone(self) -> bool:
+        session, item = self.session, self.item
+        return (self.cancelled or bool(item.get("resolved")) or state.session() is not session
+                or not state.can_resume(session) or session["messages"][-1] is not self.stopped
+                or not any(row is item for row in session["items"]) or not self.on_chatgpt())
+
+    def _check(self) -> None:  # Its own thread: a network call.
+        try:
+            self.result = self.probe(self.item.get("model") or config.CHATGPT_PLAN_MODEL, lambda: self.cancelled)
+        except Exception as ex:  # A check that broke is one more failed try, never the end of the retries.
+            self.result = {"code": f"check_error:{type(ex).__name__}"}
+        finally:
+            self.running = False
+
+    def end(self, note: str = "") -> None:
+        _plan_retries.pop(id(self.item), None)
+        self.cancelled = True
+        _retry_label(self.item, RETRY_LABEL)
+        self.item["note"] = note
+
+    def step(self, now: float) -> float | None:
+        if _plan_retries.get(id(self.item)) is not self:
+            return None
+        if self._gone():
+            self.end()
+            return None
+        if self.running:
+            return 2.0
+        if self.result is not None:
+            code = str(self.result.get("code") or "")
+            if code == "ready" and self.session.get("busy"):
+                return 2.0  # The chat is busy without a new message: carried on once it is free.
+            self.result = None
+            if code == "ready":
+                self.end()
+                if self.resume():
+                    self.item["resolved"] = RETRY_RESUMED
+                return None
+            if code in _RETRY_ENDS:
+                from . import chatgpt_ready
+                self.end(chatgpt_ready.message(code))
+                return None
+            self.attempt += 1
+            self.next_at = now + PLAN_RETRY_WAITS[min(self.attempt, len(PLAN_RETRY_WAITS) - 1)]
+        if now - self.started >= PLAN_RETRY_SPAN:
+            self.end(RETRY_GAVE_UP)
+            return None
+        if now < self.next_at:
+            return max(1.0, min(self.next_at - now, 30.0))
+        self.running = True
+        self.start(self._check)
+        return 2.0
+
+
+def _retry_label(item: dict, label: str) -> None:
+    for action in item.get("actions", []):
+        if action.get("do") == "retry_chatgpt":
+            action["label"] = label
+
+
+def chatgpt_retry_pending(item: dict) -> bool:
+    return id(item) in _plan_retries
+
+
+def watch_chatgpt_limit(session: dict, item: dict, resume, *, on_chatgpt=None, probe=None, register=None,
+                        start=None, now=time.time) -> bool:
+    """The limit card's Retry button: arm the retries, or stop them when armed. False: nothing to carry on."""
+    current = _plan_retries.get(id(item))
+    if current is not None:
+        current.end()
+        return True
+    if not state.can_resume(session) or not session["messages"]:
+        return False
+    if probe is None:
+        from . import chatgpt_ready
+        probe = lambda model, cancelled: chatgpt_ready.check(model, cancelled)  # noqa: E731
+    if on_chatgpt is None:
+        def on_chatgpt():
+            from . import settings
+            prefs = settings.preferences()
+            return prefs is not None and prefs.provider == "CHATGPT"
+    if start is None:
+        start = lambda work: threading.Thread(target=work, name="loopcut-chatgpt-retry", daemon=True).start()  # noqa: E731
+    retry = PlanRetry(session, item, probe=probe, resume=resume, on_chatgpt=on_chatgpt, start=start, now=now())
+    _plan_retries[id(item)] = retry
+    _retry_label(item, RETRY_STOP_LABEL)
+    item["note"] = RETRY_NOTE
+    if register is None:
+        import bpy
+        register = lambda fn, first: bpy.app.timers.register(fn, first_interval=first, persistent=True)  # noqa: E731
+    register(lambda: retry.step(now()), max(1.0, min(PLAN_RETRY_WAITS[0], 30.0)))
     return True
 
 

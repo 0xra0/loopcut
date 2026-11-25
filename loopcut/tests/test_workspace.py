@@ -260,6 +260,36 @@ class ShellTest(Folder):
         self.assertIn("exit 3", failed.text)
         self.assertIn("(no output)", failed.text)
 
+    def test_an_output_file_still_held_open_never_fails_the_command(self):
+        """Windows refuses to delete or move a file another process holds open (WinError 32): a command that
+        leaves a process running in the background keeps its output file open after the shell has returned."""
+        import re
+        real_unlink, real_replace = Path.unlink, os.replace
+
+        def refuse(path):
+            if Path(path).name.startswith("shell-") and Path(path).parent.name == "tmp":
+                raise PermissionError(13, "The process cannot access the file because it is being used by another process")
+
+        def held(path, *args, **kwargs):
+            refuse(path)
+            return real_unlink(path, *args, **kwargs)
+
+        def held_replace(source, target, *args, **kwargs):
+            refuse(source)
+            return real_replace(source, target, *args, **kwargs)
+
+        # A script file run through the workspace's python3, as on every platform (Windows refuses inline Python).
+        (self.ws / "long_output.py").write_text(f"print('x' * {workspace.MAX_OUTPUT_CHARS + 100})", encoding="utf-8")
+        with mock.patch.object(Path, "unlink", held), mock.patch.object(workspace.os, "replace", held_replace):
+            short = self.then(workspace.shell("echo out"))
+            self.assertTrue(short.ok, short.text)
+            self.assertIn("out", short.text)
+            long = self.then(workspace.shell("python3 long_output.py"))
+        self.assertTrue(long.ok, long.text)
+        kept = re.search(r"is in (\S+)", long.text).group(1)
+        self.assertEqual(len((self.ws / kept).read_text().strip()), workspace.MAX_OUTPUT_CHARS + 100,
+                         "the whole output is kept by a copy")
+
     @unittest.skipIf(os.name == "nt", "POSIX shell syntax")
     def test_status_variable_preserves_exit_code_and_output(self):
         for code in (0, 7):

@@ -909,13 +909,16 @@ def _item_offer(f: Frame, n: int, item: dict, x, y, width) -> int:
         cursor += f.px(4) + f.paragraph(f"item{n}.offer.resolved", inner_x, cursor + f.px(4), inner_w,
                                         item["resolved"], small, T.OK)
     else:
+        if item.get("note"):  # What the card is doing now (nudges.watch_chatgpt_limit), or how that ended.
+            cursor += f.px(4) + f.paragraph(f"item{n}.offer.note", inner_x, cursor + f.px(4), inner_w, item["note"],
+                                            small, T.TEXT_MUTED)
         signed_in, busy = bool(f.ui.get("loopcut_signed_in")), f.session.get("busy")
         buttons = []
         for i, action in enumerate(item.get("actions", [])):
             when = action.get("when", "")
             if (when == "loopcut_in" and not signed_in) or (when == "loopcut_out" and signed_in):
                 continue
-            if busy and action["do"] in {"continue_loopcut", "prompt"}:
+            if busy and action["do"] in {"continue_loopcut", "prompt", "retry_chatgpt"}:
                 continue  # These start or fill the next turn; they wait for this one to end.
             primary = not buttons and action["do"] != "dismiss"
             buttons.append((f"item{n}.offer.a{i}", action["label"], T.BUTTON if primary else T.BUTTON_GHOST,

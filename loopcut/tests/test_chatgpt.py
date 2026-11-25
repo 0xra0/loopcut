@@ -857,6 +857,9 @@ class StreamTest(Base):
             self.stream()
         self.assertEqual(caught.exception.code, "subscription_sharing_usage_limit_exceeded")
         self.assertIn("chatgpt.com/settings/usage", str(caught.exception))
+        # OpenAI's limit may be the plan's or one on the app: never told as "your plan is used up".
+        self.assertIn("for your plan or for Loopcut as an app", str(caught.exception))
+        self.assertIn("while ChatGPT still shows usage left", str(caught.exception))
         self.assertEqual(len([r for r in FakeResponses.requests if r["body"]]), 1)
 
     def test_usage_limit_429_is_not_retried(self):
@@ -1101,6 +1104,44 @@ class StreamTest(Base):
         with self.assertRaises(llm.LLMError) as caught:
             self.stream()
         self.assertEqual((caught.exception.code, str(caught.exception)), ("invalid_prompt", "boom (request req_3)"))
+
+    def overloaded(self, headers=None):
+        error = {"type": "service_unavailable_error", "code": "server_is_overloaded", "param": None,
+                 "message": "Our servers are currently overloaded. Please try again later."}
+        return sse({"type": "error", "sequence_number": 3, "error": {**error, **({"headers": headers} if headers else {})}})
+
+    def test_an_overloaded_server_in_the_stream_is_retried(self):
+        """server_is_overloaded arrives as an error event before any output: the same bounded retries as
+        server_error, not the end of the turn."""
+        FakeResponses.script = [(200, self.overloaded()), (200, reply("ok"))]
+        completion, _ = self.stream()
+        self.assertEqual((completion.text, len(FakeResponses.requests)), ("ok", 2))
+        waits = []
+        FakeResponses.requests = []
+        FakeResponses.script = [(200, self.overloaded({"retry-after": "12", "retry-after-ms": "12000"})),
+                                (200, reply("ok"))]
+        with mock.patch.object(llm, "_wait", lambda seconds, cancelled: waits.append(seconds)):
+            completion, _ = self.stream()
+        self.assertEqual((completion.text, waits), ("ok", [12.0]), "the error's own wait, when the budget holds it")
+
+    def test_an_overloaded_server_asking_for_a_long_wait_says_so_with_try_again(self):
+        FakeResponses.script = [(200, self.overloaded({"retry-after": "320", "retry-after-ms": "320000"}))]
+        with self.assertRaises(llm.LLMError) as caught:
+            self.stream()
+        self.assertEqual(len(FakeResponses.requests), 1, "no retry inside a wait ChatGPT asked for")
+        self.assertEqual(caught.exception.code, llm.STREAM_FAILED)
+        self.assertEqual((caught.exception.details["error_code"], caught.exception.details["retry_after"]),
+                         ("server_is_overloaded", 320.0))
+        self.assertTrue(str(caught.exception).startswith(
+            "ChatGPT asked Loopcut to wait 5 minutes 20 seconds before another request. Your request is saved."))
+
+    def test_a_wait_in_an_error_is_read_from_either_header(self):
+        wait = chatgpt_responses._server_wait
+        self.assertEqual(wait({"headers": {"retry-after-ms": "1500"}}), {"retry_after": 1.5})
+        self.assertEqual(wait({"headers": {"Retry-After": "7"}}), {"retry_after": 7.0})
+        for raw in ({}, {"headers": None}, {"headers": {"retry-after": "soon"}}, {"headers": {"retry-after-ms": "x"}},
+                    {"headers": {"retry-after": "-3"}}, None):
+            self.assertEqual(wait(raw), {}, raw)
 
     def test_an_error_without_a_code_is_retried(self):
         """0.2.14 logs (2026-10-25): an error event with no code or message ended a turn as 'ChatGPT request
